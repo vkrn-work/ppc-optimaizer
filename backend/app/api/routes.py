@@ -490,3 +490,136 @@ async def test_metrika(account_id: int, db: AsyncSession = Depends(get_db)):
             "error": str(e),
             "counter_id": account.metrika_counter_id,
         }
+
+
+@router.get("/accounts/{account_id}/test-metrika-full")
+async def test_metrika_full(account_id: int, db: AsyncSession = Depends(get_db)):
+    """Расширенная проверка Метрики — общий трафик без фильтра по источнику"""
+    from app.collectors.metrika_collector import MetrikaCollector
+    from datetime import date, timedelta
+    import httpx
+
+    result = await db.execute(select(Account).where(Account.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(404, "Account not found")
+
+    date_to = date.today()
+    date_from = date_to - timedelta(days=30)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Общий трафик без фильтров
+            resp = await client.get(
+                "https://api-metrika.yandex.net/stat/v1/data",
+                params={
+                    "id": account.metrika_counter_id,
+                    "date1": date_from.strftime("%Y-%m-%d"),
+                    "date2": date_to.strftime("%Y-%m-%d"),
+                    "metrics": "ym:s:visits,ym:s:users,ym:s:bounceRate",
+                    "dimensions": "ym:s:UTMSource",
+                    "limit": 20,
+                },
+                headers={"Authorization": f"OAuth {account.oauth_token}"},
+            )
+            all_traffic = resp.json()
+
+            # Список счётчиков доступных токену
+            resp2 = await client.get(
+                "https://api-metrika.yandex.net/management/v1/counters",
+                headers={"Authorization": f"OAuth {account.oauth_token}"},
+            )
+            counters = resp2.json()
+
+        return {
+            "status": "ok",
+            "counter_id": account.metrika_counter_id,
+            "period_days": 30,
+            "traffic_by_source": all_traffic.get("data", [])[:10],
+            "total_rows": all_traffic.get("total_rows", 0),
+            "available_counters": [
+                {"id": c.get("id"), "name": c.get("name"), "site": c.get("site")}
+                for c in counters.get("counters", [])[:10]
+            ],
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@router.get("/accounts/{account_id}/test-metrika-sources")
+async def test_metrika_sources(account_id: int, db: AsyncSession = Depends(get_db)):
+    """Показать все источники трафика в Метрике за последние 30 дней"""
+    import httpx
+    from datetime import date, timedelta
+
+    result = await db.execute(select(Account).where(Account.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(404, "Account not found")
+
+    date_to = date.today()
+    date_from = date_to - timedelta(days=30)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Все источники без фильтра
+            resp = await client.get(
+                "https://api-metrika.yandex.net/stat/v1/data",
+                params={
+                    "id": account.metrika_counter_id,
+                    "date1": date_from.strftime("%Y-%m-%d"),
+                    "date2": date_to.strftime("%Y-%m-%d"),
+                    "metrics": "ym:s:visits,ym:s:bounceRate",
+                    "dimensions": "ym:s:UTMSource",
+                    "limit": 20,
+                    "sort": "-ym:s:visits",
+                },
+                headers={"Authorization": f"OAuth {account.oauth_token}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Все кампании Директа
+            resp2 = await client.get(
+                "https://api-metrika.yandex.net/stat/v1/data",
+                params={
+                    "id": account.metrika_counter_id,
+                    "date1": date_from.strftime("%Y-%m-%d"),
+                    "date2": date_to.strftime("%Y-%m-%d"),
+                    "metrics": "ym:s:visits",
+                    "dimensions": "ym:s:lastSignDirectClickOrder",
+                    "limit": 10,
+                    "sort": "-ym:s:visits",
+                },
+                headers={"Authorization": f"OAuth {account.oauth_token}"},
+            )
+            resp2.raise_for_status()
+            direct_data = resp2.json()
+
+            sources = []
+            for row in data.get("data", []):
+                dims = row.get("dimensions", [])
+                metrics = row.get("metrics", [])
+                sources.append({
+                    "utm_source": dims[0].get("name") if dims else None,
+                    "visits": int(metrics[0]) if metrics else 0,
+                    "bounce_rate": round(metrics[1], 1) if len(metrics) > 1 else None,
+                })
+
+            direct_campaigns = []
+            for row in direct_data.get("data", []):
+                dims = row.get("dimensions", [])
+                metrics = row.get("metrics", [])
+                direct_campaigns.append({
+                    "campaign": dims[0].get("name") if dims else None,
+                    "visits": int(metrics[0]) if metrics else 0,
+                })
+
+            return {
+                "status": "ok",
+                "period": f"{date_from} — {date_to}",
+                "all_utm_sources": sources,
+                "direct_campaigns": direct_campaigns,
+            }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
