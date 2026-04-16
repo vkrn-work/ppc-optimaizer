@@ -623,3 +623,14 @@ async def test_metrika_sources(account_id: int, db: AsyncSession = Depends(get_d
             }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+@router.delete("/accounts/{account_id}")
+async def delete_account(account_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Account).where(Account.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(404, "Account not found")
+    await db.delete(account)
+    await db.commit()
+    return {"status": "deleted", "id": account_id}
