@@ -452,3 +452,41 @@ async def get_rules(account_id: int, db: AsyncSession = Depends(get_db)):
         }
         for r in rules
     ]
+
+
+@router.get("/accounts/{account_id}/test-metrika")
+async def test_metrika(account_id: int, db: AsyncSession = Depends(get_db)):
+    """Проверить подключение к Метрике и получить базовую статистику"""
+    from app.collectors.metrika_collector import MetrikaCollector
+    from datetime import date, timedelta
+
+    result = await db.execute(select(Account).where(Account.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(404, "Account not found")
+    if not account.oauth_token:
+        raise HTTPException(400, "No OAuth token")
+    if not account.metrika_counter_id:
+        raise HTTPException(400, "No Metrika counter ID")
+
+    date_to = date.today()
+    date_from = date_to - timedelta(days=7)
+
+    try:
+        async with MetrikaCollector(account.oauth_token, account.metrika_counter_id) as mc:
+            summary = await mc.get_traffic_summary(date_from, date_to)
+            visits = await mc.get_visits_by_utm(date_from, date_to)
+            return {
+                "status": "ok",
+                "counter_id": account.metrika_counter_id,
+                "period": f"{date_from} — {date_to}",
+                "summary": summary,
+                "utm_rows_count": len(visits),
+                "utm_sample": visits[:3] if visits else [],
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "counter_id": account.metrika_counter_id,
+        }
