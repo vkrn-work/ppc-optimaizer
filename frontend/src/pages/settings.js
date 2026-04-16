@@ -53,15 +53,11 @@ export default function Settings() {
     e.preventDefault()
     setSaving(true); setError(''); setSuccess('')
     try {
-      await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/v1/accounts/${editingId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          oauth_token: editForm.oauth_token || undefined,
-          metrika_counter_id: editForm.metrika_counter_id || undefined,
-          target_cpl: editForm.target_cpl ? Number(editForm.target_cpl) : undefined,
-          target_cpql: editForm.target_cpql ? Number(editForm.target_cpql) : undefined,
-        }),
+      await api.updateAccount(editingId, {
+        oauth_token: editForm.oauth_token || undefined,
+        metrika_counter_id: editForm.metrika_counter_id || undefined,
+        target_cpl: editForm.target_cpl ? Number(editForm.target_cpl) : undefined,
+        target_cpql: editForm.target_cpql ? Number(editForm.target_cpql) : undefined,
       })
       setSuccess('Настройки обновлены')
       setEditingId(null)
@@ -73,9 +69,7 @@ export default function Settings() {
   async function handleDelete(id) {
     setSaving(true); setError('')
     try {
-      await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/v1/accounts/${id}`, {
-        method: 'DELETE',
-      })
+      await api.deleteAccount(id)
       setSuccess('Кабинет удалён')
       setConfirmDelete(null)
       loadAccounts()
