@@ -132,12 +132,42 @@ async def get_dashboard(account_id: int, db: AsyncSession = Depends(get_db)):
     )
     campaigns = campaigns_result.scalars().all()
 
+    # Последний снапшот Метрики
+    from app.models.models import MetrikaSnapshot
+    metrika_result = await db.execute(
+        select(MetrikaSnapshot)
+        .where(MetrikaSnapshot.account_id == account_id)
+        .order_by(desc(MetrikaSnapshot.date))
+        .limit(1)
+    )
+    metrika = metrika_result.scalar_one_or_none()
+    metrika_summary = {}
+    if metrika and metrika.data:
+        s = metrika.data.get("summary", {})
+        if s:
+            metrika_summary = {
+                "has_metrika": True,
+                "metrika_visits": s.get("visits"),
+                "metrika_bounce_rate": s.get("bounceRate"),
+                "metrika_page_depth": s.get("pageDepth"),
+                "metrika_avg_duration": s.get("avgVisitDurationSeconds"),
+                "metrika_devices": metrika.data.get("devices", []),
+                "metrika_regions": metrika.data.get("regions", [])[:10],
+                "metrika_by_day": metrika.data.get("by_day", []),
+                "metrika_by_weekday": metrika.data.get("by_weekday", []),
+            }
+
+    # Обогатить summary данными Метрики
+    last_summary = analysis.summary if analysis else {}
+    if metrika_summary:
+        last_summary = {**last_summary, **metrika_summary}
+
     return {
         "account_id": account_id,
         "last_analysis": {
             "id": analysis.id if analysis else None,
             "created_at": analysis.created_at.isoformat() if analysis else None,
-            "summary": analysis.summary if analysis else None,
+            "summary": last_summary,
             "problems": analysis.problems if analysis else [],
             "opportunities": analysis.opportunities if analysis else [],
         } if analysis else None,
@@ -146,6 +176,7 @@ async def get_dashboard(account_id: int, db: AsyncSession = Depends(get_db)):
             "urgent_today": today_count.scalar(),
         },
         "campaigns_count": len(campaigns),
+        "has_metrika": bool(metrika_summary),
     }
 
 
