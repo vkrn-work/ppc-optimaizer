@@ -627,10 +627,42 @@ async def test_metrika_sources(account_id: int, db: AsyncSession = Depends(get_d
 
 @router.delete("/accounts/{account_id}")
 async def delete_account(account_id: int, db: AsyncSession = Depends(get_db)):
+    """Удалить кабинет и все связанные данные"""
+    from sqlalchemy import delete as sql_delete
+    from app.models.models import (
+        Campaign, AdGroup, Keyword, KeywordStat, CampaignStat,
+        Lead, AnalysisResult, KeywordMetrics, Suggestion, Hypothesis, Rule
+    )
+
     result = await db.execute(select(Account).where(Account.id == account_id))
     account = result.scalar_one_or_none()
     if not account:
         raise HTTPException(404, "Account not found")
+
+    # Удаляем в правильном порядке — от дочерних к родительским
+    await db.execute(sql_delete(Hypothesis).where(
+        Hypothesis.suggestion_id.in_(
+            select(Suggestion.id).where(Suggestion.account_id == account_id)
+        )
+    ))
+    await db.execute(sql_delete(Suggestion).where(Suggestion.account_id == account_id))
+    await db.execute(sql_delete(KeywordMetrics).where(KeywordMetrics.account_id == account_id))
+    await db.execute(sql_delete(AnalysisResult).where(AnalysisResult.account_id == account_id))
+    await db.execute(sql_delete(Lead).where(Lead.account_id == account_id))
+    await db.execute(sql_delete(KeywordStat).where(KeywordStat.account_id == account_id))
+    await db.execute(sql_delete(CampaignStat).where(CampaignStat.account_id == account_id))
+    await db.execute(sql_delete(Rule).where(Rule.account_id == account_id))
+
+    # Ключи и группы через JOIN
+    kw_ids = select(Keyword.id).where(Keyword.account_id == account_id)
+    await db.execute(sql_delete(KeywordStat).where(KeywordStat.keyword_id.in_(kw_ids)))
+    await db.execute(sql_delete(Keyword).where(Keyword.account_id == account_id))
+
+    ag_ids = select(AdGroup.id).where(AdGroup.account_id == account_id)
+    await db.execute(sql_delete(AdGroup).where(AdGroup.account_id == account_id))
+    await db.execute(sql_delete(CampaignStat).where(CampaignStat.account_id == account_id))
+    await db.execute(sql_delete(Campaign).where(Campaign.account_id == account_id))
+
     await db.delete(account)
     await db.commit()
     return {"status": "deleted", "id": account_id}
