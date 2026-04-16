@@ -13,22 +13,20 @@ async function req(path, options = {}) {
 }
 
 export const api = {
-  // Accounts
   getAccounts: () => req('/accounts'),
   createAccount: (data) => req('/accounts', { method: 'POST', body: JSON.stringify(data) }),
+  updateAccount: (id, data) => req(`/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteAccount: (id) => req(`/accounts/${id}`, { method: 'DELETE' }),
   triggerSync: (id) => req(`/accounts/${id}/sync`, { method: 'POST' }),
 
-  // Dashboard
   getDashboard: (id) => req(`/accounts/${id}/dashboard`),
   getCampaigns: (id) => req(`/accounts/${id}/campaigns`),
   getKeywords: (id, params = '') => req(`/accounts/${id}/keywords${params}`),
 
-  // Suggestions
   getSuggestions: (id, params = '') => req(`/accounts/${id}/suggestions${params}`),
   actionSuggestion: (id, data) =>
     req(`/suggestions/${id}/action`, { method: 'POST', body: JSON.stringify(data) }),
 
-  // Analyses
   getAnalyses: (id) => req(`/accounts/${id}/analyses`),
   getHypotheses: (id) => req(`/accounts/${id}/hypotheses`),
   getRules: (id) => req(`/accounts/${id}/rules`),
