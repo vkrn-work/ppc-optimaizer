@@ -95,8 +95,7 @@ class MetrikaCollector:
                 "ym:s:visits",
                 "ym:s:bounceRate",
                 "ym:s:pageDepth",
-                "ym:s:avgVisitDurationSeconds",
-                "ym:s:goalReachesAny",
+                "ym:s:avgVisitDurationSeconds"
             ]),
             "dimensions": "ym:s:UTMCampaign",
             "sort": "-ym:s:visits",
@@ -113,8 +112,7 @@ class MetrikaCollector:
                 "ym:s:visits",
                 "ym:s:bounceRate",
                 "ym:s:pageDepth",
-                "ym:s:avgVisitDurationSeconds",
-                "ym:s:goalReachesAny",
+                "ym:s:avgVisitDurationSeconds"
             ]),
             "dimensions": "ym:s:UTMTerm,ym:s:UTMCampaign",
             "sort": "-ym:s:visits",
@@ -129,8 +127,7 @@ class MetrikaCollector:
         params.update({
             "metrics": ",".join([
                 "ym:s:visits",
-                "ym:s:bounceRate",
-                "ym:s:goalReachesAny",
+                "ym:s:bounceRate"
                 "ym:s:avgVisitDurationSeconds",
             ]),
             "dimensions": "ym:s:deviceCategory",
@@ -146,8 +143,7 @@ class MetrikaCollector:
         params.update({
             "metrics": ",".join([
                 "ym:s:visits",
-                "ym:s:bounceRate",
-                "ym:s:goalReachesAny",
+                "ym:s:bounceRate"
                 "ym:s:avgVisitDurationSeconds",
             ]),
             "dimensions": "ym:s:regionCity",
@@ -166,8 +162,7 @@ class MetrikaCollector:
                 "ym:s:visits",
                 "ym:s:bounceRate",
                 "ym:s:pageDepth",
-                "ym:s:avgVisitDurationSeconds",
-                "ym:s:goalReachesAny",
+                "ym:s:avgVisitDurationSeconds"
             ]),
             "dimensions": "ym:s:startURL",
             "sort": "-ym:s:visits",
@@ -183,8 +178,7 @@ class MetrikaCollector:
         params.update({
             "metrics": ",".join([
                 "ym:s:visits",
-                "ym:s:bounceRate",
-                "ym:s:goalReachesAny",
+                "ym:s:bounceRate"
             ]),
             "dimensions": "ym:s:date",
             "sort": "ym:s:date",
@@ -197,8 +191,7 @@ class MetrikaCollector:
         params.update({
             "metrics": ",".join([
                 "ym:s:visits",
-                "ym:s:bounceRate",
-                "ym:s:goalReachesAny",
+                "ym:s:bounceRate"
             ]),
             "dimensions": "ym:s:hourOfDay",
             "sort": "ym:s:hourOfDay",
@@ -211,8 +204,7 @@ class MetrikaCollector:
         params.update({
             "metrics": ",".join([
                 "ym:s:visits",
-                "ym:s:bounceRate",
-                "ym:s:goalReachesAny",
+                "ym:s:bounceRate"
             ]),
             "dimensions": "ym:s:dayOfWeek",
             "sort": "ym:s:dayOfWeek",
@@ -240,8 +232,7 @@ class MetrikaCollector:
         params.update({
             "metrics": ",".join([
                 "ym:s:visits",
-                "ym:s:bounceRate",
-                "ym:s:goalReachesAny",
+                "ym:s:bounceRate"
                 "ym:s:avgVisitDurationSeconds",
             ]),
             "dimensions": "ym:s:userType",
@@ -257,11 +248,11 @@ class MetrikaCollector:
         goal_id: Optional[str] = None,
     ) -> list[dict]:
         """Достижения целей с атрибуцией по кампаниям и ключам"""
-        metrics = f"ym:s:goal{goal_id}reaches" if goal_id else "ym:s:goalReachesAny"
+        metrics = f"ym:s:goal{goal_id}reaches" if goal_id else "ym:s:visits"
         params = self._base_params(date_from, date_to)
         params.update({
             "metrics": metrics,
-            "dimensions": "ym:s:UTMCampaign,ym:s:UTMTerm,ym:s:clientID",
+            "dimensions": "ym:s:UTMCampaign,ym:s:UTMTerm",
             "sort": f"-{metrics}",
             "limit": 1000,
         })
