@@ -79,7 +79,6 @@ class MetrikaCollector:
                 "ym:s:bounceRate",
                 "ym:s:pageDepth",
                 "ym:s:avgVisitDurationSeconds",
-                "ym:s:goalReachesAny",
             ]),
             "dimensions": "ym:s:UTMSource",
         })
