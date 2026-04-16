@@ -189,6 +189,15 @@ async def _collect_account_data_async(account_id: int):
                     await db.commit()
 
                     # Статистика
+                    # Объявления
+                    for i in range(0, len(campaign_ids), 10):
+                        batch = campaign_ids[i:i+10]
+                        try:
+                            ads_data = await dc.get_ads(batch)
+                            # Сохраняем маппинг ad_group_id -> [ad_ids] для обогащения статистики
+                        except Exception as e:
+                            logger.warning(f"Ads collection error: {e}")
+
                     # Статистику запрашиваем без фильтра по кампаниям — Reports API сам агрегирует
                     stats_data = await dc.get_keyword_stats(date_from, date_to)
                     for row in stats_data:
@@ -203,29 +212,111 @@ async def _collect_account_data_async(account_id: int):
                             continue
                         try:
                             stat_date = datetime.strptime(row["Date"], "%Y-%m-%d")
-                            clicks = int(row.get("Clicks", 0))
-                            spend = float(row.get("Cost", 0))
-                            if clicks == 0 and spend == 0:
+                            clicks = int(float(row.get("Clicks", 0) or 0))
+                            spend = float(row.get("Cost", 0) or 0)
+                            impressions = int(float(row.get("Impressions", 0) or 0))
+                            if clicks == 0 and impressions == 0:
                                 continue
+                            def safe_float(v):
+                                try: return float(v) or None
+                                except: return None
+                            def safe_int(v):
+                                try: return int(float(v)) or None
+                                except: return None
                             stmt = insert(KeywordStat).values(
                                 account_id=account_id,
                                 keyword_id=kw.id,
                                 date=stat_date,
-                                impressions=int(row.get("Impressions", 0)),
+                                impressions=impressions,
                                 clicks=clicks,
                                 spend=spend,
-                                avg_cpc=float(row.get("AvgCpc", 0)) or None,
-                                avg_bid=float(row.get("AvgEffectiveBid", 0)) or None,
-                                traffic_volume=int(row.get("AvgTrafficVolume", 0)) or None,
-                                avg_position=float(row.get("AvgImpressionPosition", 0)) or None,
+                                avg_cpc=safe_float(row.get("AvgCpc")),
+                                avg_bid=safe_float(row.get("AvgEffectiveBid")),
+                                traffic_volume=safe_int(row.get("AvgTrafficVolume")),
+                                avg_position=safe_float(row.get("AvgImpressionPosition")),
+                                avg_click_position=safe_float(row.get("AvgClickPosition")),
+                                ctr=safe_float(row.get("Ctr")),
+                                ad_id=str(row.get("AdId", "")) or None,
                             ).on_conflict_do_update(
                                 index_elements=["account_id", "keyword_id", "date"],
-                                set_={"clicks": clicks, "spend": spend},
+                                set_={
+                                    "clicks": clicks,
+                                    "spend": spend,
+                                    "impressions": impressions,
+                                    "ctr": safe_float(row.get("Ctr")),
+                                    "avg_position": safe_float(row.get("AvgImpressionPosition")),
+                                    "avg_click_position": safe_float(row.get("AvgClickPosition")),
+                                },
                             )
                             await db.execute(stmt)
                         except (ValueError, KeyError) as e:
                             logger.warning(f"Error parsing stat row: {e}")
                     await db.commit()
+
+            # ── Сбор поисковых запросов ──────────────────────────────────
+            try:
+                from app.models.models import SearchQuery
+                sq_data = await dc.get_search_queries(date_from, date_to)
+                logger.info(f"Search queries for account {account_id}: {len(sq_data)} rows")
+                for row in sq_data:
+                    try:
+                        sq_date = datetime.strptime(row["Date"], "%Y-%m-%d")
+                        sq_clicks = int(float(row.get("Clicks", 0) or 0))
+                        sq_impressions = int(float(row.get("Impressions", 0) or 0))
+                        if sq_clicks == 0 and sq_impressions == 0:
+                            continue
+                        # Найти keyword_id по CriterionId
+                        kw_result = await db.execute(
+                            select(Keyword).where(
+                                Keyword.account_id == account_id,
+                                Keyword.direct_id == str(row.get("CriterionId", "")),
+                            )
+                        )
+                        kw = kw_result.scalar_one_or_none()
+                        # Найти campaign и adgroup
+                        camp_result = await db.execute(
+                            select(Campaign).where(
+                                Campaign.account_id == account_id,
+                                Campaign.direct_id == str(row.get("CampaignId", "")),
+                            )
+                        )
+                        camp = camp_result.scalar_one_or_none()
+                        ag_result = await db.execute(
+                            select(AdGroup).where(
+                                AdGroup.account_id == account_id,
+                                AdGroup.direct_id == str(row.get("AdGroupId", "")),
+                            )
+                        )
+                        ag = ag_result.scalar_one_or_none()
+
+                        def safe_float(v):
+                            try: return float(v) or None
+                            except: return None
+
+                        sq = SearchQuery(
+                            account_id=account_id,
+                            keyword_id=kw.id if kw else None,
+                            date=sq_date,
+                            query=row.get("Query", ""),
+                            keyword_phrase=row.get("Criterion", ""),
+                            match_type=row.get("MatchType", ""),
+                            campaign_id=camp.id if camp else None,
+                            ad_group_id=ag.id if ag else None,
+                            impressions=sq_impressions,
+                            clicks=sq_clicks,
+                            spend=float(row.get("Cost", 0) or 0),
+                            ctr=safe_float(row.get("Ctr")),
+                            avg_cpc=safe_float(row.get("AvgCpc")),
+                            avg_position=safe_float(row.get("AvgImpressionPosition")),
+                            avg_click_position=safe_float(row.get("AvgClickPosition")),
+                        )
+                        db.add(sq)
+                    except Exception as e:
+                        logger.warning(f"Error saving search query: {e}")
+                await db.commit()
+                logger.info(f"Search queries saved for account {account_id}")
+            except Exception as e:
+                logger.warning(f"Search queries collection failed: {e}")
 
             # ── Сбор из Метрики ──────────────────────────────────────────
             if account.metrika_counter_id:
