@@ -246,6 +246,17 @@ class KeywordMetrics(Base):
 # ─── Правила и предложения ───────────────────────────────────────────────────
 
 
+
+class MetrikaSnapshot(Base):
+    """Снапшот данных из Метрики — все срезы за один сбор"""
+    __tablename__ = "metrika_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(Integer, index=True)
+    date: Mapped[datetime] = mapped_column(DateTime, index=True)
+    data: Mapped[dict] = mapped_column(JSON)  # все 12 срезов
+
+
 class SearchQuery(Base):
     """Поисковый запрос — реальная фраза по которой показывалась реклама"""
     __tablename__ = "search_queries"
