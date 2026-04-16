@@ -2,27 +2,36 @@ import { useState, useEffect } from 'react'
 import Layout from '../components/Layout'
 import { useAccount } from '../hooks/useAccount'
 import { api } from '../utils/api'
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 
-const PRIORITY_LABELS = {
-  today: { label: 'Сегодня', cls: 'badge-today' },
-  this_week: { label: 'Эта неделя', cls: 'badge-week' },
-  month: { label: 'До конца месяца', cls: 'badge-month' },
-  scale: { label: 'Масштабирование', cls: 'badge-scale' },
+function num(n, suffix = '') {
+  if (n == null || n === 0) return '—'
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M' + suffix
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K' + suffix
+  return Math.round(n * 10) / 10 + suffix
+}
+function rub(n) { return n == null ? '—' : Math.round(n).toLocaleString('ru-RU') + ' ₽' }
+function pct(n) { return n == null ? '—' : (Math.round(n * 10) / 10) + '%' }
+function pos(n) { return n == null || n === 0 ? '—' : (Math.round(n * 10) / 10).toString() }
+
+const SEVERITY = {
+  critical: { label: '🔴 Критично', color: 'var(--red)' },
+  warning: { label: '🟡 Важно', color: 'var(--yellow, #f59e0b)' },
+  info: { label: '🔵 Инфо', color: 'var(--blue)' },
 }
 
-function fmt(n) {
-  if (n == null) return '—'
-  if (n >= 1000) return Math.round(n).toLocaleString('ru-RU') + ' ₽'
-  return Math.round(n) + ' ₽'
+const PRIORITY = {
+  today: '🔴 Сегодня',
+  this_week: '🟡 Эта неделя',
+  month: '🔵 До конца месяца',
+  scale: '🟢 Масштабирование',
 }
-function pct(n) { return n == null ? '—' : Math.round(n * 10) / 10 + '%' }
 
 export default function Dashboard() {
   const { account, accounts, accountId, switchAccount, loading } = useAccount()
   const [dash, setDash] = useState(null)
   const [syncing, setSyncing] = useState(false)
   const [syncMsg, setSyncMsg] = useState('')
+  const [expandedProblem, setExpandedProblem] = useState(null)
 
   useEffect(() => {
     if (!accountId) return
@@ -31,16 +40,13 @@ export default function Dashboard() {
 
   async function handleSync() {
     if (!accountId) return
-    setSyncing(true)
-    setSyncMsg('')
+    setSyncing(true); setSyncMsg('')
     try {
       const r = await api.triggerSync(accountId)
-      setSyncMsg(r.message)
-    } catch (e) {
-      setSyncMsg('Ошибка: ' + e.message)
-    } finally {
-      setSyncing(false)
-    }
+      setSyncMsg(r.message || 'Сбор запущен')
+      setTimeout(() => api.getDashboard(accountId).then(setDash), 15000)
+    } catch (e) { setSyncMsg('Ошибка: ' + e.message) }
+    finally { setSyncing(false) }
   }
 
   if (loading) return <div style={{ padding: 40, color: 'var(--text-3)' }}>Загрузка...</div>
@@ -48,7 +54,12 @@ export default function Dashboard() {
   if (!account && accounts.length === 0) {
     return (
       <Layout account={null} accounts={[]} onAccountChange={switchAccount}>
-        <NoAccountScreen />
+        <div className="card" style={{ maxWidth: 500, margin: '4rem auto', textAlign: 'center' }}>
+          <div style={{ fontSize: 32, marginBottom: 12 }}>🚀</div>
+          <div style={{ fontWeight: 500, marginBottom: 8 }}>Добавьте рекламный кабинет</div>
+          <p style={{ color: 'var(--text-2)', fontSize: 13 }}>Перейдите в Настройки и подключите кабинет Яндекс Директ</p>
+          <a href="/settings" className="btn btn-primary" style={{ marginTop: 16 }}>Настройки →</a>
+        </div>
       </Layout>
     )
   }
@@ -59,219 +70,167 @@ export default function Dashboard() {
 
   return (
     <Layout account={account} accounts={accounts} onAccountChange={switchAccount}>
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.5rem' }}>
+      {/* Заголовок */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
         <div>
-          <h1 style={{ fontSize: 20, fontWeight: 500 }}>{account?.name || 'Дашборд'}</h1>
-          <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 2 }}>
-            {account?.last_sync_at
-              ? `Последний сбор: ${new Date(account.last_sync_at).toLocaleString('ru-RU')}`
-              : 'Данные ещё не собирались'}
-          </div>
+          <h1 style={{ fontSize: 20, fontWeight: 500, marginBottom: 4 }}>
+            {account?.name || 'Дашборд'}
+          </h1>
+          {dash?.last_analysis?.created_at && (
+            <div style={{ fontSize: 12, color: 'var(--text-3)' }}>
+              Последний анализ: {new Date(dash.last_analysis.created_at).toLocaleString('ru-RU')}
+            </div>
+          )}
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           {syncMsg && <span style={{ fontSize: 12, color: 'var(--text-2)' }}>{syncMsg}</span>}
           <button className="btn btn-primary" onClick={handleSync} disabled={syncing}>
-            {syncing ? '⟳ Запущено...' : '↻ Собрать данные'}
+            {syncing ? '⏳ Сбор...' : '↻ Собрать данные'}
           </button>
         </div>
       </div>
 
-      {/* KPI Grid */}
-      {summary ? (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: '1.5rem' }}>
-          <StatCard label="Клики (4 нед.)" value={summary.total_clicks?.toLocaleString('ru-RU')} unit="" />
-          <StatCard label="CR клик→заявка" value={pct(summary.cr_click_lead)} unit=""
-            status={summary.cr_click_lead >= 5 ? 'ok' : summary.cr_click_lead >= 3 ? 'warn' : 'bad'} />
-          <StatCard label="CPL" value={fmt(summary.cpl)}
-            status={summary.cpl && account?.target_cpl
-              ? (summary.cpl <= account.target_cpl ? 'ok' : summary.cpl <= account.target_cpl * 1.5 ? 'warn' : 'bad')
-              : null} />
-          <StatCard label="Заявки (4 нед.)" value={summary.total_leads} unit="" />
+      {!summary ? (
+        <div className="card" style={{ textAlign: 'center', padding: '3rem' }}>
+          <div style={{ fontSize: 32, marginBottom: 12 }}>📊</div>
+          <div style={{ fontWeight: 500, marginBottom: 8 }}>Нет данных</div>
+          <p style={{ color: 'var(--text-2)', fontSize: 13, marginBottom: 16 }}>Нажмите «Собрать данные» чтобы запустить первый анализ</p>
+          <button className="btn btn-primary" onClick={handleSync} disabled={syncing}>
+            {syncing ? 'Запуск...' : '↻ Собрать данные'}
+          </button>
         </div>
       ) : (
-        <EmptyState text="Нет данных анализа. Нажмите «Собрать данные» для запуска." />
-      )}
-
-      {/* Suggestions alert */}
-      {dash?.suggestions_stats?.urgent_today > 0 && (
-        <div style={{
-          background: 'var(--red-bg)',
-          border: '0.5px solid var(--red)',
-          borderRadius: 'var(--radius)',
-          padding: '0.75rem 1rem',
-          marginBottom: '1rem',
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-        }}>
-          <span style={{ color: 'var(--red)', fontWeight: 500 }}>
-            {dash.suggestions_stats.urgent_today} задач на сегодня — требуют немедленного внимания
-          </span>
-          <a href="/suggestions?priority=today" className="btn" style={{ fontSize: 12, padding: '4px 10px' }}>
-            Смотреть →
-          </a>
-        </div>
-      )}
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.25rem' }}>
-        {/* Problems */}
-        <div className="card">
-          <div style={{ fontWeight: 500, marginBottom: '1rem', display: 'flex', justifyContent: 'space-between' }}>
-            <span>Топ проблем</span>
-            <span style={{ fontSize: 12, color: 'var(--text-3)' }}>{problems.length}</span>
+        <>
+          {/* KPI блок */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginBottom: '1.5rem' }}>
+            <KPI label="Клики" value={num(summary.total_clicks)} />
+            <KPI label="Показы" value={num(summary.total_impressions)} />
+            <KPI label="Расход" value={rub(summary.total_spend)} />
+            <KPI label="CTR" value={pct(summary.ctr)} />
+            <KPI label="Ср. CPC" value={rub(summary.avg_cpc)} />
+            <KPI label="Ср. позиция" value={pos(summary.avg_position)} />
+            <KPI label="Ключей" value={summary.keywords_analyzed} />
+            <KPI label="Проблем" value={summary.problems_found} alert={summary.problems_found > 0} />
           </div>
-          {problems.length === 0
-            ? <div style={{ color: 'var(--text-3)', fontSize: 13 }}>Критичных проблем не обнаружено</div>
-            : problems.map((p, i) => (
-              <div key={i} style={{
-                padding: '10px 0',
-                borderBottom: i < problems.length - 1 ? '0.5px solid var(--border)' : 'none',
-              }}>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start', marginBottom: 4 }}>
-                  <span className={`badge ${p.severity === 'critical' ? 'badge-today' : 'badge-warn'}`}>
-                    {p.severity === 'critical' ? 'Критично' : 'Внимание'}
-                  </span>
-                  <span style={{ fontSize: 13, fontWeight: 500 }}>{p.phrase}</span>
-                </div>
-                <p style={{ fontSize: 12, color: 'var(--text-2)', margin: '4px 0' }}>{p.description}</p>
-                <p style={{ fontSize: 12, color: 'var(--text-3)' }}>{p.action}</p>
+
+          {/* Предложения сегодня */}
+          {dash?.suggestions_stats?.urgent_today > 0 && (
+            <div style={{
+              background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)',
+              borderRadius: 'var(--radius)', padding: '12px 16px', marginBottom: '1.5rem',
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+            }}>
+              <span style={{ fontSize: 14 }}>
+                🔴 <strong>{dash.suggestions_stats.urgent_today}</strong> предложений требуют внимания сегодня
+              </span>
+              <a href="/suggestions" className="btn" style={{ fontSize: 12 }}>Смотреть →</a>
+            </div>
+          )}
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+            {/* Проблемы */}
+            <div className="card">
+              <div style={{ fontWeight: 500, marginBottom: '1rem', display: 'flex', justifyContent: 'space-between' }}>
+                <span>Проблемы ({problems.length})</span>
+                {problems.length > 3 && <a href="/suggestions" style={{ fontSize: 12, color: 'var(--blue)' }}>Все →</a>}
               </div>
-            ))}
-        </div>
-
-        {/* Opportunities */}
-        <div className="card">
-          <div style={{ fontWeight: 500, marginBottom: '1rem', display: 'flex', justifyContent: 'space-between' }}>
-            <span>Точки роста</span>
-            <span style={{ fontSize: 12, color: 'var(--text-3)' }}>{opportunities.length}</span>
-          </div>
-          {opportunities.length === 0
-            ? <div style={{ color: 'var(--text-3)', fontSize: 13 }}>Пока нет данных для масштабирования</div>
-            : opportunities.map((o, i) => (
-              <div key={i} style={{
-                padding: '10px 0',
-                borderBottom: i < opportunities.length - 1 ? '0.5px solid var(--border)' : 'none',
-              }}>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 4 }}>
-                  <span className="badge badge-ok">CR {o.cr}%</span>
-                  <span style={{ fontSize: 13, fontWeight: 500 }}>{o.phrase}</span>
+              {problems.length === 0 ? (
+                <div style={{ color: 'var(--text-3)', fontSize: 13 }}>Проблем не обнаружено ✓</div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {problems.slice(0, 5).map((p, i) => (
+                    <div key={i} style={{
+                      padding: '10px 12px', borderRadius: 'var(--radius)',
+                      background: 'var(--bg)', cursor: 'pointer',
+                      border: expandedProblem === i ? '1px solid var(--border-accent)' : '1px solid var(--border)',
+                    }} onClick={() => setExpandedProblem(expandedProblem === i ? null : i)}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 4 }}>
+                            <span style={{ fontSize: 11, color: SEVERITY[p.severity]?.color }}>
+                              {SEVERITY[p.severity]?.label}
+                            </span>
+                            <span style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                              {PRIORITY[p.priority]}
+                            </span>
+                          </div>
+                          <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 2 }}>
+                            {p.phrase}
+                          </div>
+                          <div style={{ fontSize: 12, color: 'var(--text-2)' }}>
+                            {p.description}
+                          </div>
+                        </div>
+                        <div style={{ fontSize: 12, color: 'var(--text-3)', marginLeft: 8, flexShrink: 0 }}>
+                          {p.spend > 0 && rub(p.spend)}
+                        </div>
+                      </div>
+                      {expandedProblem === i && (
+                        <div style={{ marginTop: 8, padding: '8px 0', borderTop: '1px solid var(--border)' }}>
+                          <div style={{ fontSize: 12, color: 'var(--green)', marginBottom: 4 }}>
+                            💡 {p.action}
+                          </div>
+                          <div style={{ display: 'flex', gap: 12, fontSize: 11, color: 'var(--text-3)' }}>
+                            {p.clicks != null && <span>Кликов: {p.clicks}</span>}
+                            {p.avg_position != null && <span>Позиция: {p.avg_position}</span>}
+                            {p.metric_value != null && p.type === 'traffic_drop' && <span>Падение: {p.metric_value}%</span>}
+                            {p.recommended_bid && <span>Рек. ставка: {rub(p.recommended_bid)}</span>}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ))}
                 </div>
-                <p style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 2 }}>{o.description}</p>
-                <p style={{ fontSize: 12, color: 'var(--teal)', fontWeight: 500 }}>{o.action}</p>
-              </div>
-            ))}
-        </div>
-      </div>
+              )}
+            </div>
 
-      {/* Quick stats */}
-      {summary && (
-        <div className="card" style={{ marginTop: '1.25rem' }}>
-          <div style={{ fontWeight: 500, marginBottom: '1rem' }}>Сводка за 4 недели</div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 16 }}>
-            <MiniStat label="Расход" value={`${Math.round(summary.total_spend).toLocaleString('ru-RU')} ₽`} />
-            <MiniStat label="Заявки" value={summary.total_leads} />
-            <MiniStat label="SQL" value={summary.total_sqls} />
-            <MiniStat label="CPQL" value={fmt(summary.cpql)} />
-            <MiniStat label="Ключей" value={summary.keywords_analyzed} />
+            {/* Точки роста */}
+            <div className="card">
+              <div style={{ fontWeight: 500, marginBottom: '1rem' }}>
+                Точки роста ({opportunities.length})
+              </div>
+              {opportunities.length === 0 ? (
+                <div style={{ color: 'var(--text-3)', fontSize: 13 }}>Накапливается статистика...</div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {opportunities.map((o, i) => (
+                    <div key={i} style={{ padding: '10px 12px', borderRadius: 'var(--radius)', background: 'var(--bg)', border: '1px solid var(--border)' }}>
+                      <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 4 }}>{o.phrase}</div>
+                      <div style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 4 }}>{o.description}</div>
+                      <div style={{ fontSize: 12, color: 'var(--green)' }}>💡 {o.action}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
-        </div>
+
+          {/* Данные Метрики если есть */}
+          {summary.has_metrika && (
+            <div className="card" style={{ marginTop: 16 }}>
+              <div style={{ fontWeight: 500, marginBottom: '1rem' }}>Поведение на сайте (Метрика)</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
+                <KPI label="Визиты" value={num(summary.metrika_visits)} />
+                <KPI label="Отказы" value={pct(summary.metrika_bounce_rate)} />
+                <KPI label="Глубина" value={summary.metrika_page_depth?.toFixed(1) || '—'} />
+                <KPI label="Время на сайте" value={summary.metrika_avg_duration ? Math.round(summary.metrika_avg_duration) + ' с' : '—'} />
+              </div>
+            </div>
+          )}
+        </>
       )}
     </Layout>
   )
 }
 
-function StatCard({ label, value, unit = '', status }) {
-  const statusColors = { ok: 'var(--green)', warn: 'var(--amber)', bad: 'var(--red)' }
+function KPI({ label, value, alert }) {
   return (
-    <div className="stat-card">
-      <div className="stat-label">{label}</div>
-      <div className="stat-value" style={{ color: status ? statusColors[status] : 'var(--text)' }}>
-        {value}{unit}
-      </div>
+    <div className="card" style={{ textAlign: 'center', padding: '12px 8px' }}>
+      <div style={{
+        fontSize: 22, fontWeight: 600, marginBottom: 4,
+        color: alert ? 'var(--red)' : 'var(--text-1)',
+      }}>{value}</div>
+      <div style={{ fontSize: 11, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</div>
     </div>
-  )
-}
-
-function MiniStat({ label, value }) {
-  return (
-    <div>
-      <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 2 }}>{label}</div>
-      <div style={{ fontSize: 16, fontWeight: 500 }}>{value ?? '—'}</div>
-    </div>
-  )
-}
-
-function EmptyState({ text }) {
-  return (
-    <div style={{
-      background: 'var(--bg)',
-      borderRadius: 'var(--radius)',
-      padding: '2rem',
-      textAlign: 'center',
-      color: 'var(--text-3)',
-      marginBottom: '1.5rem',
-    }}>{text}</div>
-  )
-}
-
-function NoAccountScreen() {
-  const [form, setForm] = useState({ name: '', yandex_login: '', oauth_token: '', target_cpl: '', metrika_counter_id: '' })
-  const [saving, setSaving] = useState(false)
-  const [error, setError] = useState('')
-
-  async function handleSubmit(e) {
-    e.preventDefault()
-    setSaving(true)
-    setError('')
-    try {
-      await api.createAccount({
-        ...form,
-        target_cpl: form.target_cpl ? Number(form.target_cpl) : null,
-      })
-      window.location.reload()
-    } catch (e) {
-      setError(e.message)
-      setSaving(false)
-    }
-  }
-
-  return (
-    <div style={{ maxWidth: 500, margin: '4rem auto' }}>
-      <h1 style={{ fontSize: 20, fontWeight: 500, marginBottom: '0.5rem' }}>Добавить кабинет</h1>
-      <p style={{ color: 'var(--text-2)', marginBottom: '1.5rem', fontSize: 13 }}>
-        Для начала работы подключите Яндекс Директ через OAuth-токен.
-        Инструкция: <a href="https://yandex.ru/dev/direct/doc/dg/concepts/auth-token.html"
-          target="_blank" style={{ color: 'var(--blue)' }}>получить токен</a>
-      </p>
-      <div className="card">
-        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <Field label="Название кабинета" value={form.name}
-            onChange={v => setForm(f => ({ ...f, name: v }))} required />
-          <Field label="Логин Яндекс" value={form.yandex_login}
-            onChange={v => setForm(f => ({ ...f, yandex_login: v }))} required />
-          <Field label="OAuth-токен" value={form.oauth_token} type="password"
-            onChange={v => setForm(f => ({ ...f, oauth_token: v }))} required />
-          <Field label="ID счётчика Метрики" value={form.metrika_counter_id}
-            onChange={v => setForm(f => ({ ...f, metrika_counter_id: v }))} />
-          <Field label="Целевой CPL, ₽" value={form.target_cpl} type="number"
-            onChange={v => setForm(f => ({ ...f, target_cpl: v }))} />
-          {error && <div style={{ color: 'var(--red)', fontSize: 12 }}>{error}</div>}
-          <button className="btn btn-primary" type="submit" disabled={saving}>
-            {saving ? 'Сохранение...' : 'Подключить кабинет'}
-          </button>
-        </form>
-      </div>
-    </div>
-  )
-}
-
-function Field({ label, value, onChange, type = 'text', required }) {
-  return (
-    <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-      <span style={{ fontSize: 12, color: 'var(--text-2)' }}>{label}{required && ' *'}</span>
-      <input type={type} value={value} onChange={e => onChange(e.target.value)}
-        required={required} style={{ width: '100%' }} />
-    </label>
   )
 }
