@@ -4,146 +4,151 @@ import { api } from '../utils/api'
 
 const NAV = [
   { section: 'АНАЛИЗ', items: [
-    { href: '/',           icon: '◉', label: 'Main Board' },
-    { href: '/campaigns',  icon: '≡', label: 'По кампаниям' },
-    { href: '/bids',       icon: '₽', label: 'Ставки' },
-    { href: '/adjustments',icon: '⊕', label: 'Корректировки' },
+    { href: '/',            icon: '◉', label: 'Main Board' },
+    { href: '/campaigns',   icon: '≡', label: 'По кампаниям' },
+    { href: '/bids',        icon: '₽', label: 'Ставки' },
+    { href: '/adjustments', icon: '⊕', label: 'Корректировки' },
   ]},
   { section: 'ПОИСКОВЫЕ ФРАЗЫ', items: [
-    { href: '/new-keywords', icon: '+', label: 'Новые ключи', badgeKey: 'new_keywords', badgeColor: 'green' },
-    { href: '/negatives',    icon: '×', label: 'Минуса',      badgeKey: 'negatives' },
+    { href: '/new-keywords', icon: '+', label: 'Новые ключи',  badgeKey: 'new_kw',  badgeColor: 'green' },
+    { href: '/negatives',    icon: '×', label: 'Минуса',       badgeKey: 'neg' },
   ]},
   { section: 'ОПТИМИЗАЦИЯ', items: [
-    { href: '/suggestions', icon: '◈', label: 'Предложения', badgeKey: 'suggestions' },
+    { href: '/suggestions', icon: '◈', label: 'Предложения',  badgeKey: 'suggest', badgeColor: 'accent' },
     { href: '/hypotheses',  icon: '◇', label: 'Гипотезы' },
   ]},
   { section: 'СИСТЕМА', items: [
-    { href: '/settings',     icon: '⊙', label: 'Кабинеты' },
-    { href: '/rules',        icon: '≋', label: 'Правила' },
-    { href: '/diagnostics',  icon: '⚠', label: 'Диагностика', badgeKey: 'errors', danger: true },
+    { href: '/settings',    icon: '⊙', label: 'Кабинеты' },
+    { href: '/rules',       icon: '≋', label: 'Правила' },
+    { href: '/diagnostics', icon: '⚠', label: 'Диагностика',  badgeKey: 'errors',  danger: true },
   ]},
 ]
 
-function getMSKTime() {
-  return new Date().toLocaleTimeString('ru-RU', {
-    timeZone: 'Europe/Moscow', hour: '2-digit', minute: '2-digit'
-  })
+function getMSK() {
+  return new Date().toLocaleTimeString('ru-RU',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit'})
 }
 
 export default function Layout({ children, account, accounts, onAccountChange }) {
   const router = useRouter()
   const [collapsed, setCollapsed] = useState(false)
-  const [theme, setTheme] = useState('dark')
-  const [time, setTime] = useState(getMSKTime())
+  const [theme, setTheme] = useState(() => {
+    if (typeof window !== 'undefined') return localStorage.getItem('theme') || 'light'
+    return 'light'
+  })
+  const [time, setTime] = useState(getMSK())
   const [syncing, setSyncing] = useState(false)
   const [badges, setBadges] = useState({})
   const accountId = account?.id
 
+  /* persist theme */
   useEffect(() => {
-    const t = setInterval(() => setTime(getMSKTime()), 30000)
+    document.documentElement.setAttribute('data-theme', theme)
+    if (typeof window !== 'undefined') localStorage.setItem('theme', theme)
+  }, [theme])
+
+  /* clock */
+  useEffect(() => {
+    const t = setInterval(() => setTime(getMSK()), 30000)
     return () => clearInterval(t)
   }, [])
 
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme)
-  }, [theme])
-
+  /* load badge counts */
   useEffect(() => {
     if (!accountId) return
-    // Загрузить счётчики для бейджей
-    api.getSuggestions(accountId, '?status=pending').then(d => {
-      const urgent = d.filter ? d.filter(s => s.priority === 'today').length : 0
-      setBadges(prev => ({ ...prev, suggestions: urgent || null }))
-    }).catch(() => {})
-  }, [accountId])
+    // suggestions count
+    fetch(`https://ppc-optimaizer-production.up.railway.app/api/v1/accounts/${accountId}/analyses`)
+      .then(r => r.json())
+      .then(data => {
+        const a = data?.[0]
+        const urgentProblems = (a?.problems||[]).filter(p=>p.priority==='today').length
+        const newKwCount = 0 // will be populated when search-queries endpoint returns data
+        setBadges(prev => ({
+          ...prev,
+          suggest: urgentProblems || null,
+        }))
+      }).catch(()=>{})
+    // diagnostics - check health
+    fetch(`https://ppc-optimaizer-production.up.railway.app/health`)
+      .then(r => r.json())
+      .then(h => {
+        if (!account?.oauth_token || !account?.metrika_counter_id) {
+          setBadges(prev => ({ ...prev, errors: 1 }))
+        }
+      }).catch(() => setBadges(prev => ({ ...prev, errors: 1 })))
+  }, [accountId, account])
 
   async function handleSync() {
     if (!accountId || syncing) return
     setSyncing(true)
-    try { await api.triggerSync(accountId) } catch (e) {}
+    try { await api.triggerSync(accountId) } catch(e) {}
     finally { setTimeout(() => setSyncing(false), 2000) }
   }
 
   const lastSync = account?.last_sync_at
-    ? new Date(account.last_sync_at).toLocaleString('ru-RU', {
-        timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit',
-        hour: '2-digit', minute: '2-digit'
+    ? 'Обновлено: ' + new Date(account.last_sync_at).toLocaleString('ru-RU', {
+        timeZone:'Europe/Moscow', day:'2-digit', month:'2-digit',
+        hour:'2-digit', minute:'2-digit'
       }) + ' МСК'
-    : null
+    : `Сейчас: ${time} МСК`
+
+  const isDark = theme === 'dark'
 
   return (
     <>
-      {/* TOPBAR */}
+      {/* ── TOPBAR ── */}
       <div className="app-topbar">
         <div className="topbar-logo">PPC <span>Optimizer</span></div>
         <div className="topbar-sep" />
         <div className="topbar-status">
           <div className="status-dot" />
-          {lastSync ? `Обновлено: ${lastSync}` : `Сейчас: ${time} МСК`}
+          {lastSync}
         </div>
         <div className="topbar-right">
-          <button
-            className="btn btn-sm"
-            onClick={handleSync}
-            disabled={syncing}
-            style={{ minWidth: 110 }}
-          >
+          <button className="btn btn-sm btn-primary" onClick={handleSync} disabled={syncing} style={{minWidth:120}}>
             {syncing ? '⏳ Запуск...' : '↻ Обновить данные'}
           </button>
-          <div
-            className="sb-toggle"
-            onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
-            title="Переключить тему"
-          >
-            {theme === 'dark' ? '☀' : '☾'}
+          <div className="sb-toggle" onClick={() => setTheme(t => t==='dark'?'light':'dark')}
+            title={isDark ? 'Светлая тема' : 'Тёмная тема'} style={{fontSize:14}}>
+            {isDark ? '☀' : '☾'}
           </div>
         </div>
       </div>
 
-      {/* SIDEBAR */}
-      <div className={`app-sidebar${collapsed ? ' collapsed' : ''}`}>
-        {/* Кабинет */}
+      {/* ── SIDEBAR ── */}
+      <div className={`app-sidebar${collapsed?' collapsed':''}`}>
+        {/* Cabinet */}
         <div className="sb-cabinet">
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: collapsed ? 0 : 6 }}>
-            {!collapsed && <div className="sb-label" style={{ padding: 0 }}>Кабинет</div>}
-            <div className="sb-toggle" onClick={() => setCollapsed(c => !c)} style={{ marginLeft: collapsed ? 'auto' : 0 }}>
+          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
+            {!collapsed && (
+              <select className="cabinet-select" value={accountId||''}
+                onChange={e => onAccountChange && onAccountChange(Number(e.target.value))}>
+                {accounts?.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+              </select>
+            )}
+            <div className="sb-toggle" onClick={() => setCollapsed(c=>!c)} style={{flexShrink:0}}>
               {collapsed ? '›' : '‹'}
             </div>
           </div>
-          {!collapsed && (
-            <select
-              className="cabinet-select"
-              value={accountId || ''}
-              onChange={e => onAccountChange && onAccountChange(Number(e.target.value))}
-            >
-              {accounts?.map(a => (
-                <option key={a.id} value={a.id}>{a.name}</option>
-              ))}
-            </select>
-          )}
         </div>
 
-        {/* Navigation */}
+        {/* Nav */}
         {NAV.map(({ section, items }) => (
           <div key={section} className="sb-section">
             <div className="sb-label">{section}</div>
             {items.map(item => {
-              const isActive = router.pathname === item.href
-              const badgeVal = badges[item.badgeKey]
+              const active = router.pathname === item.href
+              const bv = badges[item.badgeKey]
               return (
-                <div
-                  key={item.href}
-                  className={`sb-item${isActive ? ' active' : ''}${item.danger ? ' danger' : ''}`}
+                <div key={item.href}
+                  className={`sb-item${active?' active':''}${item.danger?' sb-danger':''}`}
                   onClick={() => router.push(item.href)}
-                  style={item.danger ? { color: 'var(--red)' } : {}}
                   title={collapsed ? item.label : ''}
+                  style={item.danger ? {color:'var(--red)'} : {}}
                 >
                   <span className="sb-icon">{item.icon}</span>
                   <span className="sb-text">{item.label}</span>
-                  {badgeVal && (
-                    <span className={`sb-badge${item.badgeColor ? ' ' + item.badgeColor : ''}`}>
-                      {badgeVal}
-                    </span>
+                  {bv != null && (
+                    <span className={`sb-badge${item.badgeColor?' '+item.badgeColor:''}`}>{bv}</span>
                   )}
                 </div>
               )
@@ -152,8 +157,8 @@ export default function Layout({ children, account, accounts, onAccountChange })
         ))}
       </div>
 
-      {/* MAIN */}
-      <div className={`app-main${collapsed ? ' expanded' : ''}`}>
+      {/* ── MAIN ── */}
+      <div className={`app-main${collapsed?' expanded':''}`}>
         {children}
       </div>
     </>
