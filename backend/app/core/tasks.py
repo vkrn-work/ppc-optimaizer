@@ -194,7 +194,6 @@ async def _collect_account_data_async(account_id: int):
                         batch = campaign_ids[i:i+10]
                         try:
                             ads_data = await dc.get_ads(batch)
-                            # Сохраняем маппинг ad_group_id -> [ad_ids] для обогащения статистики
                         except Exception as e:
                             logger.warning(f"Ads collection error: {e}")
 
@@ -254,9 +253,10 @@ async def _collect_account_data_async(account_id: int):
                     await db.commit()
 
             # ── Сбор поисковых запросов ──────────────────────────────────
-            try:
+            async with YandexDirectCollector(account.oauth_token, account.yandex_login) as dc2:
+              try:
                 from app.models.models import SearchQuery
-                sq_data = await dc.get_search_queries(date_from, date_to)
+                sq_data = await dc2.get_search_queries(date_from, date_to)
                 logger.info(f"Search queries for account {account_id}: {len(sq_data)} rows")
                 for row in sq_data:
                     try:
@@ -315,15 +315,30 @@ async def _collect_account_data_async(account_id: int):
                         logger.warning(f"Error saving search query: {e}")
                 await db.commit()
                 logger.info(f"Search queries saved for account {account_id}")
-            except Exception as e:
+              except Exception as e:
                 logger.warning(f"Search queries collection failed: {e}")
 
-            # ── Сбор из Метрики ──────────────────────────────────────────
+            # ── Сбор из Метрики — все срезы ─────────────────────────────
             if account.metrika_counter_id:
                 try:
+                    from app.models.models import MetrikaSnapshot
                     async with MetrikaCollector(account.oauth_token, account.metrika_counter_id) as mc:
-                        traffic = await mc.get_traffic_summary(date_from, date_to)
-                        logger.info(f"Metrika traffic summary for account {account_id}: {traffic}")
+                        metrika_data = await mc.collect_all(date_from, date_to)
+                        logger.info(
+                            f"Metrika collected for account {account_id}: "
+                            f"visits={metrika_data.get('summary', {}).get('visits', 0)}, "
+                            f"keywords={len(metrika_data.get('keywords', []))}, "
+                            f"devices={len(metrika_data.get('devices', []))}, "
+                            f"regions={len(metrika_data.get('regions', []))}"
+                        )
+                        # Сохранить снапшот
+                        snapshot = MetrikaSnapshot(
+                            account_id=account_id,
+                            date=datetime.utcnow(),
+                            data=metrika_data,
+                        )
+                        db.add(snapshot)
+                        await db.commit()
                 except Exception as e:
                     logger.warning(f"Metrika collection failed for account {account_id}: {e}")
 
