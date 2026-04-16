@@ -27,9 +27,9 @@ celery_app.conf.update(
     },
     beat_schedule={
         # Каждый понедельник в 6:00 МСК — сбор и анализ всех активных кабинетов
-        "weekly-collect-and-analyze": {
+        "daily-collect-and-analyze": {
             "task": "app.core.tasks.collect_and_analyze_all",
-            "schedule": crontab(hour=6, minute=0, day_of_week=1),
+            "schedule": crontab(hour=6, minute=0),
         },
         # Ежедневно в 7:00 — трекинг гипотез
         "daily-hypothesis-tracking": {
