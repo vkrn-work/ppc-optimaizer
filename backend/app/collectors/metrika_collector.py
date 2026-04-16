@@ -127,7 +127,7 @@ class MetrikaCollector:
         params.update({
             "metrics": ",".join([
                 "ym:s:visits",
-                "ym:s:bounceRate"
+                "ym:s:bounceRate",
                 "ym:s:avgVisitDurationSeconds",
             ]),
             "dimensions": "ym:s:deviceCategory",
@@ -143,7 +143,7 @@ class MetrikaCollector:
         params.update({
             "metrics": ",".join([
                 "ym:s:visits",
-                "ym:s:bounceRate"
+                "ym:s:bounceRate",
                 "ym:s:avgVisitDurationSeconds",
             ]),
             "dimensions": "ym:s:regionCity",
@@ -178,7 +178,7 @@ class MetrikaCollector:
         params.update({
             "metrics": ",".join([
                 "ym:s:visits",
-                "ym:s:bounceRate"
+                "ym:s:bounceRate",
             ]),
             "dimensions": "ym:s:date",
             "sort": "ym:s:date",
@@ -191,7 +191,7 @@ class MetrikaCollector:
         params.update({
             "metrics": ",".join([
                 "ym:s:visits",
-                "ym:s:bounceRate"
+                "ym:s:bounceRate",
             ]),
             "dimensions": "ym:s:hourOfDay",
             "sort": "ym:s:hourOfDay",
@@ -204,7 +204,7 @@ class MetrikaCollector:
         params.update({
             "metrics": ",".join([
                 "ym:s:visits",
-                "ym:s:bounceRate"
+                "ym:s:bounceRate",
             ]),
             "dimensions": "ym:s:dayOfWeek",
             "sort": "ym:s:dayOfWeek",
@@ -232,7 +232,7 @@ class MetrikaCollector:
         params.update({
             "metrics": ",".join([
                 "ym:s:visits",
-                "ym:s:bounceRate"
+                "ym:s:bounceRate",
                 "ym:s:avgVisitDurationSeconds",
             ]),
             "dimensions": "ym:s:userType",
