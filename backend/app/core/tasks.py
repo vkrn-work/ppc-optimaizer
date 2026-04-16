@@ -17,7 +17,16 @@ def run_async(coro):
     try:
         return loop.run_until_complete(coro)
     finally:
-        loop.close()
+        try:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
 
 
 @celery_app.task(name="app.core.tasks.collect_and_analyze_all", bind=True, max_retries=3)
