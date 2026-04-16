@@ -161,7 +161,6 @@ class YandexDirectCollector:
                     "CampaignName",
                     "AdGroupId",
                     "AdGroupName",
-                    "AdId",
                     "CriterionId",
                     "Criterion",
                     "CriterionType",
