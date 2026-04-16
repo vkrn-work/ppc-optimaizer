@@ -49,6 +49,10 @@ async def _run_migrations(conn):
         # search_queries — создаётся через create_all, но индексы могут не создаться
         "CREATE INDEX IF NOT EXISTS ix_sq_account_date ON search_queries (account_id, date)",
         "CREATE INDEX IF NOT EXISTS ix_sq_query ON search_queries (account_id, query)",
+        # metrika_snapshots создаётся через create_all
+        "CREATE INDEX IF NOT EXISTS ix_ms_account_date ON metrika_snapshots (account_id, date)",
+        # Фильтровать только активные кампании в представлении
+        "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS state VARCHAR(50)",
     ]
     for sql in migrations:
         try:
