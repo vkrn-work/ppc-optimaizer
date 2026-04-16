@@ -53,6 +53,7 @@ class Campaign(Base):
     status: Mapped[str] = mapped_column(String(50))
     daily_budget: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
     strategy: Mapped[Optional[str]] = mapped_column(String(100))
+    strategy_type: Mapped[Optional[str]] = mapped_column(String(50))  # MANUAL_CPC / AUTO
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -154,7 +155,10 @@ class KeywordStat(Base):
     avg_cpc: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
     avg_bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
     avg_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
+    avg_click_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
     traffic_volume: Mapped[Optional[int]] = mapped_column(Integer)
+    ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    ad_id: Mapped[Optional[str]] = mapped_column(String(100))
 
     __table_args__ = (
         UniqueConstraint("account_id", "keyword_id", "date"),
@@ -240,6 +244,37 @@ class KeywordMetrics(Base):
 
 
 # ─── Правила и предложения ───────────────────────────────────────────────────
+
+
+class SearchQuery(Base):
+    """Поисковый запрос — реальная фраза по которой показывалась реклама"""
+    __tablename__ = "search_queries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(Integer, index=True)
+    keyword_id: Mapped[Optional[int]] = mapped_column(ForeignKey("keywords.id"), index=True)
+    date: Mapped[datetime] = mapped_column(DateTime, index=True)
+    query: Mapped[str] = mapped_column(Text)  # реальный поисковый запрос
+    keyword_phrase: Mapped[Optional[str]] = mapped_column(Text)  # ключ который сматчился
+    match_type: Mapped[Optional[str]] = mapped_column(String(50))  # EXACT/PHRASE/BROAD
+    campaign_id: Mapped[Optional[int]] = mapped_column(ForeignKey("campaigns.id"))
+    ad_group_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ad_groups.id"))
+    impressions: Mapped[int] = mapped_column(Integer, default=0)
+    clicks: Mapped[int] = mapped_column(Integer, default=0)
+    spend: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
+    ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    avg_cpc: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
+    avg_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
+    avg_click_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
+    # Флаги для анализа
+    is_irrelevant: Mapped[bool] = mapped_column(Boolean, default=False)  # нерелевантный
+    is_added_as_keyword: Mapped[bool] = mapped_column(Boolean, default=False)  # добавлен как ключ
+
+    __table_args__ = (
+        Index("ix_sq_account_date", "account_id", "date"),
+        Index("ix_sq_query", "account_id", "query"),
+    )
+
 
 class Rule(Base):
     """
