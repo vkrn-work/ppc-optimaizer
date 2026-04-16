@@ -58,6 +58,32 @@ async def create_account(data: AccountCreate, db: AsyncSession = Depends(get_db)
     return account
 
 
+class AccountUpdate(BaseModel):
+    oauth_token: Optional[str] = None
+    target_cpl: Optional[float] = None
+    target_cpql: Optional[float] = None
+    metrika_counter_id: Optional[str] = None
+
+
+@router.patch("/accounts/{account_id}", response_model=AccountResponse)
+async def update_account(account_id: int, data: AccountUpdate, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Account).where(Account.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(404, "Account not found")
+    if data.oauth_token is not None:
+        account.oauth_token = data.oauth_token
+    if data.target_cpl is not None:
+        account.target_cpl = data.target_cpl
+    if data.target_cpql is not None:
+        account.target_cpql = data.target_cpql
+    if data.metrika_counter_id is not None:
+        account.metrika_counter_id = data.metrika_counter_id
+    await db.commit()
+    await db.refresh(account)
+    return account
+
+
 @router.post("/accounts/{account_id}/sync")
 async def trigger_sync(account_id: int, db: AsyncSession = Depends(get_db)):
     """Запустить ручной сбор данных и анализ"""
