@@ -1,87 +1,161 @@
+import { useState, useEffect } from 'react'
 import { useRouter } from 'next/router'
-import Link from 'next/link'
+import { api } from '../utils/api'
 
 const NAV = [
-  { href: '/', label: 'Дашборд', icon: '▦' },
-  { href: '/campaigns', label: 'Кампании', icon: '⊞' },
-  { href: '/suggestions', label: 'Предложения', icon: '✦' },
-  { href: '/keywords', label: 'Ключевые слова', icon: '⌗' },
-  { href: '/hypotheses', label: 'Гипотезы', icon: '◎' },
-  { href: '/rules', label: 'Правила', icon: '≋' },
-  { href: '/settings', label: 'Настройки', icon: '⚙' },
+  { section: 'АНАЛИЗ', items: [
+    { href: '/',           icon: '◉', label: 'Main Board' },
+    { href: '/campaigns',  icon: '≡', label: 'По кампаниям' },
+    { href: '/bids',       icon: '₽', label: 'Ставки' },
+    { href: '/adjustments',icon: '⊕', label: 'Корректировки' },
+  ]},
+  { section: 'ПОИСКОВЫЕ ФРАЗЫ', items: [
+    { href: '/new-keywords', icon: '+', label: 'Новые ключи', badgeKey: 'new_keywords', badgeColor: 'green' },
+    { href: '/negatives',    icon: '×', label: 'Минуса',      badgeKey: 'negatives' },
+  ]},
+  { section: 'ОПТИМИЗАЦИЯ', items: [
+    { href: '/suggestions', icon: '◈', label: 'Предложения', badgeKey: 'suggestions' },
+    { href: '/hypotheses',  icon: '◇', label: 'Гипотезы' },
+  ]},
+  { section: 'СИСТЕМА', items: [
+    { href: '/settings',     icon: '⊙', label: 'Кабинеты' },
+    { href: '/rules',        icon: '≋', label: 'Правила' },
+    { href: '/diagnostics',  icon: '⚠', label: 'Диагностика', badgeKey: 'errors', danger: true },
+  ]},
 ]
+
+function getMSKTime() {
+  return new Date().toLocaleTimeString('ru-RU', {
+    timeZone: 'Europe/Moscow', hour: '2-digit', minute: '2-digit'
+  })
+}
 
 export default function Layout({ children, account, accounts, onAccountChange }) {
   const router = useRouter()
+  const [collapsed, setCollapsed] = useState(false)
+  const [theme, setTheme] = useState('dark')
+  const [time, setTime] = useState(getMSKTime())
+  const [syncing, setSyncing] = useState(false)
+  const [badges, setBadges] = useState({})
+  const accountId = account?.id
+
+  useEffect(() => {
+    const t = setInterval(() => setTime(getMSKTime()), 30000)
+    return () => clearInterval(t)
+  }, [])
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+  }, [theme])
+
+  useEffect(() => {
+    if (!accountId) return
+    // Загрузить счётчики для бейджей
+    api.getSuggestions(accountId, '?status=pending').then(d => {
+      const urgent = d.filter ? d.filter(s => s.priority === 'today').length : 0
+      setBadges(prev => ({ ...prev, suggestions: urgent || null }))
+    }).catch(() => {})
+  }, [accountId])
+
+  async function handleSync() {
+    if (!accountId || syncing) return
+    setSyncing(true)
+    try { await api.triggerSync(accountId) } catch (e) {}
+    finally { setTimeout(() => setSyncing(false), 2000) }
+  }
+
+  const lastSync = account?.last_sync_at
+    ? new Date(account.last_sync_at).toLocaleString('ru-RU', {
+        timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit',
+        hour: '2-digit', minute: '2-digit'
+      }) + ' МСК'
+    : null
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh' }}>
-      {/* Sidebar */}
-      <aside style={{
-        width: 220,
-        background: '#fff',
-        borderRight: '0.5px solid var(--border-md)',
-        display: 'flex',
-        flexDirection: 'column',
-        flexShrink: 0,
-      }}>
-        <div style={{ padding: '1.25rem', borderBottom: '0.5px solid var(--border)' }}>
-          <div style={{ fontWeight: 500, fontSize: 15, marginBottom: 2 }}>PPC Optimizer</div>
-          <div style={{ fontSize: 12, color: 'var(--text-3)' }}>Яндекс Директ</div>
+    <>
+      {/* TOPBAR */}
+      <div className="app-topbar">
+        <div className="topbar-logo">PPC <span>Optimizer</span></div>
+        <div className="topbar-sep" />
+        <div className="topbar-status">
+          <div className="status-dot" />
+          {lastSync ? `Обновлено: ${lastSync}` : `Сейчас: ${time} МСК`}
         </div>
+        <div className="topbar-right">
+          <button
+            className="btn btn-sm"
+            onClick={handleSync}
+            disabled={syncing}
+            style={{ minWidth: 110 }}
+          >
+            {syncing ? '⏳ Запуск...' : '↻ Обновить данные'}
+          </button>
+          <div
+            className="sb-toggle"
+            onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
+            title="Переключить тему"
+          >
+            {theme === 'dark' ? '☀' : '☾'}
+          </div>
+        </div>
+      </div>
 
-        {/* Account switcher */}
-        {accounts && accounts.length > 0 && (
-          <div style={{ padding: '0.75rem 1rem', borderBottom: '0.5px solid var(--border)' }}>
-            <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>КАБИНЕТ</div>
+      {/* SIDEBAR */}
+      <div className={`app-sidebar${collapsed ? ' collapsed' : ''}`}>
+        {/* Кабинет */}
+        <div className="sb-cabinet">
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: collapsed ? 0 : 6 }}>
+            {!collapsed && <div className="sb-label" style={{ padding: 0 }}>Кабинет</div>}
+            <div className="sb-toggle" onClick={() => setCollapsed(c => !c)} style={{ marginLeft: collapsed ? 'auto' : 0 }}>
+              {collapsed ? '›' : '‹'}
+            </div>
+          </div>
+          {!collapsed && (
             <select
-              value={account?.id || ''}
-              onChange={(e) => onAccountChange?.(Number(e.target.value))}
-              style={{ width: '100%', fontSize: 12 }}
+              className="cabinet-select"
+              value={accountId || ''}
+              onChange={e => onAccountChange && onAccountChange(Number(e.target.value))}
             >
-              {accounts.map(a => (
+              {accounts?.map(a => (
                 <option key={a.id} value={a.id}>{a.name}</option>
               ))}
             </select>
-          </div>
-        )}
+          )}
+        </div>
 
         {/* Navigation */}
-        <nav style={{ flex: 1, padding: '0.5rem 0' }}>
-          {NAV.map(item => {
-            const active = router.pathname === item.href
-            return (
-              <Link key={item.href} href={item.href}>
-                <div style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  padding: '8px 1rem',
-                  fontSize: 13,
-                  fontWeight: active ? 500 : 400,
-                  color: active ? 'var(--text)' : 'var(--text-2)',
-                  background: active ? 'var(--bg)' : 'transparent',
-                  borderRadius: 6,
-                  margin: '1px 8px',
-                  cursor: 'pointer',
-                }}>
-                  <span style={{ fontSize: 14, opacity: 0.7 }}>{item.icon}</span>
-                  {item.label}
+        {NAV.map(({ section, items }) => (
+          <div key={section} className="sb-section">
+            <div className="sb-label">{section}</div>
+            {items.map(item => {
+              const isActive = router.pathname === item.href
+              const badgeVal = badges[item.badgeKey]
+              return (
+                <div
+                  key={item.href}
+                  className={`sb-item${isActive ? ' active' : ''}${item.danger ? ' danger' : ''}`}
+                  onClick={() => router.push(item.href)}
+                  style={item.danger ? { color: 'var(--red)' } : {}}
+                  title={collapsed ? item.label : ''}
+                >
+                  <span className="sb-icon">{item.icon}</span>
+                  <span className="sb-text">{item.label}</span>
+                  {badgeVal && (
+                    <span className={`sb-badge${item.badgeColor ? ' ' + item.badgeColor : ''}`}>
+                      {badgeVal}
+                    </span>
+                  )}
                 </div>
-              </Link>
-            )
-          })}
-        </nav>
+              )
+            })}
+          </div>
+        ))}
+      </div>
 
-        <div style={{ padding: '1rem', borderTop: '0.5px solid var(--border)', fontSize: 11, color: 'var(--text-3)' }}>
-          MVP v1.0 · {new Date().getFullYear()}
-        </div>
-      </aside>
-
-      {/* Main content */}
-      <main style={{ flex: 1, overflow: 'auto', padding: '1.5rem 2rem', maxWidth: 1200 }}>
+      {/* MAIN */}
+      <div className={`app-main${collapsed ? ' expanded' : ''}`}>
         {children}
-      </main>
-    </div>
+      </div>
+    </>
   )
 }
