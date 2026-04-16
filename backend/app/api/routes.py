@@ -697,3 +697,77 @@ async def delete_account(account_id: int, db: AsyncSession = Depends(get_db)):
     await db.delete(account)
     await db.commit()
     return {"status": "deleted", "id": account_id}
+
+
+# ─── Метрика снапшот ──────────────────────────────────────────────────────────
+
+@router.get("/accounts/{account_id}/metrika-snapshot")
+async def get_metrika_snapshot(account_id: int, db: AsyncSession = Depends(get_db)):
+    """Последний снапшот данных из Метрики"""
+    from app.models.models import MetrikaSnapshot
+    result = await db.execute(
+        select(MetrikaSnapshot)
+        .where(MetrikaSnapshot.account_id == account_id)
+        .order_by(desc(MetrikaSnapshot.date))
+        .limit(1)
+    )
+    snapshot = result.scalar_one_or_none()
+    if not snapshot:
+        raise HTTPException(404, "No Metrika data yet")
+    return {"date": snapshot.date.isoformat(), "data": snapshot.data}
+
+
+# ─── Поисковые запросы ────────────────────────────────────────────────────────
+
+@router.get("/accounts/{account_id}/search-queries")
+async def get_search_queries(
+    account_id: int,
+    suggest: str = "",
+    limit: int = 200,
+    db: AsyncSession = Depends(get_db)
+):
+    """Поисковые запросы с рекомендациями"""
+    from app.models.models import SearchQuery, Keyword
+    from sqlalchemy import and_
+
+    q = select(SearchQuery).where(SearchQuery.account_id == account_id)
+
+    if suggest == "negatives":
+        # Фразы с кликами но без конверсий — кандидаты в минуса
+        q = q.where(
+            and_(
+                SearchQuery.clicks >= 3,
+                SearchQuery.query.ilike('%стандарт%') |
+                SearchQuery.query.ilike('%что такое%') |
+                SearchQuery.query.ilike('%скачать%') |
+                SearchQuery.query.ilike('%характеристики%') |
+                SearchQuery.query.ilike('%описание%')
+            )
+        ).order_by(SearchQuery.spend.desc())
+    elif suggest == "new_keywords":
+        # Семантическое соответствие с кликами — кандидаты в новые ключи
+        q = q.where(
+            and_(
+                SearchQuery.clicks >= 2,
+                SearchQuery.match_type != 'EXACT',
+            )
+        ).order_by(SearchQuery.clicks.desc())
+    else:
+        q = q.order_by(SearchQuery.clicks.desc())
+
+    q = q.limit(limit)
+    result = await db.execute(q)
+    rows = result.scalars().all()
+
+    return [{
+        "id": r.id,
+        "query": r.query,
+        "keyword_phrase": r.keyword_phrase,
+        "match_type": r.match_type,
+        "clicks": r.clicks,
+        "impressions": r.impressions,
+        "spend": float(r.spend) if r.spend else 0,
+        "ctr": float(r.ctr) if r.ctr else None,
+        "avg_position": float(r.avg_position) if r.avg_position else None,
+        "date": r.date.isoformat() if r.date else None,
+    } for r in rows]
