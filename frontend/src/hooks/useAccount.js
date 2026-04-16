@@ -1,39 +1,32 @@
-import { useState, useEffect, createContext, useContext } from 'react'
+import { useState, useEffect } from 'react'
 import { api } from '../utils/api'
 
-const AccountContext = createContext(null)
-
-export function AccountProvider({ children }) {
+export function useAccount() {
   const [accounts, setAccounts] = useState([])
   const [accountId, setAccountId] = useState(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    api.getAccounts().then(data => {
-      setAccounts(data)
-      if (data.length > 0) {
-        const saved = typeof window !== 'undefined' ? localStorage.getItem('account_id') : null
-        const id = saved ? Number(saved) : data[0].id
-        setAccountId(id)
-      }
-      setLoading(false)
-    }).catch(() => setLoading(false))
+    api.getAccounts()
+      .then(data => {
+        setAccounts(data)
+        if (data.length > 0) {
+          const saved = typeof window !== 'undefined' ? localStorage.getItem('accountId') : null
+          const id = saved ? Number(saved) : data[0].id
+          const exists = data.find(a => a.id === id)
+          setAccountId(exists ? id : data[0].id)
+        }
+      })
+      .catch(console.error)
+      .finally(() => setLoading(false))
   }, [])
+
+  const account = accounts.find(a => a.id === accountId) || null
 
   function switchAccount(id) {
     setAccountId(id)
-    if (typeof window !== 'undefined') localStorage.setItem('account_id', id)
+    if (typeof window !== 'undefined') localStorage.setItem('accountId', id)
   }
 
-  const account = accounts.find(a => a.id === accountId)
-
-  return (
-    <AccountContext.Provider value={{ account, accounts, accountId, switchAccount, loading }}>
-      {children}
-    </AccountContext.Provider>
-  )
-}
-
-export function useAccount() {
-  return useContext(AccountContext)
+  return { account, accounts, accountId, switchAccount, loading }
 }
