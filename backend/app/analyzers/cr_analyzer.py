@@ -209,6 +209,15 @@ class CRAnalyzer:
         problems = problems[:20]
         opportunities = opportunities[:5]
 
+        # Средние позиции по всему кабинету
+        pos_vals = [float(s["avg_position"]) for s in curr_stats.values() if s["avg_position"] and float(s["avg_position"]) > 0]
+        cpos_vals = [float(s["avg_click_position"]) for s in curr_stats.values() if s.get("avg_click_position") and float(s["avg_click_position"]) > 0]
+        traf_vals = [float(s["traffic_volume"]) for s in curr_stats.values() if s["traffic_volume"] and float(s["traffic_volume"]) > 0]
+
+        avg_pos = round(sum(pos_vals)/len(pos_vals), 2) if pos_vals else None
+        avg_cpos = round(sum(cpos_vals)/len(cpos_vals), 2) if cpos_vals else None
+        avg_traf = round(sum(traf_vals)/len(traf_vals)) if traf_vals else None
+
         # Сводка
         analysis.summary = {
             "total_clicks": total_clicks,
@@ -216,6 +225,9 @@ class CRAnalyzer:
             "total_spend": round(total_spend, 2),
             "ctr": round(total_clicks / total_impressions * 100, 2) if total_impressions > 0 else 0,
             "avg_cpc": round(total_spend / total_clicks, 2) if total_clicks > 0 else 0,
+            "avg_position": avg_pos,
+            "avg_click_position": avg_cpos,
+            "avg_traffic_volume": avg_traf,
             "keywords_analyzed": keywords_analyzed,
             "problems_found": len(problems),
             "opportunities_found": len(opportunities),
