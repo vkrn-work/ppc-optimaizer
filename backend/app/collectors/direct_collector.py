@@ -65,7 +65,10 @@ class YandexDirectCollector:
     async def get_campaigns(self) -> list[dict]:
         """Кампании с полными настройками включая стратегию"""
         result = await self._post("campaigns", "get", {
-            "SelectionCriteria": {},
+            "SelectionCriteria": {
+                "States": ["ON"],
+                "Statuses": ["ACCEPTED"],
+            },
             "FieldNames": [
                 "Id", "Name", "Type", "Status", "State",
                 "DailyBudget", "StartDate", "EndDate",
@@ -118,8 +121,7 @@ class YandexDirectCollector:
         result = await self._post("ads", "get", {
             "SelectionCriteria": {"CampaignIds": campaign_ids},
             "FieldNames": [
-                "Id", "AdGroupId", "CampaignId", "Status", "State",
-                "Type", "ServingStatus",
+                "Id", "AdGroupId", "CampaignId", "Status", "State", "Type",
             ],
             "TextAdFieldNames": ["Title", "Title2", "Text"],
             "Page": {"Limit": 10000},
