@@ -123,7 +123,12 @@ async def _collect_account_data_async(account_id: int):
                 # Группы
                 campaign_ids = [str(c["Id"]) for c in campaigns_data]
                 if campaign_ids:
-                    groups_data = await dc.get_ad_groups(campaign_ids[:100])
+                    # Директ API лимит: 10 кампаний за запрос для adgroups
+                    groups_data = []
+                    for i in range(0, len(campaign_ids), 10):
+                        batch = campaign_ids[i:i+10]
+                        batch_result = await dc.get_ad_groups(batch)
+                        groups_data.extend(batch_result)
                     for g in groups_data:
                         camp_result = await db.execute(
                             select(Campaign).where(
@@ -148,7 +153,12 @@ async def _collect_account_data_async(account_id: int):
                     await db.commit()
 
                     # Ключи
-                    keywords_data = await dc.get_keywords(campaign_ids[:100])
+                    # Батчинг ключей по 10 кампаний
+                    keywords_data = []
+                    for i in range(0, len(campaign_ids), 10):
+                        batch = campaign_ids[i:i+10]
+                        batch_result = await dc.get_keywords(batch)
+                        keywords_data.extend(batch_result)
                     for kw in keywords_data:
                         group_result = await db.execute(
                             select(AdGroup).where(
@@ -179,7 +189,8 @@ async def _collect_account_data_async(account_id: int):
                     await db.commit()
 
                     # Статистика
-                    stats_data = await dc.get_keyword_stats(date_from, date_to, campaign_ids[:100])
+                    # Статистику запрашиваем без фильтра по кампаниям — Reports API сам агрегирует
+                    stats_data = await dc.get_keyword_stats(date_from, date_to)
                     for row in stats_data:
                         kw_result = await db.execute(
                             select(Keyword).where(
