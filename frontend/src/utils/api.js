@@ -1,4 +1,4 @@
-const BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+const BASE = 'https://ppc-optimaizer-production.up.railway.app'
 
 async function req(path, options = {}) {
   const res = await fetch(`${BASE}/api/v1${path}`, {
