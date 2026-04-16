@@ -1,15 +1,15 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg:      #0d0f14;
-  --bg2:     #141720;
-  --bg3:     #1a1e2a;
-  --bg4:     #212636;
-  --border:  rgba(255,255,255,0.07);
-  --border2: rgba(255,255,255,0.12);
-  --text1:   #f0f2f7;
-  --text2:   #8b93a8;
-  --text3:   #545c70;
+  --bg:      #f0f2f7;
+  --bg2:     #ffffff;
+  --bg3:     #f5f7fc;
+  --bg4:     #e8ecf5;
+  --border:  rgba(0,0,0,0.07);
+  --border2: rgba(0,0,0,0.13);
+  --text1:   #111827;
+  --text2:   #4b5563;
+  --text3:   #9ca3af;
   --accent:  #5b7bff;
   --accent2: #3d5be0;
   --green:   #22c98a;
@@ -37,22 +37,43 @@
   --teal-bg: var(--green-bg);
   --amber: var(--yellow);
   --amber-bg: var(--yellow-bg);
+  /* Light theme: slightly adjusted colors */
+  --accent:  #4060e0;
+  --accent2: #2845c0;
+  --green:   #1a9e6a;
+  --green-bg: rgba(26,158,106,0.1);
+  --red:     #d93030;
+  --red-bg:  rgba(217,48,48,0.08);
+  --yellow:  #c07010;
+  --yellow-bg: rgba(192,112,16,0.08);
+  --blue:    #1a6fc4;
+  --blue-bg: rgba(26,111,196,0.08);
 }
 
-[data-theme="light"] {
-  --bg:      #f0f2f7;
-  --bg2:     #ffffff;
-  --bg3:     #f5f7fc;
-  --bg4:     #e8ecf5;
-  --border:  rgba(0,0,0,0.07);
-  --border2: rgba(0,0,0,0.13);
-  --text1:   #111827;
-  --text2:   #4b5563;
-  --text3:   #9ca3af;
-  --surface: #ffffff;
-  --text: #111827;
-  --text-2: #4b5563;
-  --text-3: #9ca3af;
+[data-theme="dark"] {
+  --bg:      #0d0f14;
+  --bg2:     #141720;
+  --bg3:     #1a1e2a;
+  --bg4:     #212636;
+  --border:  rgba(255,255,255,0.07);
+  --border2: rgba(255,255,255,0.12);
+  --text1:   #f0f2f7;
+  --text2:   #8b93a8;
+  --text3:   #545c70;
+  --surface: #1a1e2a;
+  --text: #f0f2f7;
+  --text-2: #8b93a8;
+  --text-3: #545c70;
+  --accent:  #5b7bff;
+  --accent2: #3d5be0;
+  --green:   #22c98a;
+  --green-bg: rgba(34,201,138,0.12);
+  --red:     #ff4f4f;
+  --red-bg:  rgba(255,79,79,0.12);
+  --yellow:  #f5a623;
+  --yellow-bg: rgba(245,166,35,0.12);
+  --blue:    #4d9cf0;
+  --blue-bg: rgba(77,156,240,0.12);
 }
 
 body {
@@ -172,7 +193,9 @@ button { cursor: pointer; font-family: inherit; }
 .kpi-card {
   background: var(--bg3); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 11px 13px;
+  transition: border-color 0.15s, transform 0.1s;
 }
+.kpi-card:hover { border-color: var(--border2); }
 .kpi-label { font-size: 11px; color: var(--text3); margin-bottom: 5px; }
 .kpi-value { font-size: 20px; font-weight: 600; color: var(--text1); margin-bottom: 3px; line-height: 1.2; }
 .kpi-delta { font-size: 11px; display: flex; align-items: center; gap: 3px; }
@@ -236,6 +259,7 @@ button { cursor: pointer; font-family: inherit; }
 .btn-success { background: var(--green-bg); color: var(--green); border-color: transparent; }
 .btn-danger  { background: var(--red-bg); color: var(--red); border-color: transparent; }
 .btn-sm { padding: 4px 10px; font-size: 11px; }
+.sb-danger { color: var(--red) !important; }
 
 /* ── Table ── */
 table { width: 100%; border-collapse: collapse; }
