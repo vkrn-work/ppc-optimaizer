@@ -8,7 +8,6 @@ from app.api.routes import router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Инициализация БД и seed данных при старте
     await init_db()
     await seed_default_rules()
     yield
@@ -22,90 +21,89 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins_list,
+    allow_origins=["*"],   # Railway handles SSL termination; restrict per-env if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Routes at /api/v1/...
 app.include_router(router, prefix="/api/v1")
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.0.0"}
+    """Health check — DB ping included"""
+    from app.db.database import get_db
+    try:
+        from sqlalchemy import text
+        async for db in get_db():
+            await db.execute(text("SELECT 1"))
+        db_status = "ok"
+    except Exception as e:
+        db_status = str(e)[:80]
+    return {
+        "status": "ok" if db_status == "ok" else "degraded",
+        "db": db_status,
+        "version": "1.0.0",
+    }
 
 
 async def seed_default_rules():
-    """Заполнить базовые правила из воркфлоу при первом запуске"""
-    from app.db.database import AsyncSessionLocal
-    from app.models.models import Rule
-    from sqlalchemy import select, func
-
-    async with AsyncSessionLocal() as db:
-        count = await db.execute(select(func.count(Rule.id)))
-        if count.scalar() > 0:
-            return  # Правила уже есть
-
-        default_rules = [
-            Rule(
-                name="Высокий CR — поднять ставку",
-                condition_type="cr_high",
-                min_clicks=30,
-                cr_min=0.15,
-                action_type="bid_raise",
-                priority="today",
-                description="CR > 15% при 30+ кликах. Формула: CPL_цель × CR_ключа",
-            ),
-            Rule(
-                name="Нормальный CR — держать",
-                condition_type="cr_mid",
-                min_clicks=30,
-                cr_min=0.05,
-                cr_max=0.15,
-                action_type="bid_hold",
-                priority="this_week",
-                description="CR 5–15%. Стабилизировать позиции.",
-            ),
-            Rule(
-                name="Низкий CR при достаточных данных — CPA",
-                condition_type="cr_low_cpa",
-                min_clicks=100,
-                cr_min=0.01,
-                cr_max=0.05,
-                action_type="strategy_cpa",
-                priority="this_week",
-                description="CR 1–5% при 100+ кликах. Алгоритм CPA оптимизирует сам.",
-            ),
-            Rule(
-                name="Очень низкий CR — минус-слова",
-                condition_type="cr_critical",
-                min_clicks=100,
-                cr_max=0.01,
-                action_type="add_negatives",
-                priority="today",
-                description="CR < 1% при 100+ кликах. Информационный трафик.",
-            ),
-            Rule(
-                name="CPQL превышает цель в 1.5×",
-                condition_type="cpql_over_target",
-                min_clicks=30,
-                cpql_multiplier=1.5,
-                action_type="bid_lower",
-                action_params={"reduce_percent": 20},
-                priority="this_week",
-                description="Лиды слишком дорогие. Снизить ставку на 20%.",
-            ),
-            Rule(
-                name="Высокий CR — масштабировать семантику",
-                condition_type="cr_scale",
-                min_clicks=30,
-                cr_min=0.15,
-                action_type="expand_semantics",
-                priority="scale",
-                description="CR > 15% подтверждён. Расширить кластер смежными ключами.",
-            ),
-        ]
-        for rule in default_rules:
-            db.add(rule)
-        await db.commit()
+    """Заполнить базовые правила при первом запуске"""
+    try:
+        from app.db.database import AsyncSessionLocal
+        from app.models.models import Rule
+        from sqlalchemy import select
+        async with AsyncSessionLocal() as db:
+            existing = await db.execute(select(Rule).limit(1))
+            if existing.scalar_one_or_none():
+                return
+            rules = [
+                Rule(
+                    account_id=None,
+                    name="Низкая позиция показа",
+                    rule_type="signal",
+                    condition={"metric": "avg_position", "operator": ">", "value": 3, "min_clicks": 5},
+                    action={"type": "suggest_bid_increase", "increase_pct": 30},
+                    priority=1,
+                    is_active=True,
+                    description="Если позиция показа > 3 при ≥5 кликах → поднять ставку на 30%",
+                ),
+                Rule(
+                    account_id=None,
+                    name="Падение трафика",
+                    rule_type="signal",
+                    condition={"metric": "clicks_delta", "operator": "<", "value": -30, "min_traffic": 50},
+                    action={"type": "suggest_bid_increase", "increase_pct": 20},
+                    priority=2,
+                    is_active=True,
+                    description="Если клики упали > 30% при объёме трафика > 50 → поднять ставку",
+                ),
+                Rule(
+                    account_id=None,
+                    name="CTR = 0 при показах",
+                    rule_type="signal",
+                    condition={"metric": "ctr", "operator": "==", "value": 0, "min_impressions": 100},
+                    action={"type": "flag_ad_issue"},
+                    priority=3,
+                    is_active=True,
+                    description="Если CTR = 0 при ≥100 показах → проблема с объявлением",
+                ),
+                Rule(
+                    account_id=None,
+                    name="Позиция клика хуже показа",
+                    rule_type="signal",
+                    condition={"metric": "click_position_gap", "operator": ">", "value": 1.5},
+                    action={"type": "flag_ctr_issue"},
+                    priority=4,
+                    is_active=True,
+                    description="Если поз.клика хуже поз.показа на 1.5+ → объявление не цепляет аудиторию",
+                ),
+            ]
+            for r in rules:
+                db.add(r)
+            await db.commit()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Could not seed rules: {e}")
