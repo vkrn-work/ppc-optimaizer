@@ -15,24 +15,36 @@ from app.db.database import get_db
 from app.models.models import (
     Account, Campaign, AdGroup, Keyword, KeywordStat,
     AnalysisResult, KeywordMetrics, Suggestion, Hypothesis,
-    Rule, Lead, SuggestionStatus, HypothesisVerdict,
+    Rule, Lead, SuggestionStatus,
 )
 from app.core.config import settings
 
-router = APIRouter(prefix="/api/v1")
+router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def period_dates(period: str):
-    """Вернуть (curr_start, curr_end, prev_start, prev_end) для периода"""
+    """
+    Вернуть (curr_start, curr_end, prev_start, prev_end) для периода.
+
+    Логика сравнения:
+    - yesterday  → вчера vs среднее за последние 14 дней (без вчера)
+    - 3d         → последние 3 дня vs предыдущие 3 дня
+    - week       → последние 7 дней vs предыдущие 7 дней
+    - month      → последние 30 дней vs предыдущие 30 дней
+
+    Для "вчера" используем 14-дневное среднее как baseline —
+    один день слишком волатилен чтобы сравнивать с одним днём.
+    """
     today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     if period == "yesterday":
         curr_end   = today
         curr_start = today - timedelta(days=1)
+        # Baseline: среднее за 14 дней до вчера
         prev_end   = curr_start
-        prev_start = prev_end - timedelta(days=1)
+        prev_start = prev_end - timedelta(days=14)
     elif period == "3d":
         curr_end   = today
         curr_start = today - timedelta(days=3)
@@ -311,6 +323,33 @@ async def get_dashboard(
                 "browsers": metrika.data.get("browsers", [])[:10],
             }
 
+    # ── Дневная динамика за curr период (для спарклайнов и трендов) ──────
+    daily_q = await db.execute(
+        select(
+            KeywordStat.date,
+            func.sum(KeywordStat.clicks).label("clicks"),
+            func.sum(KeywordStat.impressions).label("impressions"),
+            func.sum(KeywordStat.spend).label("spend"),
+            func.avg(KeywordStat.avg_position).label("avg_position"),
+            func.avg(KeywordStat.ctr).label("ctr"),
+        )
+        .where(
+            KeywordStat.account_id == account_id,
+            KeywordStat.date >= curr_start,
+            KeywordStat.date <= curr_end,
+        )
+        .group_by(KeywordStat.date)
+        .order_by(KeywordStat.date)
+    )
+    daily_stats = [{
+        "date": r.date.strftime("%Y-%m-%d"),
+        "clicks": int(r.clicks or 0),
+        "impressions": int(r.impressions or 0),
+        "spend": round(float(r.spend or 0), 2),
+        "avg_position": round(float(r.avg_position), 2) if r.avg_position else None,
+        "ctr": round(float(r.ctr), 2) if r.ctr else None,
+    } for r in daily_q]
+
     # Топ-5 кампаний по расходу за период
     top_campaigns_q = await db.execute(
         select(
@@ -357,6 +396,13 @@ async def get_dashboard(
         "analysis_at": analysis.created_at.isoformat() if analysis else None,
         "suggestions_pending": today_suggestions.scalar() or 0,
         "top_campaigns": top_campaigns,
+        "daily_stats": daily_stats,
+        "period_label": {
+            "yesterday": "Вчера vs среднее за 14 дней",
+            "3d": "3 дня vs предыдущие 3 дня",
+            "week": "7 дней vs предыдущие 7 дней",
+            "month": "30 дней vs предыдущие 30 дней",
+        }.get(period, period),
     }
 
 
@@ -607,7 +653,7 @@ async def action_suggestion(suggestion_id: str, data: dict, db: AsyncSession = D
             change_description=suggestion_data.get("action", ""),
             forecast=suggestion_data.get("description", ""),
             source="algorithm",
-            verdict=HypothesisVerdict.pending,
+            verdict="pending",
             applied_at=datetime.utcnow(),
             track_until=datetime.utcnow() + timedelta(days=7),
         )
@@ -688,7 +734,7 @@ async def create_hypothesis(account_id: int, data: HypothesisCreate, db: AsyncSe
         object_type=data.object_type,
         object_id=data.keyword_id or data.object_id,
         source=data.source,
-        verdict=HypothesisVerdict.pending,
+        verdict="pending",
         applied_at=datetime.utcnow(),
         track_until=datetime.utcnow() + timedelta(days=7),
     )
@@ -883,7 +929,3 @@ async def get_diagnostics(account_id: int, db: AsyncSession = Depends(get_db)):
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
-
-@router.get("/health")
-async def health():
-    return {"status": "ok", "version": "1.0.0"}
