@@ -1,155 +1,156 @@
 import { useState, useEffect } from 'react'
 import Layout from '../components/Layout'
 import { useAccount } from '../hooks/useAccount'
+import { api } from '../utils/api'
 
-const BASE = 'https://ppc-optimaizer-production.up.railway.app'
-
-function rub(n) { return !n ? '—' : Math.round(n).toLocaleString('ru') + ' ₽' }
-function pct(n) { return !n ? '—' : (Math.round(n * 10) / 10) + '%' }
-function num(n) { return (!n && n !== 0) ? '—' : Math.round(n).toLocaleString('ru') }
-function pos(n) { return (!n || n === 0) ? '—' : (Math.round(n * 10) / 10) }
-
-const METRICS = [
-  { key: 'clicks', label: 'Клики', fmt: num },
-  { key: 'impressions', label: 'Показы', fmt: num },
-  { key: 'spend', label: 'Расход', fmt: rub },
-  { key: 'ctr', label: 'CTR', fmt: pct },
-  { key: 'avg_cpc', label: 'CPC', fmt: rub },
-  { key: 'avg_position', label: 'Позиция', fmt: pos },
-  { key: 'avg_click_position', label: 'Поз. клика', fmt: pos },
-  { key: 'traffic_volume', label: 'Объём', fmt: num },
+const PERIODS = [
+  {key:'yesterday',label:'Вчера'},
+  {key:'3d',label:'3 дня'},
+  {key:'week',label:'Неделя'},
+  {key:'month',label:'Месяц'},
 ]
+
+function f(n, suffix='') { return n==null?'—':typeof n==='number'?Math.round(n*10)/10+suffix:n+suffix }
+function fR(n) { return n==null?'—':Math.round(n).toLocaleString('ru')+' ₽' }
+function fP(n) { return (!n||n===0)?'—':(Math.round(n*10)/10) }
+
+const PROBLEM_LABELS = {
+  low_position:'📍 Позиция',traffic_drop:'📉 Трафик',
+  zero_ctr:'👁 CTR=0',low_ctr:'📊 CTR низкий',click_position_gap:'⬇ Поз.клика',
+}
 
 export default function Campaigns() {
   const { account, accounts, accountId, switchAccount } = useAccount()
+  const [period, setPeriod] = useState('week')
+  const [view, setView] = useState('campaigns')
   const [campaigns, setCampaigns] = useState([])
   const [keywords, setKeywords] = useState([])
-  const [view, setView] = useState('campaigns')
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
-  const [selCampaigns, setSelCampaigns] = useState([])
+  const [selCampaign, setSelCampaign] = useState('')
 
   useEffect(() => {
     if (!accountId) return
     setLoading(true)
-    Promise.all([
-      fetch(`${BASE}/api/v1/accounts/${accountId}/campaigns`).then(r => r.json()),
-      fetch(`${BASE}/api/v1/accounts/${accountId}/keywords`).then(r => r.json()),
-    ]).then(([c, k]) => {
-      setCampaigns(Array.isArray(c) ? c : [])
-      setKeywords(Array.isArray(k) ? k : [])
-    }).catch(console.error).finally(() => setLoading(false))
-  }, [accountId])
+    const loads = [api.getCampaigns(accountId, period)]
+    if (view === 'keywords') loads.push(api.getKeywords(accountId, `?period=${period}${selCampaign?'&campaign_id='+selCampaign:''}${search?'&search='+search:''}`))
+    Promise.all(loads)
+      .then(([c, k]) => { setCampaigns(Array.isArray(c)?c:[]); if(k) setKeywords(Array.isArray(k)?k:[]) })
+      .catch(console.error)
+      .finally(() => setLoading(false))
+  }, [accountId, period, view, selCampaign, search])
 
-  const filteredKW = keywords.filter(kw => {
-    if (search && !kw.phrase?.toLowerCase().includes(search.toLowerCase())) return false
-    if (selCampaigns.length > 0) {
-      // filter by selected campaigns if we had campaign_id on keywords
-    }
-    return true
-  })
-
-  const displayData = view === 'keywords' ? filteredKW : campaigns.filter(c =>
-    !search || c.name?.toLowerCase().includes(search.toLowerCase())
-  )
+  const filteredC = campaigns.filter(c => !search || c.name?.toLowerCase().includes(search.toLowerCase()))
 
   return (
     <Layout account={account} accounts={accounts} onAccountChange={switchAccount}>
       <div className="page-header">
         <div className="page-title">По кампаниям</div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <input
-            placeholder="Поиск..."
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-            style={{ width: 180 }}
-          />
+        <div style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+          <input placeholder="Поиск..." value={search} onChange={e=>setSearch(e.target.value)} style={{width:160}} />
+          {view==='keywords' && (
+            <select value={selCampaign} onChange={e=>setSelCampaign(e.target.value)} className="btn" style={{padding:'5px 10px'}}>
+              <option value="">Все кампании</option>
+              {campaigns.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          )}
           <div className="period-tabs">
-            {['campaigns', 'keywords'].map(v => (
-              <div key={v} className={`period-tab${view === v ? ' active' : ''}`} onClick={() => setView(v)}>
-                {v === 'campaigns' ? 'Кампании' : 'Ключевые слова'}
-              </div>
+            {PERIODS.map(p=>(
+              <div key={p.key} className={`period-tab${period===p.key?' active':''}`} onClick={()=>setPeriod(p.key)}>{p.label}</div>
             ))}
+          </div>
+          <div className="period-tabs">
+            <div className={`period-tab${view==='campaigns'?' active':''}`} onClick={()=>setView('campaigns')}>Кампании</div>
+            <div className={`period-tab${view==='keywords'?' active':''}`} onClick={()=>setView('keywords')}>Ключи</div>
           </div>
         </div>
       </div>
 
       {loading ? (
-        <div style={{ color: 'var(--text3)', fontSize: 13 }}>Загрузка...</div>
+        <div style={{color:'var(--text3)',fontSize:13}}>Загрузка...</div>
+      ) : view === 'campaigns' ? (
+        <div className="card" style={{padding:0,overflow:'auto'}}>
+          <table>
+            <thead>
+              <tr>
+                <th style={{minWidth:200}}>Кампания</th>
+                <th>Расход</th>
+                <th>Клики</th>
+                <th>CTR</th>
+                <th>Позиция</th>
+                <th>Трафик</th>
+                <th>Стратегия</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredC.length===0 ? (
+                <tr><td colSpan={7} style={{textAlign:'center',color:'var(--text3)',padding:'2rem'}}>
+                  {campaigns.length===0 ? 'Нет данных — запустите сбор' : 'Нет совпадений'}
+                </td></tr>
+              ) : filteredC.map(c=>(
+                <tr key={c.id}>
+                  <td style={{fontWeight:500,fontSize:12}}>
+                    <div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:260}}>{c.name}</div>
+                  </td>
+                  <td>{fR(c.spend)}</td>
+                  <td>{f(c.clicks)}</td>
+                  <td>{c.ctr ? f(c.ctr,'%') : '—'}</td>
+                  <td>{fP(c.avg_position)}</td>
+                  <td>{f(c.traffic_volume)}</td>
+                  <td>
+                    <span className={`badge ${c.strategy_type==='MANUAL_CPC'?'badge-ok':'badge-info'}`}>
+                      {c.strategy_type==='MANUAL_CPC'?'Ручная':'Авто'}
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       ) : (
-        <div className="card" style={{ padding: 0, overflow: 'auto' }}>
-          {view === 'campaigns' ? (
-            <table>
-              <thead>
-                <tr>
-                  <th>Кампания</th>
-                  <th>Тип</th>
-                  <th>Стратегия</th>
-                  <th>Статус</th>
-                  <th>Групп</th>
+        <div className="card" style={{padding:0,overflow:'auto'}}>
+          <table>
+            <thead>
+              <tr>
+                <th style={{minWidth:220}}>Фраза</th>
+                <th>Ставка</th>
+                <th>Клики</th>
+                <th>Δ клики</th>
+                <th>Расход</th>
+                <th>Позиция</th>
+                <th>Проблема</th>
+              </tr>
+            </thead>
+            <tbody>
+              {keywords.length===0 ? (
+                <tr><td colSpan={7} style={{textAlign:'center',color:'var(--text3)',padding:'2rem'}}>Нет данных</td></tr>
+              ) : keywords.slice(0,300).map(kw=>(
+                <tr key={kw.id}>
+                  <td style={{fontFamily:'monospace',fontSize:11,maxWidth:280}}>
+                    <div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{kw.phrase}</div>
+                  </td>
+                  <td>{kw.current_bid ? fR(kw.current_bid) : '—'}</td>
+                  <td>{f(kw.clicks)}</td>
+                  <td>
+                    {kw.click_delta != null && (
+                      <span style={{color:kw.click_delta>0?'var(--green)':'var(--red)',fontSize:11}}>
+                        {kw.click_delta>0?'▲':'▼'}{Math.abs(kw.click_delta)}%
+                      </span>
+                    )}
+                  </td>
+                  <td>{fR(kw.spend)}</td>
+                  <td>{fP(kw.avg_position)}</td>
+                  <td>
+                    {kw.problem && (
+                      <span className="badge badge-warn" style={{fontSize:10}}>
+                        {PROBLEM_LABELS[kw.problem.type] || kw.problem.type}
+                      </span>
+                    )}
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {displayData.length === 0 ? (
-                  <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text3)', padding: '2rem' }}>
-                    Нет данных — запустите сбор
-                  </td></tr>
-                ) : displayData.map(c => (
-                  <tr key={c.id}>
-                    <td style={{ fontWeight: 500, maxWidth: 300 }}>
-                      <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {c.name}
-                      </div>
-                    </td>
-                    <td style={{ color: 'var(--text2)', fontSize: 12 }}>{c.campaign_type || '—'}</td>
-                    <td>
-                      <span className={`badge ${c.strategy_type === 'MANUAL_CPC' ? 'badge-ok' : 'badge-info'}`}>
-                        {c.strategy_type === 'MANUAL_CPC' ? 'Ручная' : c.strategy_type || '—'}
-                      </span>
-                    </td>
-                    <td>
-                      <span className={`badge ${c.is_active ? 'badge-ok' : 'badge-warn'}`}>
-                        {c.is_active ? 'Активна' : 'Остановлена'}
-                      </span>
-                    </td>
-                    <td style={{ color: 'var(--text2)' }}>{c.ad_groups_count || '—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          ) : (
-            <table>
-              <thead>
-                <tr>
-                  <th>Ключевая фраза</th>
-                  <th>Ставка</th>
-                  <th>Статус</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredKW.length === 0 ? (
-                  <tr><td colSpan={3} style={{ textAlign: 'center', color: 'var(--text3)', padding: '2rem' }}>
-                    Нет данных
-                  </td></tr>
-                ) : filteredKW.slice(0, 200).map(kw => (
-                  <tr key={kw.id}>
-                    <td style={{ fontFamily: 'monospace', fontSize: 12 }}>{kw.phrase}</td>
-                    <td>{kw.current_bid ? rub(kw.current_bid) : '—'}</td>
-                    <td>
-                      <span className={`badge ${kw.status === 'ACTIVE' ? 'badge-ok' : 'badge-warn'}`}>
-                        {kw.status === 'ACTIVE' ? 'Активно' : kw.status || '—'}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-                {filteredKW.length > 200 && (
-                  <tr><td colSpan={3} style={{ textAlign: 'center', color: 'var(--text3)', fontSize: 12, padding: '1rem' }}>
-                    Показано 200 из {filteredKW.length}
-                  </td></tr>
-                )}
-              </tbody>
-            </table>
-          )}
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </Layout>
