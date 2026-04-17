@@ -16,33 +16,32 @@ function fPct(n)  { return n==null ? '—' : (Math.round(n*10)/10)+'%' }
 function fPos(n)  { return (!n||n===0) ? '—' : (Math.round(n*10)/10) }
 function fSec(n)  { if (!n) return '—'; if (n>=60) return Math.floor(n/60)+'м '+(Math.round(n)%60)+'с'; return Math.round(n)+'с' }
 
-// Мини-спарклайн из SVG
-function Sparkline({ data, field, color = '#5b7bff', height = 28 }) {
-  if (!data?.length || data.length < 2) return null
-  const vals = data.map(d => d[field] || 0)
+// Мини-спарклайн — только клиентский рендер
+function Sparkline({ data, field, height = 28 }) {
+  const [mounted, setMounted] = useState(false)
+  useEffect(() => setMounted(true), [])
+  if (!mounted || !data?.length || data.length < 2) return null
+
+  const vals = data.map(d => Number(d[field]) || 0)
   const min = Math.min(...vals)
   const max = Math.max(...vals)
   const range = max - min || 1
   const w = 60, h = height
   const pts = vals.map((v, i) => {
-    const x = (i / (vals.length - 1)) * w
-    const y = h - ((v - min) / range) * (h - 4) - 2
+    const x = Math.round((i / (vals.length - 1)) * w * 10) / 10
+    const y = Math.round((h - ((v - min) / range) * (h - 4) - 2) * 10) / 10
     return `${x},${y}`
   }).join(' ')
-  // Тренд последних 3 точек
   const last3 = vals.slice(-3)
-  const trend = last3[last3.length-1] - last3[0]
+  const trend = last3[last3.length - 1] - last3[0]
   const tColor = trend > 0 ? 'var(--green)' : trend < 0 ? 'var(--red)' : 'var(--text3)'
+  const lastCoords = pts.split(' ').pop().split(',')
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
       <svg width={w} height={h} style={{ overflow: 'visible' }}>
-        <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" opacity="0.8" />
-        {/* последняя точка */}
-        {(() => {
-          const lastPt = pts.split(' ').pop()
-          const [lx, ly] = lastPt.split(',')
-          return <circle cx={lx} cy={ly} r="2.5" fill={tColor} />
-        })()}
+        <polyline points={pts} fill="none" stroke="var(--accent)" strokeWidth="1.5"
+          strokeLinecap="round" strokeLinejoin="round" opacity="0.7" />
+        <circle cx={lastCoords[0]} cy={lastCoords[1]} r="2.5" fill={tColor} />
       </svg>
       <span style={{ fontSize: 9, color: tColor, fontWeight: 600 }}>
         {trend > 0 ? '↑' : trend < 0 ? '↓' : '→'}
@@ -291,7 +290,11 @@ export default function Dashboard() {
           <KPICard label="Ср. объём тр."   value={fNum(ad.avg_traffic_volume?.value)} delta={ad.avg_traffic_volume?.delta} prev={ad.avg_traffic_volume?.prev}  prevLabel={prevLabel} />
           <KPICard label="Поз. показа"      value={fPos(ad.avg_position?.value)}       delta={ad.avg_position?.delta}       prev={ad.avg_position?.prev ? fPos(ad.avg_position.prev) : null}       dailyData={daily} sparkField="avg_position" invert prevLabel={prevLabel} />
           <KPICard label="Поз. клика"       value={fPos(ad.avg_click_position?.value)} delta={ad.avg_click_position?.delta} prev={ad.avg_click_position?.prev ? fPos(ad.avg_click_position.prev) : null} invert prevLabel={prevLabel} />
-          <KPICard label="Активных РК"      value={fNum(dash?.active_campaigns)} />
+          <KPICard label="Активных РК" value={
+            dash?.active_campaigns > 0
+              ? fNum(dash.active_campaigns)
+              : (dash?.total_campaigns > 0 ? fNum(dash.total_campaigns) : '—')
+          } />
         </div>
       </div>
 
@@ -311,10 +314,10 @@ export default function Dashboard() {
         <div className="kpi-section-label">◑ Поведение (Метрика)</div>
         {beh.has_metrika ? (
           <div className="kpi-grid">
-            <KPICard label="Визиты"      value={fNum(beh.visits)} />
-            <KPICard label="Отказы"      value={fPct(beh.bounce_rate)} invert />
+            <KPICard label="Визиты"      value={fNum(beh.visits)}       delta={beh.visits_delta}   prevLabel={prevLabel} />
+            <KPICard label="Отказы"      value={fPct(beh.bounce_rate)}  delta={beh.bounce_delta}   invert prevLabel={prevLabel} />
             <KPICard label="Глубина"     value={beh.page_depth ? (Math.round(beh.page_depth * 10) / 10) : '—'} />
-            <KPICard label="Время"       value={fSec(beh.avg_duration)} />
+            <KPICard label="Время"       value={fSec(beh.avg_duration)} delta={beh.duration_delta} prevLabel={prevLabel} />
             {qs != null && (
               <div className="kpi-card" style={{ gridColumn: 'span 2' }}>
                 <div className="kpi-label">Качество трафика</div>
