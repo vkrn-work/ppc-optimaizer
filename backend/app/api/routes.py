@@ -261,11 +261,19 @@ async def get_dashboard(
     # Количество активных кампаний
     camp_count = await db.execute(
         select(func.count(Campaign.id)).where(
-            Campaign.account_id == account_id,
-            Campaign.is_active == True,
+            and_(
+                Campaign.account_id == account_id,
+                Campaign.is_active == True,
+            )
         )
     )
     active_campaigns = camp_count.scalar() or 0
+
+    # Debug: total campaigns
+    total_camp = await db.execute(
+        select(func.count(Campaign.id)).where(Campaign.account_id == account_id)
+    )
+    total_campaigns = total_camp.scalar() or 0
 
     # Последний анализ (для проблем и точек роста)
     analysis_result = await db.execute(
@@ -284,7 +292,7 @@ async def get_dashboard(
         )
     )
 
-    # Метрика snapshot
+    # Метрика snapshot — берём последний и фильтруем by_day по периоду
     from app.models.models import MetrikaSnapshot
     metrika_result = await db.execute(
         select(MetrikaSnapshot)
@@ -295,33 +303,80 @@ async def get_dashboard(
     metrika = metrika_result.scalar_one_or_none()
     behavior = {}
     if metrika and metrika.data:
-        s = metrika.data.get("summary", {})
-        if s:
-            bounce = s.get("bounceRate")
-            duration = s.get("avgVisitDurationSeconds")
-            depth = s.get("pageDepth")
-            # Качество трафика 0-100
-            quality = None
-            if bounce is not None:
-                b = (1 - (bounce or 0) / 100) * 0.4
-                t = min((duration or 0) / 180, 1) * 0.3
-                d = min((depth or 0) / 3, 1) * 0.2
-                quality = round((b + t + d) * 100 / 0.9)
-            behavior = {
-                "has_metrika": True,
-                "visits": s.get("visits"),
-                "bounce_rate": bounce,
-                "page_depth": depth,
-                "avg_duration": duration,
-                "quality_score": quality,
-                "devices": metrika.data.get("devices", []),
-                "regions": metrika.data.get("regions", [])[:10],
-                "by_day": metrika.data.get("by_day", []),
-                "by_weekday": metrika.data.get("by_weekday", []),
-                "by_hour": metrika.data.get("by_hour", []),
-                "landings": metrika.data.get("landings", [])[:10],
-                "browsers": metrika.data.get("browsers", [])[:10],
-            }
+        # Фильтруем by_day по выбранному периоду
+        all_by_day = metrika.data.get("by_day", [])
+        curr_start_str = curr_start.date().isoformat()
+        curr_end_str = curr_end.date().isoformat()
+        period_by_day = [
+            d for d in all_by_day
+            if curr_start_str <= d.get("date", "") <= curr_end_str
+        ]
+        prev_by_day = [
+            d for d in all_by_day
+            if prev_start.date().isoformat() <= d.get("date", "") <= prev_end.date().isoformat()
+        ]
+
+        def avg_by_day(days, key):
+            vals = [float(d[key]) for d in days if d.get(key) is not None]
+            return round(sum(vals) / len(vals), 2) if vals else None
+
+        def sum_by_day(days, key):
+            return sum(float(d.get(key) or 0) for d in days)
+
+        # Текущий период
+        curr_visits = sum_by_day(period_by_day, "visits")
+        curr_bounce = avg_by_day(period_by_day, "bounceRate")
+        curr_duration = avg_by_day(period_by_day, "avgVisitDurationSeconds")
+        curr_depth = avg_by_day(period_by_day, "pageDepth")
+
+        # Предыдущий период
+        prev_visits = sum_by_day(prev_by_day, "visits") if prev_by_day else None
+        prev_bounce = avg_by_day(prev_by_day, "bounceRate") if prev_by_day else None
+        prev_duration = avg_by_day(prev_by_day, "avgVisitDurationSeconds") if prev_by_day else None
+
+        # Если нет данных в by_day — fallback на summary
+        if not curr_visits and not period_by_day:
+            s = metrika.data.get("summary", {})
+            curr_visits = s.get("visits")
+            curr_bounce = s.get("bounceRate")
+            curr_duration = s.get("avgVisitDurationSeconds")
+            curr_depth = s.get("pageDepth")
+
+        bounce = curr_bounce
+        duration = curr_duration
+        depth = curr_depth
+        quality = None
+        if bounce is not None:
+            b = (1 - (bounce or 0) / 100) * 0.4
+            t = min((duration or 0) / 180, 1) * 0.3
+            d = min((depth or 0) / 3, 1) * 0.2
+            quality = round((b + t + d) * 100 / 0.9)
+
+        # Дельты Метрики
+        def mk_m_delta(curr_v, prev_v, invert=False):
+            if not prev_v or prev_v == 0 or curr_v is None:
+                return None
+            d = (curr_v - prev_v) / abs(prev_v) * 100
+            return {"value": round(d, 1), "is_good": (d < 0 if invert else d > 0)}
+
+        behavior = {
+            "has_metrika": True,
+            "visits": curr_visits,
+            "visits_delta": mk_m_delta(curr_visits, prev_visits),
+            "bounce_rate": bounce,
+            "bounce_delta": mk_m_delta(bounce, prev_bounce, invert=True),
+            "page_depth": depth,
+            "avg_duration": duration,
+            "duration_delta": mk_m_delta(duration, prev_duration),
+            "quality_score": quality,
+            "by_day": period_by_day,
+            "devices": metrika.data.get("devices", []),
+            "regions": metrika.data.get("regions", [])[:10],
+            "by_weekday": metrika.data.get("by_weekday", []),
+            "by_hour": metrika.data.get("by_hour", []),
+            "landings": metrika.data.get("landings", [])[:10],
+            "browsers": metrika.data.get("browsers", [])[:10],
+        }
 
     # ── Дневная динамика за curr период (для спарклайнов и трендов) ──────
     daily_q = await db.execute(
@@ -397,6 +452,7 @@ async def get_dashboard(
         "suggestions_pending": today_suggestions.scalar() or 0,
         "top_campaigns": top_campaigns,
         "daily_stats": daily_stats,
+        "total_campaigns": total_campaigns,
         "period_label": {
             "yesterday": "Вчера vs среднее за 14 дней",
             "3d": "3 дня vs предыдущие 3 дня",
@@ -412,12 +468,14 @@ async def get_dashboard(
 async def get_campaigns(
     account_id: int,
     period: str = Query("week"),
+    active_only: bool = Query(False),
     db: AsyncSession = Depends(get_db),
 ):
     curr_start, curr_end, _, _ = period_dates(period)
-    campaigns_result = await db.execute(
-        select(Campaign).where(Campaign.account_id == account_id).order_by(Campaign.name)
-    )
+    camp_q = select(Campaign).where(Campaign.account_id == account_id)
+    if active_only:
+        camp_q = camp_q.where(Campaign.is_active == True)
+    campaigns_result = await db.execute(camp_q.order_by(Campaign.name))
     campaigns = campaigns_result.scalars().all()
 
     # Статистика по кампаниям за период
@@ -469,12 +527,15 @@ async def get_keywords(
     period: str = Query("week"),
     campaign_id: Optional[int] = None,
     search: Optional[str] = None,
+    active_only: bool = Query(False),
     limit: int = 500,
     db: AsyncSession = Depends(get_db),
 ):
     curr_start, curr_end, prev_start, prev_end = period_dates(period)
 
     q = select(Keyword).where(Keyword.account_id == account_id)
+    if active_only:
+        q = q.where(Keyword.status == "ACTIVE")
     if campaign_id:
         q = q.join(AdGroup, AdGroup.id == Keyword.ad_group_id).where(AdGroup.campaign_id == campaign_id)
     if search:
