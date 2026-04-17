@@ -321,6 +321,12 @@ class SuggestionStatus(str, enum.Enum):
     rolled_back = "rolled_back"
 
 
+class HypothesisVerdict(str, enum.Enum):
+    confirmed = "confirmed"
+    rejected = "rejected"
+    insufficient = "insufficient"
+
+
 class Suggestion(Base):
     """Предложение по изменению (ставка, стратегия, минус-слова и т.д.)"""
     __tablename__ = "suggestions"
@@ -360,7 +366,7 @@ class Hypothesis(Base):
     metrics_before: Mapped[Optional[dict]] = mapped_column(JSON)
     metrics_after: Mapped[Optional[dict]] = mapped_column(JSON)
     delta_percent: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 2))
-    verdict: Mapped[Optional[str]] = mapped_column(String(50))  # confirmed/rejected/insufficient
+    verdict: Mapped[Optional[HypothesisVerdict]] = mapped_column(SAEnum(HypothesisVerdict), nullable=True)
     report: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
