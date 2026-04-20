@@ -40,14 +40,13 @@ const COLS = [
 export default function Campaigns() {
   const { account, accounts, accountId, switchAccount } = useAccount()
   const [period, setPeriod] = useState('week')
-  const [view, setView] = useState('campaigns')   // campaigns | groups | keywords
+  const [view, setView] = useState('campaigns')
   const [data, setData] = useState([])
   const [campaigns, setCampaigns] = useState([])
   const [loading, setLoading] = useState(false)
   const [onlyActive, setOnlyActive] = useState(true)
   const [search, setSearch] = useState('')
   const [selCampaign, setSelCampaign] = useState('')
-  const [selGroup, setSelGroup] = useState('')
   const [sortBy, setSortBy] = useState('spend')
   const [sortDir, setSortDir] = useState(-1)
 
@@ -55,18 +54,16 @@ export default function Campaigns() {
     if (!accountId) return
     setLoading(true)
 
-    let params = `?period=${period}`
-    if (onlyActive) params += '&active_only=true'
-
+    // ВАЖНО: передаём period в getCampaigns
     Promise.all([
-      api.getCampaigns(accountId, period),
+      api.getCampaigns(accountId, period, onlyActive),
       view === 'keywords'
-        ? api.getKeywords(accountId, `${params}${selCampaign?'&campaign_id='+selCampaign:''}${search?'&search='+encodeURIComponent(search):''}`)
+        ? api.getKeywords(accountId, `?period=${period}${onlyActive?'&active_only=true':''}${selCampaign?'&campaign_id='+selCampaign:''}${search?'&search='+encodeURIComponent(search):''}`)
         : Promise.resolve(null),
     ]).then(([camps, kws]) => {
-      const activeCamps = onlyActive ? camps.filter(c => c.is_active) : camps
-      setCampaigns(activeCamps)
-      if (view === 'campaigns') setData(activeCamps)
+      const list = onlyActive ? (camps||[]).filter(c => c.is_active) : (camps||[])
+      setCampaigns(list)
+      if (view === 'campaigns') setData(list)
       else if (view === 'keywords' && kws) setData(kws)
     }).catch(console.error).finally(() => setLoading(false))
   }, [accountId, period, view, onlyActive, selCampaign, search])
@@ -134,14 +131,15 @@ export default function Campaigns() {
           <div style={{padding:'2rem',textAlign:'center',color:'var(--text3)'}}>Загрузка...</div>
         ) : filtered.length === 0 ? (
           <div style={{padding:'2rem',textAlign:'center',color:'var(--text3)'}}>
-            Нет данных — {onlyActive?'попробуйте снять фильтр «Только активные»':'запустите сбор данных'}
+            Нет данных{onlyActive?' — попробуйте снять «Только активные»':''}
           </div>
         ) : view === 'campaigns' ? (
           <table>
             <thead>
               <tr>
                 <th style={{minWidth:220}}>Кампания</th>
-                <th>ID</th>
+                <th>ID Директа</th>
+                <th>Тип</th>
                 <th>Стратегия</th>
                 {COLS.map(c=>(
                   <th key={c.key} style={{cursor:'pointer',whiteSpace:'nowrap'}}
@@ -149,6 +147,9 @@ export default function Campaigns() {
                     {c.label} {sortBy===c.key?(sortDir>0?'↑':'↓'):''}
                   </th>
                 ))}
+                {/* CRM плейсхолдер */}
+                <th style={{color:'var(--text3)'}}>SQL</th>
+                <th style={{color:'var(--text3)'}}>CPL</th>
               </tr>
             </thead>
             <tbody>
@@ -165,9 +166,12 @@ export default function Campaigns() {
                   <td style={{fontSize:11,color:'var(--text3)',fontFamily:'monospace'}}>
                     {c.direct_id || '—'}
                   </td>
+                  <td style={{fontSize:11,color:'var(--text3)'}}>
+                    {c.campaign_type || '—'}
+                  </td>
                   <td>
                     <span className={`badge ${c.strategy_type==='MANUAL_CPC'?'badge-ok':'badge-info'}`}>
-                      {c.strategy_type==='MANUAL_CPC'?'Ручная':'Авто'}
+                      {c.strategy_type==='MANUAL_CPC'?'Ручная':c.strategy_type||'—'}
                     </span>
                   </td>
                   {COLS.map(col=>(
@@ -177,6 +181,8 @@ export default function Campaigns() {
                         : col.fmt(c[col.key])}
                     </td>
                   ))}
+                  <td style={{color:'var(--text3)',fontSize:11}}>—</td>
+                  <td style={{color:'var(--text3)',fontSize:11}}>—</td>
                 </tr>
               ))}
             </tbody>
