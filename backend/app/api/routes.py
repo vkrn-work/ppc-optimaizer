@@ -26,23 +26,10 @@ logger = logging.getLogger(__name__)
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def period_dates(period: str):
-    """
-    Вернуть (curr_start, curr_end, prev_start, prev_end) для периода.
-
-    Логика сравнения:
-    - yesterday  → вчера vs среднее за последние 14 дней (без вчера)
-    - 3d         → последние 3 дня vs предыдущие 3 дня
-    - week       → последние 7 дней vs предыдущие 7 дней
-    - month      → последние 30 дней vs предыдущие 30 дней
-
-    Для "вчера" используем 14-дневное среднее как baseline —
-    один день слишком волатилен чтобы сравнивать с одним днём.
-    """
     today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     if period == "yesterday":
         curr_end   = today
         curr_start = today - timedelta(days=1)
-        # Baseline: среднее за 14 дней до вчера
         prev_end   = curr_start
         prev_start = prev_end - timedelta(days=14)
     elif period == "3d":
@@ -71,9 +58,7 @@ async def agg_kw_stats(db, account_id: int, date_from: datetime, date_to: dateti
         func.sum(KeywordStat.spend).label("spend"),
         func.avg(KeywordStat.avg_position).label("avg_position"),
         func.avg(KeywordStat.avg_click_position).label("avg_click_position"),
-        func.avg(KeywordStat.avg_cpc).label("avg_cpc"),
         func.avg(KeywordStat.traffic_volume).label("avg_traffic_volume"),
-        func.avg(KeywordStat.ctr).label("avg_ctr"),
     ).where(and_(
         KeywordStat.account_id == account_id,
         KeywordStat.date >= date_from,
@@ -84,20 +69,23 @@ async def agg_kw_stats(db, account_id: int, date_from: datetime, date_to: dateti
     clicks = int(row.clicks or 0)
     impressions = int(row.impressions or 0)
     spend = float(row.spend or 0)
+    # CPC = sum(spend)/sum(clicks) — правильный способ, не avg(avg_cpc)
+    avg_cpc = round(spend / clicks, 2) if clicks > 0 else None
+    # CTR = sum(clicks)/sum(impressions)*100
+    ctr = round(clicks / impressions * 100, 2) if impressions > 0 else None
     return {
         "clicks": clicks,
         "impressions": impressions,
         "spend": round(spend, 2),
         "avg_position": round(float(row.avg_position), 2) if row.avg_position else None,
         "avg_click_position": round(float(row.avg_click_position), 2) if row.avg_click_position else None,
-        "avg_cpc": round(spend / clicks, 2) if clicks > 0 else None,
+        "avg_cpc": avg_cpc,
         "avg_traffic_volume": round(float(row.avg_traffic_volume)) if row.avg_traffic_volume else None,
-        "ctr": round(clicks / impressions * 100, 2) if impressions > 0 else None,
+        "ctr": ctr,
     }
 
 
 def calc_delta(curr, prev):
-    """Процентное изменение с направлением"""
     if not prev or prev == 0 or curr is None:
         return None
     d = (curr - prev) / abs(prev) * 100
@@ -149,7 +137,6 @@ async def create_account(data: AccountCreate, db: AsyncSession = Depends(get_db)
     db.add(account)
     await db.commit()
     await db.refresh(account)
-    # Create default rules
     default_rules = [
         Rule(account_id=account.id, name="Низкая позиция показа", rule_type="bid_increase",
              condition={"field":"avg_position","op":"gt","value":3}, action={"type":"bid_increase","pct":30},
@@ -206,14 +193,19 @@ async def delete_account(account_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/accounts/{account_id}/sync")
-async def trigger_sync(account_id: int, db: AsyncSession = Depends(get_db)):
+async def trigger_sync(
+    account_id: int,
+    days: int = Query(28, description="За сколько дней собирать статистику. 28 — стандарт, 90 — история"),
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(select(Account).where(Account.id == account_id))
     account = result.scalar_one_or_none()
     if not account:
         raise HTTPException(404, "Account not found")
     from app.core.tasks import collect_account_data
-    collect_account_data.delay(account_id)
-    return {"status": "started", "message": f"Сбор данных запущен для кабинета '{account.name}'"}
+    collect_account_data.delay(account_id, days=days)
+    label = "ретроспективных данных" if days > 28 else "данных"
+    return {"status": "started", "message": f"Сбор {label} запущен для кабинета '{account.name}' за {days} дней"}
 
 
 # ─── Dashboard ────────────────────────────────────────────────────────────────
@@ -224,23 +216,16 @@ async def get_dashboard(
     period: str = Query("week", description="yesterday|3d|week|month"),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Главный дашборд с реальными периодами и дельтами.
-    period: yesterday | 3d | week | month
-    """
     curr_start, curr_end, prev_start, prev_end = period_dates(period)
 
-    # Проверить что аккаунт существует
     acc_result = await db.execute(select(Account).where(Account.id == account_id))
     account = acc_result.scalar_one_or_none()
     if not account:
         raise HTTPException(404, "Account not found")
 
-    # Рекламные KPI из keyword_stats за оба периода
     curr_kpi = await agg_kw_stats(db, account_id, curr_start, curr_end)
     prev_kpi = await agg_kw_stats(db, account_id, prev_start, prev_end)
 
-    # Дельты
     def mk_delta(key, invert=False):
         d = calc_delta(curr_kpi.get(key), prev_kpi.get(key))
         if d is None:
@@ -248,34 +233,28 @@ async def get_dashboard(
         return {"value": d, "is_good": (d < 0 if invert else d > 0)}
 
     kpi_with_deltas = {
-        "clicks":             {**{"value": curr_kpi["clicks"]}, "delta": mk_delta("clicks"), "prev": prev_kpi["clicks"]},
-        "impressions":        {**{"value": curr_kpi["impressions"]}, "delta": mk_delta("impressions"), "prev": prev_kpi["impressions"]},
-        "spend":              {**{"value": curr_kpi["spend"]}, "delta": mk_delta("spend", invert=True), "prev": prev_kpi["spend"]},
-        "ctr":                {**{"value": curr_kpi["ctr"]}, "delta": mk_delta("ctr"), "prev": prev_kpi["ctr"]},
-        "avg_cpc":            {**{"value": curr_kpi["avg_cpc"]}, "delta": mk_delta("avg_cpc", invert=True), "prev": prev_kpi["avg_cpc"]},
-        "avg_position":       {**{"value": curr_kpi["avg_position"]}, "delta": mk_delta("avg_position", invert=True), "prev": prev_kpi["avg_position"]},
-        "avg_click_position": {**{"value": curr_kpi["avg_click_position"]}, "delta": mk_delta("avg_click_position", invert=True), "prev": prev_kpi["avg_click_position"]},
-        "avg_traffic_volume": {**{"value": curr_kpi["avg_traffic_volume"]}, "delta": mk_delta("avg_traffic_volume"), "prev": prev_kpi["avg_traffic_volume"]},
+        "clicks":             {"value": curr_kpi["clicks"], "delta": mk_delta("clicks"), "prev": prev_kpi["clicks"]},
+        "impressions":        {"value": curr_kpi["impressions"], "delta": mk_delta("impressions"), "prev": prev_kpi["impressions"]},
+        "spend":              {"value": curr_kpi["spend"], "delta": mk_delta("spend", invert=True), "prev": prev_kpi["spend"]},
+        "ctr":                {"value": curr_kpi["ctr"], "delta": mk_delta("ctr"), "prev": prev_kpi["ctr"]},
+        "avg_cpc":            {"value": curr_kpi["avg_cpc"], "delta": mk_delta("avg_cpc", invert=True), "prev": prev_kpi["avg_cpc"]},
+        "avg_position":       {"value": curr_kpi["avg_position"], "delta": mk_delta("avg_position", invert=True), "prev": prev_kpi["avg_position"]},
+        "avg_click_position": {"value": curr_kpi["avg_click_position"], "delta": mk_delta("avg_click_position", invert=True), "prev": prev_kpi["avg_click_position"]},
+        "avg_traffic_volume": {"value": curr_kpi["avg_traffic_volume"], "delta": mk_delta("avg_traffic_volume"), "prev": prev_kpi["avg_traffic_volume"]},
     }
 
-    # Количество активных кампаний
     camp_count = await db.execute(
         select(func.count(Campaign.id)).where(
-            and_(
-                Campaign.account_id == account_id,
-                Campaign.is_active == True,
-            )
+            and_(Campaign.account_id == account_id, Campaign.is_active == True)
         )
     )
     active_campaigns = camp_count.scalar() or 0
 
-    # Debug: total campaigns
     total_camp = await db.execute(
         select(func.count(Campaign.id)).where(Campaign.account_id == account_id)
     )
     total_campaigns = total_camp.scalar() or 0
 
-    # Последний анализ (для проблем и точек роста)
     analysis_result = await db.execute(
         select(AnalysisResult)
         .where(AnalysisResult.account_id == account_id)
@@ -284,7 +263,6 @@ async def get_dashboard(
     )
     analysis = analysis_result.scalar_one_or_none()
 
-    # Предложения сегодня
     today_suggestions = await db.execute(
         select(func.count(Suggestion.id)).where(
             Suggestion.account_id == account_id,
@@ -292,7 +270,6 @@ async def get_dashboard(
         )
     )
 
-    # Метрика snapshot — берём последний и фильтруем by_day по периоду
     from app.models.models import MetrikaSnapshot
     metrika_result = await db.execute(
         select(MetrikaSnapshot)
@@ -303,7 +280,6 @@ async def get_dashboard(
     metrika = metrika_result.scalar_one_or_none()
     behavior = {}
     if metrika and metrika.data:
-        # Фильтруем by_day по выбранному периоду
         all_by_day = metrika.data.get("by_day", [])
         curr_start_str = curr_start.date().isoformat()
         curr_end_str = curr_end.date().isoformat()
@@ -323,18 +299,15 @@ async def get_dashboard(
         def sum_by_day(days, key):
             return sum(float(d.get(key) or 0) for d in days)
 
-        # Текущий период
         curr_visits = sum_by_day(period_by_day, "visits")
         curr_bounce = avg_by_day(period_by_day, "bounceRate")
         curr_duration = avg_by_day(period_by_day, "avgVisitDurationSeconds")
         curr_depth = avg_by_day(period_by_day, "pageDepth")
 
-        # Предыдущий период
         prev_visits = sum_by_day(prev_by_day, "visits") if prev_by_day else None
         prev_bounce = avg_by_day(prev_by_day, "bounceRate") if prev_by_day else None
         prev_duration = avg_by_day(prev_by_day, "avgVisitDurationSeconds") if prev_by_day else None
 
-        # Если нет данных в by_day — fallback на summary
         if not curr_visits and not period_by_day:
             s = metrika.data.get("summary", {})
             curr_visits = s.get("visits")
@@ -352,7 +325,6 @@ async def get_dashboard(
             d = min((depth or 0) / 3, 1) * 0.2
             quality = round((b + t + d) * 100 / 0.9)
 
-        # Дельты Метрики
         def mk_m_delta(curr_v, prev_v, invert=False):
             if not prev_v or prev_v == 0 or curr_v is None:
                 return None
@@ -378,7 +350,6 @@ async def get_dashboard(
             "browsers": metrika.data.get("browsers", [])[:10],
         }
 
-    # ── Дневная динамика за curr период (для спарклайнов и трендов) ──────
     daily_q = await db.execute(
         select(
             KeywordStat.date,
@@ -386,7 +357,6 @@ async def get_dashboard(
             func.sum(KeywordStat.impressions).label("impressions"),
             func.sum(KeywordStat.spend).label("spend"),
             func.avg(KeywordStat.avg_position).label("avg_position"),
-            func.avg(KeywordStat.ctr).label("ctr"),
         )
         .where(
             KeywordStat.account_id == account_id,
@@ -396,19 +366,22 @@ async def get_dashboard(
         .group_by(KeywordStat.date)
         .order_by(KeywordStat.date)
     )
-    daily_stats = [{
-        "date": r.date.strftime("%Y-%m-%d"),
-        "clicks": int(r.clicks or 0),
-        "impressions": int(r.impressions or 0),
-        "spend": round(float(r.spend or 0), 2),
-        "avg_position": round(float(r.avg_position), 2) if r.avg_position else None,
-        "ctr": round(float(r.ctr), 2) if r.ctr else None,
-    } for r in daily_q]
+    daily_stats = []
+    for r in daily_q:
+        cl = int(r.clicks or 0)
+        im = int(r.impressions or 0)
+        daily_stats.append({
+            "date": r.date.strftime("%Y-%m-%d"),
+            "clicks": cl,
+            "impressions": im,
+            "spend": round(float(r.spend or 0), 2),
+            "avg_position": round(float(r.avg_position), 2) if r.avg_position else None,
+            "ctr": round(cl / im * 100, 2) if im > 0 else None,
+        })
 
-    # Топ-5 кампаний по расходу за период
     top_campaigns_q = await db.execute(
         select(
-            Campaign.id, Campaign.name, Campaign.strategy_type,
+            Campaign.id, Campaign.name, Campaign.strategy_type, Campaign.direct_id,
             func.sum(KeywordStat.spend).label("spend"),
             func.sum(KeywordStat.clicks).label("clicks"),
             func.avg(KeywordStat.avg_position).label("avg_position"),
@@ -421,12 +394,13 @@ async def get_dashboard(
             KeywordStat.date >= curr_start,
             KeywordStat.date <= curr_end,
         )
-        .group_by(Campaign.id, Campaign.name, Campaign.strategy_type)
+        .group_by(Campaign.id, Campaign.name, Campaign.strategy_type, Campaign.direct_id)
         .order_by(desc("spend"))
         .limit(5)
     )
     top_campaigns = [{
         "id": r.id,
+        "direct_id": r.direct_id,
         "name": r.name,
         "strategy_type": r.strategy_type,
         "spend": round(float(r.spend or 0), 2),
@@ -478,7 +452,6 @@ async def get_campaigns(
     campaigns_result = await db.execute(camp_q.order_by(Campaign.name))
     campaigns = campaigns_result.scalars().all()
 
-    # Статистика по кампаниям за период
     stats_q = await db.execute(
         select(
             Campaign.id,
@@ -487,7 +460,6 @@ async def get_campaigns(
             func.sum(KeywordStat.impressions).label("impressions"),
             func.avg(KeywordStat.avg_position).label("avg_position"),
             func.avg(KeywordStat.avg_click_position).label("avg_click_position"),
-            func.avg(KeywordStat.ctr).label("ctr"),
             func.avg(KeywordStat.traffic_volume).label("traffic_volume"),
         )
         .join(AdGroup, AdGroup.campaign_id == Campaign.id)
@@ -502,21 +474,93 @@ async def get_campaigns(
     )
     stats_map = {r.id: r for r in stats_q}
 
+    result = []
+    for c in campaigns:
+        s = stats_map.get(c.id)
+        cl = int(s.clicks or 0) if s else 0
+        im = int(s.impressions or 0) if s else 0
+        sp = float(s.spend or 0) if s else 0
+        result.append({
+            "id": c.id,
+            "direct_id": c.direct_id,  # ID кампании в Яндекс Директе
+            "name": c.name,
+            "campaign_type": c.campaign_type,
+            "strategy_type": c.strategy_type,
+            "status": c.status,
+            "is_active": c.is_active,
+            "spend": round(sp, 2),
+            "clicks": cl,
+            "impressions": im,
+            # CPC = sum(spend)/sum(clicks) — правильный способ
+            "avg_cpc": round(sp / cl, 2) if cl > 0 else None,
+            # CTR = sum(clicks)/sum(impressions)*100
+            "ctr": round(cl / im * 100, 2) if im > 0 else None,
+            "avg_position": round(float(s.avg_position), 2) if s and s.avg_position else None,
+            "avg_click_position": round(float(s.avg_click_position), 2) if s and s.avg_click_position else None,
+            "traffic_volume": round(float(s.traffic_volume)) if s and s.traffic_volume else None,
+        })
+    return result
+
+
+# ─── Ad Groups ────────────────────────────────────────────────────────────────
+
+@router.get("/accounts/{account_id}/ad-groups")
+async def get_ad_groups(
+    account_id: int,
+    campaign_id: Optional[int] = None,
+    period: str = Query("week"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Группы объявлений с базовой статистикой"""
+    curr_start, curr_end, _, _ = period_dates(period)
+
+    q = select(AdGroup).where(AdGroup.account_id == account_id)
+    if campaign_id:
+        q = q.where(AdGroup.campaign_id == campaign_id)
+    result = await db.execute(q.order_by(AdGroup.name))
+    groups = result.scalars().all()
+    group_ids = [g.id for g in groups]
+
+    if not group_ids:
+        return []
+
+    # Статистика по группам через ключи
+    stats_q = await db.execute(
+        select(
+            Keyword.ad_group_id,
+            func.sum(KeywordStat.spend).label("spend"),
+            func.sum(KeywordStat.clicks).label("clicks"),
+            func.sum(KeywordStat.impressions).label("impressions"),
+            func.count(Keyword.id).label("kw_count"),
+        )
+        .join(KeywordStat, KeywordStat.keyword_id == Keyword.id)
+        .where(
+            Keyword.ad_group_id.in_(group_ids),
+            KeywordStat.date >= curr_start,
+            KeywordStat.date <= curr_end,
+        )
+        .group_by(Keyword.ad_group_id)
+    )
+    stats_map = {r.ad_group_id: r for r in stats_q}
+
+    # Количество ключей на группу
+    kw_count_q = await db.execute(
+        select(Keyword.ad_group_id, func.count(Keyword.id).label("cnt"))
+        .where(Keyword.ad_group_id.in_(group_ids))
+        .group_by(Keyword.ad_group_id)
+    )
+    kw_map = {r.ad_group_id: r.cnt for r in kw_count_q}
+
     return [{
-        "id": c.id,
-        "name": c.name,
-        "campaign_type": c.campaign_type,
-        "strategy_type": c.strategy_type,
-        "status": c.status,
-        "is_active": c.is_active,
-        "spend": round(float(stats_map[c.id].spend or 0), 2) if c.id in stats_map else 0,
-        "clicks": int(stats_map[c.id].clicks or 0) if c.id in stats_map else 0,
-        "impressions": int(stats_map[c.id].impressions or 0) if c.id in stats_map else 0,
-        "avg_position": round(float(stats_map[c.id].avg_position), 2) if c.id in stats_map and stats_map[c.id].avg_position else None,
-        "avg_click_position": round(float(stats_map[c.id].avg_click_position), 2) if c.id in stats_map and stats_map[c.id].avg_click_position else None,
-        "ctr": round(float(stats_map[c.id].ctr), 2) if c.id in stats_map and stats_map[c.id].ctr else None,
-        "traffic_volume": round(float(stats_map[c.id].traffic_volume)) if c.id in stats_map and stats_map[c.id].traffic_volume else None,
-    } for c in campaigns]
+        "id": g.id,
+        "name": g.name,
+        "campaign_id": g.campaign_id,
+        "status": g.status,
+        "keywords_count": kw_map.get(g.id, 0),
+        "spend": round(float(stats_map[g.id].spend or 0), 2) if g.id in stats_map else 0,
+        "clicks": int(stats_map[g.id].clicks or 0) if g.id in stats_map else 0,
+        "impressions": int(stats_map[g.id].impressions or 0) if g.id in stats_map else 0,
+    } for g in groups]
 
 
 # ─── Keywords ─────────────────────────────────────────────────────────────────
@@ -526,6 +570,7 @@ async def get_keywords(
     account_id: int,
     period: str = Query("week"),
     campaign_id: Optional[int] = None,
+    ad_group_id: Optional[int] = None,
     search: Optional[str] = None,
     active_only: bool = Query(False),
     limit: int = 500,
@@ -538,6 +583,8 @@ async def get_keywords(
         q = q.where(Keyword.status == "ACTIVE")
     if campaign_id:
         q = q.join(AdGroup, AdGroup.id == Keyword.ad_group_id).where(AdGroup.campaign_id == campaign_id)
+    if ad_group_id:
+        q = q.where(Keyword.ad_group_id == ad_group_id)
     if search:
         q = q.where(Keyword.phrase.ilike(f"%{search}%"))
     q = q.limit(limit)
@@ -549,7 +596,6 @@ async def get_keywords(
     if not kw_ids:
         return []
 
-    # Текущая статистика
     curr_stats_q = await db.execute(
         select(
             KeywordStat.keyword_id,
@@ -558,7 +604,6 @@ async def get_keywords(
             func.sum(KeywordStat.spend).label("spend"),
             func.avg(KeywordStat.avg_position).label("avg_position"),
             func.avg(KeywordStat.avg_click_position).label("avg_click_position"),
-            func.avg(KeywordStat.ctr).label("ctr"),
             func.avg(KeywordStat.traffic_volume).label("traffic_volume"),
             func.avg(KeywordStat.avg_bid).label("avg_bid"),
         )
@@ -571,7 +616,6 @@ async def get_keywords(
     )
     curr_map = {r.keyword_id: r for r in curr_stats_q}
 
-    # Предыдущий период для дельт
     prev_stats_q = await db.execute(
         select(
             KeywordStat.keyword_id,
@@ -588,7 +632,6 @@ async def get_keywords(
     )
     prev_map = {r.keyword_id: r for r in prev_stats_q}
 
-    # Последний анализ для проблем
     analysis_result = await db.execute(
         select(AnalysisResult)
         .where(AnalysisResult.account_id == account_id)
@@ -608,16 +651,19 @@ async def get_keywords(
         ps = prev_map.get(kw.id)
         clicks = int(cs.clicks or 0) if cs else 0
         prev_clicks = int(ps.clicks or 0) if ps else 0
+        impressions = int(cs.impressions or 0) if cs else 0
         spend = float(cs.spend or 0) if cs else 0
         avg_pos = round(float(cs.avg_position), 2) if cs and cs.avg_position else None
         avg_cpos = round(float(cs.avg_click_position), 2) if cs and cs.avg_click_position else None
         traf = round(float(cs.traffic_volume)) if cs and cs.traffic_volume else None
         bid = round(float(cs.avg_bid), 2) if cs and cs.avg_bid else None
 
-        # Дельты
         click_delta = calc_delta(clicks, prev_clicks)
 
-        # Рекомендованная ставка
+        # CPC и CTR по сумме
+        avg_cpc = round(spend / clicks, 2) if clicks > 0 else None
+        ctr = round(clicks / impressions * 100, 2) if impressions > 0 else None
+
         recommended_bid = None
         if kw.current_bid and avg_pos and avg_pos > 3:
             recommended_bid = round(float(kw.current_bid) * 1.3, 2)
@@ -632,9 +678,10 @@ async def get_keywords(
             "current_bid": float(kw.current_bid) if kw.current_bid else None,
             "status": kw.status,
             "clicks": clicks,
-            "impressions": int(cs.impressions or 0) if cs else 0,
+            "impressions": impressions,
             "spend": round(spend, 2),
-            "ctr": round(float(cs.ctr), 2) if cs and cs.ctr else None,
+            "ctr": ctr,
+            "avg_cpc": avg_cpc,
             "avg_position": avg_pos,
             "avg_click_position": avg_cpos,
             "traffic_volume": traf,
@@ -644,7 +691,6 @@ async def get_keywords(
             "problem": problem,
         })
 
-    # Сортировка: сначала с проблемами, потом по расходу
     result.sort(key=lambda x: (0 if x["problem"] else 1, -(x["spend"] or 0)))
     return result
 
@@ -679,7 +725,6 @@ async def get_suggestions(
     status: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    # Берём из последнего анализа
     analysis_result = await db.execute(
         select(AnalysisResult)
         .where(AnalysisResult.account_id == account_id)
@@ -699,7 +744,6 @@ async def get_suggestions(
 
 @router.post("/suggestions/{suggestion_id}/action")
 async def action_suggestion(suggestion_id: str, data: dict, db: AsyncSession = Depends(get_db)):
-    """Взять в работу / отклонить предложение → создать гипотезу"""
     action = data.get("action", "accept")
     account_id = data.get("account_id")
     suggestion_data = data.get("suggestion", {})
@@ -731,7 +775,6 @@ class HypothesisCreate(BaseModel):
     object_type: str = "keyword"
     object_id: Optional[int] = None
     keyword_id: Optional[int] = None
-    # description can be auto-built from phrase + problem_type
     description: Optional[str] = None
     phrase: Optional[str] = None
     change_description: str
@@ -750,16 +793,13 @@ async def get_hypotheses(account_id: int, db: AsyncSession = Depends(get_db)):
         .order_by(desc(Hypothesis.applied_at))
     )
     hyps = result.scalars().all()
+
     def h_status(h):
         v = h.verdict.value if h.verdict else "pending"
-        if v == "pending":
-            return "planned"
-        if v == "positive":
-            return "success"
-        if v == "negative":
-            return "failed"
-        if v == "neutral":
-            return "neutral"
+        if v == "pending": return "planned"
+        if v == "positive": return "success"
+        if v == "negative": return "failed"
+        if v == "neutral": return "neutral"
         return v
 
     return [{
@@ -783,7 +823,6 @@ async def get_hypotheses(account_id: int, db: AsyncSession = Depends(get_db)):
 
 @router.post("/accounts/{account_id}/hypotheses")
 async def create_hypothesis(account_id: int, data: HypothesisCreate, db: AsyncSession = Depends(get_db)):
-    # Build description from phrase if not provided
     description = data.description or (
         f"{data.phrase}: {data.change_description}" if data.phrase else data.change_description
     )
@@ -863,18 +902,16 @@ async def get_search_queries(
     NEGATIVE_SIGNALS = ['стандарт', 'что такое', 'скачать', 'характеристики',
                         'описание', 'гост', 'нормативы', 'документ', 'pdf']
     COMMERCIAL_SIGNALS = ['купить', 'цена', 'поставка', 'заказ', 'прайс',
-                          'производитель', 'поставщик', 'мм', 'дюйм', 'купить',
+                          'производитель', 'поставщик', 'мм', 'дюйм',
                           'лист', 'труба', 'прокат', 'сталь', 'полоса', 'лента']
 
     if suggest == "negatives":
-        # Фразы с кликами но без конверсий + информационный интент
         neg_filters = [SearchQuery.query.ilike(f"%{s}%") for s in NEGATIVE_SIGNALS]
         q = q.where(
             SearchQuery.clicks >= 2,
             or_(*neg_filters) if neg_filters else True,
         ).order_by(SearchQuery.spend.desc())
     elif suggest == "new_keywords":
-        # Семантическое соответствие + коммерческий интент + не точное
         q = q.where(
             SearchQuery.clicks >= 2,
             SearchQuery.match_type != 'EXACT',
@@ -887,14 +924,12 @@ async def get_search_queries(
     rows = result.scalars().all()
 
     def score_query(query_text):
-        """Скоринг коммерческого интента 0-100"""
         qt = (query_text or "").lower()
-        score = 50  # baseline
+        score = 50
         for sig in COMMERCIAL_SIGNALS:
             if sig in qt: score += 10
         for sig in NEGATIVE_SIGNALS:
             if sig in qt: score -= 20
-        # Наличие цифр/размеров
         import re
         if re.search(r'\d+[xх×]\d+|\d+мм|\d+"\s|\d/\d', qt): score += 20
         return max(0, min(100, score))
@@ -922,19 +957,20 @@ async def get_diagnostics(account_id: int, db: AsyncSession = Depends(get_db)):
     acc_result = await db.execute(select(Account).where(Account.id == account_id))
     account = acc_result.scalar_one_or_none()
 
-    # Статистика БД
     kw_count = await db.execute(select(func.count(Keyword.id)).where(Keyword.account_id == account_id))
     stat_count = await db.execute(select(func.count(KeywordStat.id)).where(KeywordStat.account_id == account_id))
-    sq_count = await db.execute(select(func.count()).select_from(
-        __import__('app.models.models', fromlist=['SearchQuery']).SearchQuery
-    ).where(__import__('app.models.models', fromlist=['SearchQuery']).SearchQuery.account_id == account_id))
 
-    from app.models.models import MetrikaSnapshot
+    from app.models.models import MetrikaSnapshot, SearchQuery
     ms_result = await db.execute(
         select(MetrikaSnapshot).where(MetrikaSnapshot.account_id == account_id)
         .order_by(desc(MetrikaSnapshot.date)).limit(1)
     )
     last_metrika = ms_result.scalar_one_or_none()
+
+    sq_count_r = await db.execute(
+        select(func.count(SearchQuery.id)).where(SearchQuery.account_id == account_id)
+    )
+    sq_count = sq_count_r.scalar() or 0
 
     checks = [
         {
@@ -952,7 +988,7 @@ async def get_diagnostics(account_id: int, db: AsyncSession = Depends(get_db)):
         {
             "name": "Последний сбор данных",
             "ok": bool(account and account.last_sync_at),
-            "detail": account.last_sync_at.strftime("%d.%m.%Y %H:%M МСК") if (account and account.last_sync_at) else "Сбор ещё не запускался",
+            "detail": account.last_sync_at.strftime("%d.%m.%Y %H:%M UTC") if (account and account.last_sync_at) else "Сбор ещё не запускался",
             "category": "sync",
         },
         {
@@ -969,8 +1005,8 @@ async def get_diagnostics(account_id: int, db: AsyncSession = Depends(get_db)):
         },
         {
             "name": "Поисковые фразы",
-            "ok": True,  # will be checked
-            "detail": "Будут доступны после следующего сбора",
+            "ok": sq_count > 0,
+            "detail": f"{sq_count} запросов" if sq_count > 0 else "Появятся после следующего сбора",
             "category": "data",
         },
         {
