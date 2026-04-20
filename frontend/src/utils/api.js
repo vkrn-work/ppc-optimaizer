@@ -21,9 +21,17 @@ export const api = {
   triggerHistoricalSync: (id, days = 90) => req(`/accounts/${id}/sync?days=${days}`, { method: 'POST' }),
 
   // period: yesterday | 3d | week | month
-  getDashboard: (id, period = 'week') => req(`/accounts/${id}/dashboard?period=${period}`),
-  getCampaigns: (id, period = 'week', activeOnly = false) =>
-    req(`/accounts/${id}/campaigns?period=${period}&active_only=${activeOnly}`),
+  // или custom: date_from=YYYY-MM-DD&date_to=YYYY-MM-DD&compare_from=YYYY-MM-DD&compare_to=YYYY-MM-DD
+  getDashboard: (id, period = 'week', extra = '') =>
+    req(`/accounts/${id}/dashboard?period=${period}${extra ? '&' + extra : ''}`),
+
+  getCampaigns: (id, period = 'week', activeOnly = false, extra = '') =>
+    req(`/accounts/${id}/campaigns?period=${period}&active_only=${activeOnly}${extra ? '&' + extra : ''}`),
+
+  // FIX: был полностью отсутствующий метод — ломал страницу Ставки
+  getAdGroups: (id, campaignId, period = 'week') =>
+    req(`/accounts/${id}/ad-groups?campaign_id=${campaignId}&period=${period}`),
+
   getKeywords: (id, params = '') => req(`/accounts/${id}/keywords${params}`),
 
   getSuggestions: (id, params = '') => req(`/accounts/${id}/suggestions${params}`),
@@ -39,4 +47,12 @@ export const api = {
   getMetrikaSnapshot: (id) => req(`/accounts/${id}/metrika-snapshot`),
   getSearchQueries: (id, params = '') => req(`/accounts/${id}/search-queries${params}`),
   getDiagnostics: (id) => req(`/accounts/${id}/diagnostics`),
+
+  // Получить дневную статистику за произвольный диапазон дат
+  getDailyStats: (id, dateFrom, dateTo) =>
+    req(`/accounts/${id}/daily-stats?date_from=${dateFrom}&date_to=${dateTo}`),
+
+  // Получить статистику кампании по дням
+  getCampaignDailyStats: (id, campaignId, dateFrom, dateTo) =>
+    req(`/accounts/${id}/campaigns/${campaignId}/daily-stats?date_from=${dateFrom}&date_to=${dateTo}`),
 }
