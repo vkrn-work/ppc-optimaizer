@@ -25,7 +25,25 @@ const NAV = [
 ]
 
 function getMSK() {
-  return new Date().toLocaleTimeString('ru-RU',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit'})
+  return new Date().toLocaleTimeString('ru-RU', {
+    timeZone: 'Europe/Moscow',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+// Форматировать UTC-дату из БД как МСК
+// last_sync_at приходит без Z — добавляем чтобы браузер трактовал как UTC
+function formatSyncTime(isoString) {
+  if (!isoString) return null
+  const s = isoString.endsWith('Z') ? isoString : isoString + 'Z'
+  return new Date(s).toLocaleString('ru-RU', {
+    timeZone: 'Europe/Moscow',
+    day: '2-digit',
+    month: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
 }
 
 export default function Layout({ children, account, accounts, onAccountChange }) {
@@ -40,34 +58,25 @@ export default function Layout({ children, account, accounts, onAccountChange })
   const [badges, setBadges] = useState({})
   const accountId = account?.id
 
-  /* persist theme */
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
     if (typeof window !== 'undefined') localStorage.setItem('theme', theme)
   }, [theme])
 
-  /* clock */
   useEffect(() => {
     const t = setInterval(() => setTime(getMSK()), 30000)
     return () => clearInterval(t)
   }, [])
 
-  /* load badge counts */
   useEffect(() => {
     if (!accountId) return
-    // suggestions count
     fetch(`https://ppc-optimaizer-production.up.railway.app/api/v1/accounts/${accountId}/analyses`)
       .then(r => r.json())
       .then(data => {
         const a = data?.[0]
-        const urgentProblems = (a?.problems||[]).filter(p=>p.priority==='today').length
-        const newKwCount = 0 // will be populated when search-queries endpoint returns data
-        setBadges(prev => ({
-          ...prev,
-          suggest: urgentProblems || null,
-        }))
-      }).catch(()=>{})
-    // diagnostics - check health
+        const urgentProblems = (a?.problems || []).filter(p => p.priority === 'today').length
+        setBadges(prev => ({ ...prev, suggest: urgentProblems || null }))
+      }).catch(() => {})
     fetch(`https://ppc-optimaizer-production.up.railway.app/health`)
       .then(r => r.json())
       .then(h => {
@@ -80,15 +89,13 @@ export default function Layout({ children, account, accounts, onAccountChange })
   async function handleSync() {
     if (!accountId || syncing) return
     setSyncing(true)
-    try { await api.triggerSync(accountId) } catch(e) {}
+    try { await api.triggerSync(accountId) } catch (e) {}
     finally { setTimeout(() => setSyncing(false), 2000) }
   }
 
-  const lastSync = account?.last_sync_at
-    ? 'Обновлено: ' + new Date(account.last_sync_at).toLocaleString('ru-RU', {
-        timeZone:'Europe/Moscow', day:'2-digit', month:'2-digit',
-        hour:'2-digit', minute:'2-digit'
-      }) + ' МСК'
+  const syncFormatted = formatSyncTime(account?.last_sync_at)
+  const lastSync = syncFormatted
+    ? `Обновлено: ${syncFormatted} МСК`
     : `Сейчас: ${time} МСК`
 
   const isDark = theme === 'dark'
@@ -104,34 +111,32 @@ export default function Layout({ children, account, accounts, onAccountChange })
           {lastSync}
         </div>
         <div className="topbar-right">
-          <button className="btn btn-sm btn-primary" onClick={handleSync} disabled={syncing} style={{minWidth:120}}>
+          <button className="btn btn-sm btn-primary" onClick={handleSync} disabled={syncing} style={{ minWidth: 120 }}>
             {syncing ? '⏳ Запуск...' : '↻ Обновить данные'}
           </button>
-          <div className="sb-toggle" onClick={() => setTheme(t => t==='dark'?'light':'dark')}
-            title={isDark ? 'Светлая тема' : 'Тёмная тема'} style={{fontSize:14}}>
+          <div className="sb-toggle" onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
+            title={isDark ? 'Светлая тема' : 'Тёмная тема'} style={{ fontSize: 14 }}>
             {isDark ? '☀' : '☾'}
           </div>
         </div>
       </div>
 
       {/* ── SIDEBAR ── */}
-      <div className={`app-sidebar${collapsed?' collapsed':''}`}>
-        {/* Cabinet */}
+      <div className={`app-sidebar${collapsed ? ' collapsed' : ''}`}>
         <div className="sb-cabinet">
-          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:8}}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
             {!collapsed && (
-              <select className="cabinet-select" value={accountId||''}
+              <select className="cabinet-select" value={accountId || ''}
                 onChange={e => onAccountChange && onAccountChange(Number(e.target.value))}>
                 {accounts?.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
               </select>
             )}
-            <div className="sb-toggle" onClick={() => setCollapsed(c=>!c)} style={{flexShrink:0}}>
+            <div className="sb-toggle" onClick={() => setCollapsed(c => !c)} style={{ flexShrink: 0 }}>
               {collapsed ? '›' : '‹'}
             </div>
           </div>
         </div>
 
-        {/* Nav */}
         {NAV.map(({ section, items }) => (
           <div key={section} className="sb-section">
             <div className="sb-label">{section}</div>
@@ -140,15 +145,15 @@ export default function Layout({ children, account, accounts, onAccountChange })
               const bv = badges[item.badgeKey]
               return (
                 <div key={item.href}
-                  className={`sb-item${active?' active':''}${item.danger?' sb-danger':''}`}
+                  className={`sb-item${active ? ' active' : ''}${item.danger ? ' sb-danger' : ''}`}
                   onClick={() => router.push(item.href)}
                   title={collapsed ? item.label : ''}
-                  style={item.danger ? {color:'var(--red)'} : {}}
+                  style={item.danger ? { color: 'var(--red)' } : {}}
                 >
                   <span className="sb-icon">{item.icon}</span>
                   <span className="sb-text">{item.label}</span>
                   {bv != null && (
-                    <span className={`sb-badge${item.badgeColor?' '+item.badgeColor:''}`}>{bv}</span>
+                    <span className={`sb-badge${item.badgeColor ? ' ' + item.badgeColor : ''}`}>{bv}</span>
                   )}
                 </div>
               )
@@ -158,7 +163,7 @@ export default function Layout({ children, account, accounts, onAccountChange })
       </div>
 
       {/* ── MAIN ── */}
-      <div className={`app-main${collapsed?' expanded':''}`}>
+      <div className={`app-main${collapsed ? ' expanded' : ''}`}>
         {children}
       </div>
     </>
