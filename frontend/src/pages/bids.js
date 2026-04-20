@@ -17,6 +17,29 @@ const SIGNAL_RULES = [
   { key:'low_ctr',            label:'📊 Низкий CTR',       color:'var(--yellow)' },
 ]
 
+// Честный спарклайн из реальных посуточных данных ключа
+function KeySparkline({ data }) {
+  const [mounted, setMounted] = useState(false)
+  useEffect(() => setMounted(true), [])
+  if (!mounted || !data?.length || data.length < 2) return null
+  const vals = data.map(d => d.clicks || 0)
+  const max = Math.max(...vals) || 1
+  const w = 40, h = 18
+  const pts = vals.map((v, i) => {
+    const x = Math.round((i / (vals.length - 1)) * w * 10) / 10
+    const y = Math.round((h - (v / max) * (h - 2) - 1) * 10) / 10
+    return `${x},${y}`
+  }).join(' ')
+  const trend = vals[vals.length-1] - vals[0]
+  const tColor = trend > 0 ? 'var(--green)' : trend < 0 ? 'var(--red)' : 'var(--text3)'
+  return (
+    <svg width={w} height={h} style={{overflow:'visible', opacity:0.8}}>
+      <polyline points={pts} fill="none" stroke={tColor} strokeWidth="1.2"
+        strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
 export default function Bids() {
   const { account, accounts, accountId, switchAccount } = useAccount()
   const [period, setPeriod] = useState('week')
@@ -32,7 +55,7 @@ export default function Bids() {
   const [cpl, setCpl] = useState(2000)
   const [cr, setCr] = useState(5)
 
-  // Загрузка всех кампаний (без фильтра по стратегии)
+  // Загрузка кампаний
   useEffect(() => {
     if (!accountId) return
     api.getCampaigns(accountId, period)
@@ -40,19 +63,15 @@ export default function Bids() {
       .catch(console.error)
   }, [accountId, period])
 
-  // Загрузка групп при выборе кампании
+  // Загрузка групп при выборе кампании — FIX: метод теперь существует
   useEffect(() => {
-    if (!accountId || !selCampaign) {
-      setAdGroups([])
-      setSelGroup('')
-      return
-    }
-    api.getAdGroups(accountId, selCampaign)
+    if (!accountId || !selCampaign) { setAdGroups([]); setSelGroup(''); return }
+    api.getAdGroups(accountId, selCampaign, period)
       .then(g => setAdGroups(g || []))
       .catch(() => setAdGroups([]))
-  }, [accountId, selCampaign])
+  }, [accountId, selCampaign, period])
 
-  // Загрузка ключей
+  // Загрузка ключей со спарклайном
   useEffect(() => {
     if (!accountId) return
     setLoading(true)
@@ -73,12 +92,9 @@ export default function Bids() {
   })
 
   const calcBid = () => Math.round(cpl * cr / 100)
-
   const problemCounts = SIGNAL_RULES.map(r => ({
-    ...r,
-    count: keywords.filter(kw => kw.problem?.type === r.key).length
+    ...r, count: keywords.filter(kw => kw.problem?.type === r.key).length
   })).filter(r => r.count > 0)
-
   const manualCount = campaigns.filter(c => c.strategy_type === 'MANUAL_CPC').length
 
   return (
@@ -95,21 +111,10 @@ export default function Bids() {
         </div>
       </div>
 
-      {/* Фильтры */}
       <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap',alignItems:'center'}}>
-        <input
-          placeholder="Поиск по фразе..."
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          style={{width:180}}
-        />
-
-        <select
-          value={selCampaign}
-          onChange={e => { setSelCampaign(e.target.value); setSelGroup('') }}
-          className="btn"
-          style={{padding:'5px 10px', maxWidth:260}}
-        >
+        <input placeholder="Поиск по фразе..." value={search} onChange={e => setSearch(e.target.value)} style={{width:180}} />
+        <select value={selCampaign} onChange={e => { setSelCampaign(e.target.value); setSelGroup('') }}
+          className="btn" style={{padding:'5px 10px', maxWidth:260}}>
           <option value="">Все кампании ({campaigns.length})</option>
           {campaigns.map(c => (
             <option key={c.id} value={c.id}>
@@ -117,39 +122,26 @@ export default function Bids() {
             </option>
           ))}
         </select>
-
         {selCampaign && adGroups.length > 0 && (
-          <select
-            value={selGroup}
-            onChange={e => setSelGroup(e.target.value)}
-            className="btn"
-            style={{padding:'5px 10px', maxWidth:220}}
-          >
+          <select value={selGroup} onChange={e => setSelGroup(e.target.value)}
+            className="btn" style={{padding:'5px 10px', maxWidth:220}}>
             <option value="">Все группы ({adGroups.length})</option>
-            {adGroups.map(g => (
-              <option key={g.id} value={g.id}>{g.name}</option>
-            ))}
+            {adGroups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
           </select>
         )}
-
-        <button className={`btn${hideAuto?' btn-primary':''}`}
-          onClick={() => setHideAuto(h => !h)}>
+        <button className={`btn${hideAuto?' btn-primary':''}`} onClick={() => setHideAuto(h => !h)}>
           {hideAuto ? '✓ ' : ''}Скрыть автотаргетинг
         </button>
-        <button className={`btn${onlyProblems?' btn-primary':''}`}
-          onClick={() => setOnlyProblems(p => !p)}>
+        <button className={`btn${onlyProblems?' btn-primary':''}`} onClick={() => setOnlyProblems(p => !p)}>
           {onlyProblems ? '✓ ' : ''}Только с сигналами
         </button>
         <span style={{fontSize:11,color:'var(--text3)'}}>
           {filtered.length} ключей
-          {manualCount > 0 && (
-            <span style={{marginLeft:6,color:'var(--green)'}}>✎ {manualCount} ручных РК</span>
-          )}
+          {manualCount > 0 && <span style={{marginLeft:6,color:'var(--green)'}}>✎ {manualCount} ручных РК</span>}
         </span>
       </div>
 
       <div style={{display:'grid',gridTemplateColumns:'1fr 290px',gap:14}}>
-        {/* Таблица */}
         <div className="card" style={{padding:0,overflow:'auto'}}>
           {loading ? (
             <div style={{padding:'2rem',textAlign:'center',color:'var(--text3)'}}>Загрузка...</div>
@@ -168,7 +160,8 @@ export default function Bids() {
                   <th>Поз. клика</th>
                   <th>Объём тр.</th>
                   <th>Клики</th>
-                  <th>Δ клики</th>
+                  <th>Тренд</th>
+                  <th>Δ кл.</th>
                   <th>CTR</th>
                   <th>CPC</th>
                   <th>Расход</th>
@@ -184,17 +177,16 @@ export default function Bids() {
                   return (
                     <tr key={kw.id} style={hasProblem ? {background:'rgba(255,79,79,0.04)'} : {}}>
                       <td style={{fontFamily:'monospace',fontSize:11,maxWidth:240}}>
-                        <div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
-                          title={kw.phrase}>{kw.phrase}</div>
+                        <div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={kw.phrase}>
+                          {kw.phrase}
+                        </div>
                       </td>
                       <td style={{whiteSpace:'nowrap'}}>{kw.current_bid ? fR(kw.current_bid) : '—'}</td>
                       <td style={{whiteSpace:'nowrap'}}>
                         {recBid ? (
                           <span style={{fontWeight:600,color:diff>0?'var(--green)':'var(--red)'}}>
                             {fR(recBid)}
-                            <span style={{fontSize:10,marginLeft:3}}>
-                              {diff>0?'▲':'▼'}{Math.abs(diffPct)}%
-                            </span>
+                            <span style={{fontSize:10,marginLeft:3}}>{diff>0?'▲':'▼'}{Math.abs(diffPct)}%</span>
                           </span>
                         ) : '—'}
                       </td>
@@ -202,13 +194,13 @@ export default function Bids() {
                         <span style={{
                           color: kw.avg_position>3?'var(--red)':kw.avg_position<2?'var(--green)':'inherit',
                           fontWeight: kw.avg_position>3?600:400,
-                        }}>
-                          {fP(kw.avg_position)}
-                        </span>
+                        }}>{fP(kw.avg_position)}</span>
                       </td>
                       <td>{fP(kw.avg_click_position)}</td>
                       <td>{fN(kw.traffic_volume)}</td>
                       <td>{fN(kw.clicks)}</td>
+                      {/* Честный тренд из посуточных данных */}
+                      <td><KeySparkline data={kw.sparkline} /></td>
                       <td>
                         {kw.click_delta != null && (
                           <span style={{fontSize:11,color:kw.click_delta>0?'var(--green)':'var(--red)'}}>
@@ -233,7 +225,7 @@ export default function Bids() {
                 })}
                 {filtered.length > 300 && (
                   <tr>
-                    <td colSpan={12} style={{textAlign:'center',color:'var(--text3)',padding:'1rem',fontSize:12}}>
+                    <td colSpan={13} style={{textAlign:'center',color:'var(--text3)',padding:'1rem',fontSize:12}}>
                       Показано 300 из {filtered.length}
                     </td>
                   </tr>
@@ -243,7 +235,6 @@ export default function Bids() {
           )}
         </div>
 
-        {/* Правая панель */}
         <div style={{display:'flex',flexDirection:'column',gap:12}}>
           <div className="card">
             <div className="card-title">Калькулятор ставки</div>
@@ -259,34 +250,27 @@ export default function Bids() {
               <div style={{background:'var(--bg4)',borderRadius:8,padding:'12px'}}>
                 <div style={{fontSize:11,color:'var(--text3)',marginBottom:4}}>Рекомендуемая ставка</div>
                 <div style={{fontSize:22,fontWeight:700,color:'var(--accent)'}}>{fR(calcBid())}</div>
-                <div style={{fontSize:10,color:'var(--text3)',marginTop:3}}>
-                  CPL {cpl}₽ × CR {cr}% = {calcBid()}₽
-                </div>
+                <div style={{fontSize:10,color:'var(--text3)',marginTop:3}}>CPL {cpl}₽ × CR {cr}% = {calcBid()}₽</div>
               </div>
             </div>
           </div>
-
           <div className="card">
             <div className="card-title">Сигналы</div>
             {problemCounts.length === 0 ? (
               <div style={{fontSize:12,color:'var(--text3)'}}>Проблем не найдено ✓</div>
             ) : problemCounts.map(r => (
-              <div key={r.key} style={{
-                display:'flex',justifyContent:'space-between',alignItems:'center',
-                padding:'5px 0',borderBottom:'1px solid var(--border)',
-              }}>
+              <div key={r.key} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'5px 0',borderBottom:'1px solid var(--border)'}}>
                 <span style={{fontSize:12,color:r.color}}>{r.label}</span>
                 <span style={{fontWeight:600,fontSize:13}}>{r.count}</span>
               </div>
             ))}
           </div>
-
           <div className="card" style={{fontSize:11,color:'var(--text2)'}}>
             <div style={{fontWeight:500,marginBottom:6}}>ℹ Логика рекомендаций</div>
             <div style={{lineHeight:1.8,color:'var(--text3)'}}>
               <div>↑ Поз. показа &gt;3 → ставка ×1.3</div>
               <div>↓ Поз. показа &lt;1.5 → ставка ×0.9</div>
-              <div>Все активные ключи</div>
+              <div>Тренд — посуточные клики за период</div>
               <div>✎ ручные &nbsp;⚙ автоматические РК</div>
             </div>
           </div>

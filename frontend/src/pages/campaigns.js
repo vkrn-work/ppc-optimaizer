@@ -3,19 +3,26 @@ import Layout from '../components/Layout'
 import { useAccount } from '../hooks/useAccount'
 import { api } from '../utils/api'
 
-const PERIODS = [{key:'yesterday',label:'Вчера'},{key:'3d',label:'3 дня'},{key:'week',label:'Неделя'},{key:'month',label:'Месяц'}]
+const PERIODS = [
+  {key:'yesterday',label:'Вчера'},
+  {key:'3d',label:'3 дня'},
+  {key:'week',label:'Неделя'},
+  {key:'month',label:'Месяц'},
+  {key:'custom',label:'Период ↓'},
+]
 
-function fN(n)  { return (n==null||n==='')?'—':n>=1000?Math.round(n).toLocaleString('ru'):Math.round(n*10)/10 }
-function fR(n)  { return n==null?'—':Math.round(n).toLocaleString('ru')+' ₽' }
-function fP(n)  { return (!n||n===0)?'—':(Math.round(n*10)/10) }
-function fPct(n){ return n==null?'—':(Math.round(n*10)/10)+'%' }
+function fN(n)   { return (n==null||n==='')?'—':n>=1000?Math.round(n).toLocaleString('ru'):Math.round(n*10)/10 }
+function fR(n)   { return n==null?'—':Math.round(n).toLocaleString('ru')+' ₽' }
+function fP(n)   { return (!n||n===0)?'—':(Math.round(n*10)/10) }
+function fPct(n) { return n==null?'—':(Math.round(n*10)/10)+'%' }
 
-function Delta({ v }) {
-  if (v == null) return <span style={{color:'var(--text3)',fontSize:10}}>—</span>
-  const up = v > 0
+function Delta({ v, invert }) {
+  if (v==null) return <span style={{color:'var(--text3)',fontSize:10}}>—</span>
+  const up = v.value > 0
+  const good = invert ? !up : up
   return (
-    <span style={{fontSize:10,color:up?'var(--green)':'var(--red)',marginLeft:4}}>
-      {up?'▲':'▼'}{Math.abs(v)}%
+    <span style={{fontSize:10, color: good ? 'var(--green)' : 'var(--red)', marginLeft:4}}>
+      {up?'▲':'▼'}{Math.abs(v.value)}%
     </span>
   )
 }
@@ -27,45 +34,133 @@ function PosCell({ v }) {
 }
 
 const COLS = [
-  { key:'spend',             label:'Расход',        fmt:fR,    invert:true  },
-  { key:'impressions',       label:'Показы',        fmt:fN               },
-  { key:'clicks',            label:'Клики',         fmt:fN               },
-  { key:'ctr',               label:'CTR',           fmt:fPct             },
-  { key:'avg_cpc',           label:'CPC',           fmt:fR,    invert:true  },
-  { key:'avg_position',      label:'Поз. показа',   fmt:fP,    invert:true  },
-  { key:'avg_click_position',label:'Поз. клика',    fmt:fP,    invert:true  },
-  { key:'traffic_volume',    label:'Ср. объём тр.', fmt:fN               },
+  { key:'spend',              label:'Расход',       fmt:fR,   invert:true },
+  { key:'impressions',        label:'Показы',       fmt:fN               },
+  { key:'clicks',             label:'Клики',        fmt:fN               },
+  { key:'ctr',                label:'CTR',          fmt:fPct             },
+  { key:'avg_cpc',            label:'CPC',          fmt:fR,   invert:true },
+  { key:'avg_position',       label:'Поз. показа',  fmt:fP,   invert:true },
+  { key:'avg_click_position', label:'Поз. клика',   fmt:fP,   invert:true },
+  { key:'traffic_volume',     label:'Объём тр.',    fmt:fN               },
 ]
+
+// Раскрывающийся график динамики кампании по дням
+function CampaignDrillDown({ campaign, accountId, dateFrom, dateTo }) {
+  const [rows, setRows] = useState(null)
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (!accountId || !campaign || !dateFrom || !dateTo) return
+    setLoading(true)
+    api.getCampaignDailyStats(accountId, campaign.id, dateFrom, dateTo)
+      .then(r => setRows(r.rows || []))
+      .catch(console.error)
+      .finally(() => setLoading(false))
+  }, [accountId, campaign?.id, dateFrom, dateTo])
+
+  if (loading) return <tr><td colSpan={COLS.length + 4} style={{padding:'8px 16px',color:'var(--text3)'}}>Загрузка...</td></tr>
+  if (!rows?.length) return <tr><td colSpan={COLS.length + 4} style={{padding:'8px 16px',color:'var(--text3)'}}>Нет данных за период</td></tr>
+
+  return (
+    <tr>
+      <td colSpan={COLS.length + 4} style={{padding:0}}>
+        <div style={{background:'var(--bg2)',padding:'8px 16px',borderTop:'1px solid var(--border)'}}>
+          <div style={{fontSize:11,color:'var(--text3)',marginBottom:6}}>Динамика по дням</div>
+          <div style={{overflowX:'auto'}}>
+            <table style={{fontSize:11}}>
+              <thead>
+                <tr>
+                  <th>Дата</th><th>Клики</th><th>Показы</th>
+                  <th>Расход</th><th>CPC</th><th>CTR</th><th>Позиция</th><th>Объём тр.</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...rows].reverse().map((d,i) => (
+                  <tr key={i}>
+                    <td style={{whiteSpace:'nowrap'}}>
+                      {new Date(d.date).toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit'})}
+                    </td>
+                    <td style={{fontWeight:i===0?600:400}}>{fN(d.clicks)}</td>
+                    <td>{fN(d.impressions)}</td>
+                    <td>{fR(d.spend)}</td>
+                    <td>{fR(d.avg_cpc)}</td>
+                    <td>{fPct(d.ctr)}</td>
+                    <td><PosCell v={d.avg_position} /></td>
+                    <td>{fN(d.traffic_volume)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </td>
+    </tr>
+  )
+}
 
 export default function Campaigns() {
   const { account, accounts, accountId, switchAccount } = useAccount()
-  const [period, setPeriod] = useState('week')
-  const [view, setView] = useState('campaigns')
-  const [data, setData] = useState([])
-  const [campaigns, setCampaigns] = useState([])
-  const [loading, setLoading] = useState(false)
+  const [period, setPeriod]         = useState('week')
+  const [customFrom, setCustomFrom] = useState('')
+  const [customTo, setCustomTo]     = useState('')
+  const [compareFrom, setCompareFrom] = useState('')
+  const [compareTo, setCompareTo]   = useState('')
+  const [showCustom, setShowCustom] = useState(false)
+  const [view, setView]             = useState('campaigns')
+  const [data, setData]             = useState([])
+  const [campaigns, setCampaigns]   = useState([])
+  const [loading, setLoading]       = useState(false)
   const [onlyActive, setOnlyActive] = useState(true)
-  const [search, setSearch] = useState('')
+  const [search, setSearch]         = useState('')
   const [selCampaign, setSelCampaign] = useState('')
-  const [sortBy, setSortBy] = useState('spend')
-  const [sortDir, setSortDir] = useState(-1)
+  const [sortBy, setSortBy]         = useState('spend')
+  const [sortDir, setSortDir]       = useState(-1)
+  const [expandedId, setExpandedId] = useState(null)  // раскрытая кампания
 
-  useEffect(() => {
+  // Реальные даты для drill-down
+  const [activeDateFrom, setActiveDateFrom] = useState('')
+  const [activeDateTo, setActiveDateTo]     = useState('')
+
+  function buildExtra() {
+    if (period === 'custom' && customFrom && customTo) {
+      let e = `date_from=${customFrom}&date_to=${customTo}`
+      if (compareFrom && compareTo) e += `&compare_from=${compareFrom}&compare_to=${compareTo}`
+      return e
+    }
+    return ''
+  }
+
+  function loadData() {
     if (!accountId) return
     setLoading(true)
-
-    // ВАЖНО: передаём period в getCampaigns
+    const extra = buildExtra()
     Promise.all([
-      api.getCampaigns(accountId, period, onlyActive),
+      api.getCampaigns(accountId, period === 'custom' ? 'week' : period, onlyActive, extra),
       view === 'keywords'
-        ? api.getKeywords(accountId, `?period=${period}${onlyActive?'&active_only=true':''}${selCampaign?'&campaign_id='+selCampaign:''}${search?'&search='+encodeURIComponent(search):''}`)
+        ? api.getKeywords(accountId, `?period=${period === 'custom' ? 'week' : period}${onlyActive?'&active_only=true':''}${selCampaign?'&campaign_id='+selCampaign:''}${search?'&search='+encodeURIComponent(search):''}${extra?'&'+extra:''}`)
         : Promise.resolve(null),
     ]).then(([camps, kws]) => {
       const list = onlyActive ? (camps||[]).filter(c => c.is_active) : (camps||[])
       setCampaigns(list)
       if (view === 'campaigns') setData(list)
       else if (view === 'keywords' && kws) setData(kws)
+      // Сохраняем активные даты для drill-down
+      if (period !== 'custom') {
+        const today = new Date()
+        const daysMap = {yesterday:1,'3d':3,week:7,month:30}
+        const days = daysMap[period] || 7
+        const from = new Date(today); from.setDate(from.getDate() - days)
+        setActiveDateFrom(from.toISOString().slice(0,10))
+        setActiveDateTo(today.toISOString().slice(0,10))
+      } else {
+        setActiveDateFrom(customFrom)
+        setActiveDateTo(customTo)
+      }
     }).catch(console.error).finally(() => setLoading(false))
+  }
+
+  useEffect(() => {
+    if (period !== 'custom') loadData()
   }, [accountId, period, view, onlyActive, selCampaign, search])
 
   function toggleSort(key) {
@@ -77,36 +172,64 @@ export default function Campaigns() {
     .filter(item => !search || (item.name||item.phrase||'').toLowerCase().includes(search.toLowerCase()))
     .sort((a,b) => ((b[sortBy]||0) - (a[sortBy]||0)) * sortDir)
 
+  function strategyLabel(s) {
+    if (s === 'MANUAL_CPC') return {label:'Ручная', cls:'badge-ok'}
+    if (s === 'AUTO')       return {label:'Авто',   cls:'badge-info'}
+    return {label: s || '—', cls:'badge-info'}
+  }
+
   return (
     <Layout account={account} accounts={accounts} onAccountChange={switchAccount}>
-      {/* Header */}
       <div className="page-header">
         <div className="page-title">По кампаниям</div>
         <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
           <div className="period-tabs">
             {PERIODS.map(p=>(
               <div key={p.key} className={`period-tab${period===p.key?' active':''}`}
-                onClick={()=>setPeriod(p.key)}>{p.label}</div>
+                onClick={()=>{ setPeriod(p.key); setShowCustom(p.key==='custom') }}>
+                {p.label}
+              </div>
             ))}
           </div>
           <div className="period-tabs">
             {['campaigns','keywords'].map(v=>(
-              <div key={v} className={`period-tab${view===v?' active':''}`}
-                onClick={()=>setView(v)}>
-                {v==='campaigns'?'Кампании':'Ключевые слова'}
+              <div key={v} className={`period-tab${view===v?' active':''}`} onClick={()=>setView(v)}>
+                {v==='campaigns'?'Кампании':'Ключи'}
               </div>
             ))}
           </div>
         </div>
       </div>
 
-      {/* Filters */}
+      {/* Выбор произвольного периода */}
+      {showCustom && (
+        <div className="card" style={{marginBottom:14,padding:'12px 16px'}}>
+          <div style={{display:'flex',gap:12,flexWrap:'wrap',alignItems:'flex-end'}}>
+            <div>
+              <div style={{fontSize:11,color:'var(--text3)',marginBottom:4}}>Период анализа</div>
+              <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                <input type="date" value={customFrom} onChange={e=>setCustomFrom(e.target.value)} style={{padding:'4px 8px'}} />
+                <span style={{color:'var(--text3)'}}>—</span>
+                <input type="date" value={customTo} onChange={e=>setCustomTo(e.target.value)} style={{padding:'4px 8px'}} />
+              </div>
+            </div>
+            <div>
+              <div style={{fontSize:11,color:'var(--text3)',marginBottom:4}}>Период сравнения</div>
+              <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                <input type="date" value={compareFrom} onChange={e=>setCompareFrom(e.target.value)} style={{padding:'4px 8px'}} />
+                <span style={{color:'var(--text3)'}}>—</span>
+                <input type="date" value={compareTo} onChange={e=>setCompareTo(e.target.value)} style={{padding:'4px 8px'}} />
+              </div>
+            </div>
+            <button className="btn btn-primary" onClick={loadData} disabled={!customFrom||!customTo||loading}>
+              Применить
+            </button>
+          </div>
+        </div>
+      )}
+
       <div style={{display:'flex',gap:8,marginBottom:12,flexWrap:'wrap',alignItems:'center'}}>
-        <input
-          placeholder={`Поиск по ${view==='campaigns'?'кампании':'фразе'}...`}
-          value={search} onChange={e=>setSearch(e.target.value)}
-          style={{width:200}}
-        />
+        <input placeholder={`Поиск...`} value={search} onChange={e=>setSearch(e.target.value)} style={{width:200}} />
         {view==='keywords' && (
           <select value={selCampaign} onChange={e=>setSelCampaign(e.target.value)}
             className="btn" style={{padding:'5px 10px'}}>
@@ -114,10 +237,7 @@ export default function Campaigns() {
             {campaigns.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
           </select>
         )}
-        <button
-          className={`btn${onlyActive?' btn-primary':''}`}
-          onClick={()=>setOnlyActive(a=>!a)}
-        >
+        <button className={`btn${onlyActive?' btn-primary':''}`} onClick={()=>setOnlyActive(a=>!a)}>
           {onlyActive?'✓ ':''} Только активные
         </button>
         <span style={{fontSize:11,color:'var(--text3)',marginLeft:4}}>
@@ -125,7 +245,6 @@ export default function Campaigns() {
         </span>
       </div>
 
-      {/* Table */}
       <div className="card" style={{padding:0,overflow:'auto'}}>
         {loading ? (
           <div style={{padding:'2rem',textAlign:'center',color:'var(--text3)'}}>Загрузка...</div>
@@ -139,56 +258,70 @@ export default function Campaigns() {
               <tr>
                 <th style={{minWidth:220}}>Кампания</th>
                 <th>ID Директа</th>
-                <th>Тип</th>
                 <th>Стратегия</th>
                 {COLS.map(c=>(
                   <th key={c.key} style={{cursor:'pointer',whiteSpace:'nowrap'}}
                     onClick={()=>toggleSort(c.key)}>
-                    {c.label} {sortBy===c.key?(sortDir>0?'↑':'↓'):''}
+                    {c.label}{sortBy===c.key?(sortDir>0?' ↑':' ↓'):''}
                   </th>
                 ))}
-                {/* CRM плейсхолдер */}
                 <th style={{color:'var(--text3)'}}>SQL</th>
                 <th style={{color:'var(--text3)'}}>CPL</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
-              {filtered.map(c=>(
-                <tr key={c.id}>
-                  <td style={{fontWeight:500,fontSize:12,maxWidth:260}}>
-                    <div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
-                      {c.name}
-                    </div>
-                    {!c.is_active && (
-                      <span style={{fontSize:10,color:'var(--text3)'}}>остановлена</span>
+              {filtered.map(c => {
+                const strat = strategyLabel(c.strategy_type)
+                const isExpanded = expandedId === c.id
+                return (
+                  <>
+                    <tr key={c.id} style={{cursor:'pointer'}} onClick={()=>setExpandedId(isExpanded?null:c.id)}>
+                      <td style={{fontWeight:500,fontSize:12,maxWidth:260}}>
+                        <div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{c.name}</div>
+                        {!c.is_active && <span style={{fontSize:10,color:'var(--text3)'}}>остановлена</span>}
+                      </td>
+                      <td style={{fontSize:11,color:'var(--text3)',fontFamily:'monospace'}}>{c.direct_id||'—'}</td>
+                      <td>
+                        <span className={`badge ${strat.cls}`}>{strat.label}</span>
+                      </td>
+                      {COLS.map(col => (
+                        <td key={col.key}>
+                          {col.key==='avg_position'||col.key==='avg_click_position'
+                            ? <PosCell v={c[col.key]} />
+                            : (
+                              <div>
+                                {col.fmt(c[col.key])}
+                                {c[`delta_${col.key.replace('avg_','')}`] && (
+                                  <Delta v={c[`delta_${col.key.replace('avg_','')}`]} invert={col.invert} />
+                                )}
+                                {c[`prev_${col.key}`] != null && (
+                                  <div style={{fontSize:9,color:'var(--text3)'}}>
+                                    пред: {col.fmt(c[`prev_${col.key}`])}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                        </td>
+                      ))}
+                      <td style={{color:'var(--text3)',fontSize:11}}>—</td>
+                      <td style={{color:'var(--text3)',fontSize:11}}>—</td>
+                      <td style={{fontSize:12,color:'var(--accent)'}}>{isExpanded ? '▲' : '▼'}</td>
+                    </tr>
+                    {isExpanded && (
+                      <CampaignDrillDown
+                        campaign={c}
+                        accountId={accountId}
+                        dateFrom={activeDateFrom}
+                        dateTo={activeDateTo}
+                      />
                     )}
-                  </td>
-                  <td style={{fontSize:11,color:'var(--text3)',fontFamily:'monospace'}}>
-                    {c.direct_id || '—'}
-                  </td>
-                  <td style={{fontSize:11,color:'var(--text3)'}}>
-                    {c.campaign_type || '—'}
-                  </td>
-                  <td>
-                    <span className={`badge ${c.strategy_type==='MANUAL_CPC'?'badge-ok':'badge-info'}`}>
-                      {c.strategy_type==='MANUAL_CPC'?'Ручная':c.strategy_type||'—'}
-                    </span>
-                  </td>
-                  {COLS.map(col=>(
-                    <td key={col.key}>
-                      {col.key==='avg_position'||col.key==='avg_click_position'
-                        ? <PosCell v={c[col.key]} />
-                        : col.fmt(c[col.key])}
-                    </td>
-                  ))}
-                  <td style={{color:'var(--text3)',fontSize:11}}>—</td>
-                  <td style={{color:'var(--text3)',fontSize:11}}>—</td>
-                </tr>
-              ))}
+                  </>
+                )
+              })}
             </tbody>
           </table>
         ) : (
-          /* Keywords table */
           <table>
             <thead>
               <tr>
@@ -197,7 +330,7 @@ export default function Campaigns() {
                 {COLS.map(c=>(
                   <th key={c.key} style={{cursor:'pointer',whiteSpace:'nowrap'}}
                     onClick={()=>toggleSort(c.key)}>
-                    {c.label} {sortBy===c.key?(sortDir>0?'↑':'↓'):''}
+                    {c.label}{sortBy===c.key?(sortDir>0?' ↑':' ↓'):''}
                   </th>
                 ))}
                 <th>Δ клики</th>
@@ -209,9 +342,7 @@ export default function Campaigns() {
                 <tr key={kw.id} style={kw.problem?{background:'rgba(255,79,79,0.03)'}:{}}>
                   <td style={{fontFamily:'monospace',fontSize:11,maxWidth:260}}>
                     <div style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{kw.phrase}</div>
-                    {kw.status && kw.status!=='ACTIVE' && (
-                      <span style={{fontSize:10,color:'var(--text3)'}}>· {kw.status}</span>
-                    )}
+                    {kw.status && kw.status!=='ACTIVE' && <span style={{fontSize:10,color:'var(--text3)'}}>· {kw.status}</span>}
                   </td>
                   <td style={{whiteSpace:'nowrap'}}>{kw.current_bid?fR(kw.current_bid):'—'}</td>
                   {COLS.map(col=>(
