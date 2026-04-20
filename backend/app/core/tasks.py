@@ -1,7 +1,5 @@
 """
 Celery задачи — сбор данных, анализ, трекинг гипотез.
-Используем синхронные сессии БД внутри воркера чтобы избежать
-конфликтов asyncpg с event loop при prefork.
 """
 import asyncio
 import logging
@@ -13,7 +11,6 @@ logger = logging.getLogger(__name__)
 
 
 def run_async(coro):
-    """Запустить async функцию из синхронного Celery — каждый раз новый loop"""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_closed():
@@ -23,7 +20,6 @@ def run_async(coro):
         asyncio.set_event_loop(loop)
 
     if loop.is_running():
-        # уже внутри async контекста — не должно случаться в воркере
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as pool:
             future = pool.submit(asyncio.run, coro)
@@ -33,12 +29,10 @@ def run_async(coro):
 
 
 def get_sync_db():
-    """Получить синхронную сессию для использования в Celery воркере"""
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
     from app.core.config import settings
 
-    # Конвертируем asyncpg URL в синхронный psycopg2
     sync_url = settings.DATABASE_URL.replace(
         "postgresql+asyncpg://", "postgresql://"
     )
@@ -49,7 +43,6 @@ def get_sync_db():
 
 @celery_app.task(name="app.core.tasks.collect_and_analyze_all", bind=True, max_retries=3)
 def collect_and_analyze_all(self):
-    """Запустить сбор + анализ для всех активных кабинетов"""
     session, engine = get_sync_db()
     try:
         from app.models.models import Account
@@ -66,19 +59,22 @@ def collect_and_analyze_all(self):
 
 
 @celery_app.task(name="app.core.tasks.collect_account_data", bind=True, max_retries=3)
-def collect_account_data(self, account_id: int):
-    """Собрать данные из Директа и Метрики для одного кабинета"""
+def collect_account_data(self, account_id: int, days: int = 28):
+    """
+    Собрать данные из Директа и Метрики для одного кабинета.
+    days: за сколько дней собирать статистику (28 по умолчанию, 90 для истории).
+    """
     import asyncio as _asyncio
     loop = _asyncio.new_event_loop()
     _asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_collect_account_data_async(account_id))
+        loop.run_until_complete(_collect_account_data_async(account_id, days=days))
     finally:
         loop.close()
         _asyncio.set_event_loop(None)
 
 
-async def _collect_account_data_async(account_id: int):
+async def _collect_account_data_async(account_id: int, days: int = 28):
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
     from app.core.config import settings
     from app.models.models import Account, Campaign, AdGroup, Keyword, KeywordStat
@@ -99,36 +95,48 @@ async def _collect_account_data_async(account_id: int):
                 return
 
             date_to = date.today()
-            date_from = date_to - timedelta(days=28)
+            date_from = date_to - timedelta(days=days)
+            logger.info(f"Collecting account {account_id} for {days} days: {date_from} — {date_to}")
 
             # ── Сбор из Директа ──────────────────────────────────────────
             async with YandexDirectCollector(account.oauth_token, account.yandex_login) as dc:
-                # Кампании
                 campaigns_data = await dc.get_campaigns()
+                logger.info(f"Campaigns from Yandex Direct: {len(campaigns_data)}")
+
                 for c in campaigns_data:
+                    # ВАЖНО: запрос фильтрует States:ON + Statuses:ACCEPTED,
+                    # значит все пришедшие кампании уже активны.
+                    # is_active=c.get("Status")=="ON" — это БАГ (Status != State).
+                    strategy = c.get("_strategy", "UNKNOWN")
                     stmt = insert(Campaign).values(
                         account_id=account_id,
                         direct_id=str(c["Id"]),
                         name=c.get("Name", ""),
                         campaign_type=c.get("Type", ""),
                         status=c.get("Status", ""),
-                        is_active=c.get("Status") == "ON",
+                        strategy_type=strategy,
+                        is_active=True,  # все из этого запроса активны
                     ).on_conflict_do_update(
                         index_elements=["account_id", "direct_id"],
-                        set_={"name": c.get("Name", ""), "status": c.get("Status", "")},
+                        set_={
+                            "name": c.get("Name", ""),
+                            "status": c.get("Status", ""),
+                            "strategy_type": strategy,
+                            "is_active": True,
+                        },
                     )
                     await db.execute(stmt)
                 await db.commit()
 
-                # Группы
                 campaign_ids = [str(c["Id"]) for c in campaigns_data]
                 if campaign_ids:
-                    # Директ API лимит: 10 кампаний за запрос для adgroups
+                    # Группы
                     groups_data = []
                     for i in range(0, len(campaign_ids), 10):
                         batch = campaign_ids[i:i+10]
                         batch_result = await dc.get_ad_groups(batch)
                         groups_data.extend(batch_result)
+                    logger.info(f"AdGroups: {len(groups_data)}")
                     for g in groups_data:
                         camp_result = await db.execute(
                             select(Campaign).where(
@@ -153,12 +161,12 @@ async def _collect_account_data_async(account_id: int):
                     await db.commit()
 
                     # Ключи
-                    # Батчинг ключей по 10 кампаний
                     keywords_data = []
                     for i in range(0, len(campaign_ids), 10):
                         batch = campaign_ids[i:i+10]
                         batch_result = await dc.get_keywords(batch)
                         keywords_data.extend(batch_result)
+                    logger.info(f"Keywords: {len(keywords_data)}")
                     for kw in keywords_data:
                         group_result = await db.execute(
                             select(AdGroup).where(
@@ -170,35 +178,38 @@ async def _collect_account_data_async(account_id: int):
                         if not group:
                             continue
                         bid = kw.get("Bid")
+                        # Bid приходит в микрорублях (1 руб = 1_000_000 микрорублей)
+                        bid_rub = float(bid) / 1_000_000 if bid and float(bid) > 0 else None
                         stmt = insert(Keyword).values(
                             account_id=account_id,
                             ad_group_id=group.id,
                             direct_id=str(kw["Id"]),
                             phrase=kw.get("Keyword", ""),
-                            current_bid=float(bid) / 1_000_000 if bid else None,
+                            current_bid=bid_rub,
                             status=kw.get("Status", "ACTIVE"),
                         ).on_conflict_do_update(
                             index_elements=["account_id", "direct_id"],
                             set_={
                                 "phrase": kw.get("Keyword", ""),
-                                "current_bid": float(bid) / 1_000_000 if bid else None,
+                                "current_bid": bid_rub,
                                 "status": kw.get("Status", "ACTIVE"),
                             },
                         )
                         await db.execute(stmt)
                     await db.commit()
 
-                    # Статистика
                     # Объявления
                     for i in range(0, len(campaign_ids), 10):
                         batch = campaign_ids[i:i+10]
                         try:
-                            ads_data = await dc.get_ads(batch)
+                            await dc.get_ads(batch)
                         except Exception as e:
                             logger.warning(f"Ads collection error: {e}")
 
-                    # Статистику запрашиваем без фильтра по кампаниям — Reports API сам агрегирует
+                    # Статистика по ключам
                     stats_data = await dc.get_keyword_stats(date_from, date_to)
+                    logger.info(f"Keyword stats rows: {len(stats_data)}")
+                    saved_stats = 0
                     for row in stats_data:
                         kw_result = await db.execute(
                             select(Keyword).where(
@@ -216,12 +227,29 @@ async def _collect_account_data_async(account_id: int):
                             impressions = int(float(row.get("Impressions", 0) or 0))
                             if clicks == 0 and impressions == 0:
                                 continue
+
                             def safe_float(v):
-                                try: return float(v) or None
-                                except: return None
+                                try:
+                                    r = float(v)
+                                    return r if r > 0 else None
+                                except:
+                                    return None
+
                             def safe_int(v):
-                                try: return int(float(v)) or None
-                                except: return None
+                                try:
+                                    r = int(float(v))
+                                    return r if r > 0 else None
+                                except:
+                                    return None
+
+                            # CTR приходит в процентах ("5.23")
+                            ctr_val = safe_float(row.get("Ctr"))
+                            # AvgEffectiveBid приходит в микрорублях — конвертируем
+                            avg_bid_raw = safe_float(row.get("AvgEffectiveBid"))
+                            avg_bid_rub = avg_bid_raw / 1_000_000 if avg_bid_raw else None
+                            # AvgCpc уже в рублях
+                            avg_cpc_val = safe_float(row.get("AvgCpc"))
+
                             stmt = insert(KeywordStat).values(
                                 account_id=account_id,
                                 keyword_id=kw.id,
@@ -229,96 +257,98 @@ async def _collect_account_data_async(account_id: int):
                                 impressions=impressions,
                                 clicks=clicks,
                                 spend=spend,
-                                avg_cpc=safe_float(row.get("AvgCpc")),
-                                avg_bid=safe_float(row.get("AvgEffectiveBid")),
+                                avg_cpc=avg_cpc_val,
+                                avg_bid=avg_bid_rub,
                                 traffic_volume=safe_int(row.get("AvgTrafficVolume")),
                                 avg_position=safe_float(row.get("AvgImpressionPosition")),
                                 avg_click_position=safe_float(row.get("AvgClickPosition")),
-                                ctr=safe_float(row.get("Ctr")),
-                                ad_id=str(row.get("AdId", "")) or None,
+                                ctr=ctr_val,
                             ).on_conflict_do_update(
                                 index_elements=["account_id", "keyword_id", "date"],
                                 set_={
                                     "clicks": clicks,
                                     "spend": spend,
                                     "impressions": impressions,
-                                    "ctr": safe_float(row.get("Ctr")),
+                                    "ctr": ctr_val,
+                                    "avg_cpc": avg_cpc_val,
+                                    "avg_bid": avg_bid_rub,
                                     "avg_position": safe_float(row.get("AvgImpressionPosition")),
                                     "avg_click_position": safe_float(row.get("AvgClickPosition")),
+                                    "traffic_volume": safe_int(row.get("AvgTrafficVolume")),
                                 },
                             )
                             await db.execute(stmt)
+                            saved_stats += 1
                         except (ValueError, KeyError) as e:
-                            logger.warning(f"Error parsing stat row: {e}")
+                            logger.warning(f"Error parsing stat row: {e} | row={row}")
                     await db.commit()
+                    logger.info(f"Stats saved: {saved_stats} rows for account {account_id}")
 
             # ── Сбор поисковых запросов ──────────────────────────────────
             async with YandexDirectCollector(account.oauth_token, account.yandex_login) as dc2:
-              try:
-                from app.models.models import SearchQuery
-                sq_data = await dc2.get_search_queries(date_from, date_to)
-                logger.info(f"Search queries for account {account_id}: {len(sq_data)} rows")
-                for row in sq_data:
-                    try:
-                        sq_date = datetime.strptime(row["Date"], "%Y-%m-%d")
-                        sq_clicks = int(float(row.get("Clicks", 0) or 0))
-                        sq_impressions = int(float(row.get("Impressions", 0) or 0))
-                        if sq_clicks == 0 and sq_impressions == 0:
-                            continue
-                        # Найти keyword_id по CriterionId
-                        kw_result = await db.execute(
-                            select(Keyword).where(
-                                Keyword.account_id == account_id,
-                                Keyword.direct_id == str(row.get("CriterionId", "")),
+                try:
+                    from app.models.models import SearchQuery
+                    sq_data = await dc2.get_search_queries(date_from, date_to)
+                    logger.info(f"Search queries for account {account_id}: {len(sq_data)} rows")
+                    for row in sq_data:
+                        try:
+                            sq_date = datetime.strptime(row["Date"], "%Y-%m-%d")
+                            sq_clicks = int(float(row.get("Clicks", 0) or 0))
+                            sq_impressions = int(float(row.get("Impressions", 0) or 0))
+                            if sq_clicks == 0 and sq_impressions == 0:
+                                continue
+                            kw_result = await db.execute(
+                                select(Keyword).where(
+                                    Keyword.account_id == account_id,
+                                    Keyword.direct_id == str(row.get("CriterionId", "")),
+                                )
                             )
-                        )
-                        kw = kw_result.scalar_one_or_none()
-                        # Найти campaign и adgroup
-                        camp_result = await db.execute(
-                            select(Campaign).where(
-                                Campaign.account_id == account_id,
-                                Campaign.direct_id == str(row.get("CampaignId", "")),
+                            kw = kw_result.scalar_one_or_none()
+                            camp_result = await db.execute(
+                                select(Campaign).where(
+                                    Campaign.account_id == account_id,
+                                    Campaign.direct_id == str(row.get("CampaignId", "")),
+                                )
                             )
-                        )
-                        camp = camp_result.scalar_one_or_none()
-                        ag_result = await db.execute(
-                            select(AdGroup).where(
-                                AdGroup.account_id == account_id,
-                                AdGroup.direct_id == str(row.get("AdGroupId", "")),
+                            camp = camp_result.scalar_one_or_none()
+                            ag_result = await db.execute(
+                                select(AdGroup).where(
+                                    AdGroup.account_id == account_id,
+                                    AdGroup.direct_id == str(row.get("AdGroupId", "")),
+                                )
                             )
-                        )
-                        ag = ag_result.scalar_one_or_none()
+                            ag = ag_result.scalar_one_or_none()
 
-                        def safe_float(v):
-                            try: return float(v) or None
-                            except: return None
+                            def safe_float(v):
+                                try: return float(v) or None
+                                except: return None
 
-                        sq = SearchQuery(
-                            account_id=account_id,
-                            keyword_id=kw.id if kw else None,
-                            date=sq_date,
-                            query=row.get("Query", ""),
-                            keyword_phrase=row.get("Criterion", ""),
-                            match_type=row.get("MatchType", ""),
-                            campaign_id=camp.id if camp else None,
-                            ad_group_id=ag.id if ag else None,
-                            impressions=sq_impressions,
-                            clicks=sq_clicks,
-                            spend=float(row.get("Cost", 0) or 0),
-                            ctr=safe_float(row.get("Ctr")),
-                            avg_cpc=safe_float(row.get("AvgCpc")),
-                            avg_position=safe_float(row.get("AvgImpressionPosition")),
-                            avg_click_position=safe_float(row.get("AvgClickPosition")),
-                        )
-                        db.add(sq)
-                    except Exception as e:
-                        logger.warning(f"Error saving search query: {e}")
-                await db.commit()
-                logger.info(f"Search queries saved for account {account_id}")
-              except Exception as e:
-                logger.warning(f"Search queries collection failed: {e}")
+                            sq = SearchQuery(
+                                account_id=account_id,
+                                keyword_id=kw.id if kw else None,
+                                date=sq_date,
+                                query=row.get("Query", ""),
+                                keyword_phrase=row.get("Criterion", ""),
+                                match_type=row.get("MatchType", ""),
+                                campaign_id=camp.id if camp else None,
+                                ad_group_id=ag.id if ag else None,
+                                impressions=sq_impressions,
+                                clicks=sq_clicks,
+                                spend=float(row.get("Cost", 0) or 0),
+                                ctr=safe_float(row.get("Ctr")),
+                                avg_cpc=safe_float(row.get("AvgCpc")),
+                                avg_position=safe_float(row.get("AvgImpressionPosition")),
+                                avg_click_position=safe_float(row.get("AvgClickPosition")),
+                            )
+                            db.add(sq)
+                        except Exception as e:
+                            logger.warning(f"Error saving search query: {e}")
+                    await db.commit()
+                    logger.info(f"Search queries saved for account {account_id}")
+                except Exception as e:
+                    logger.warning(f"Search queries collection failed: {e}")
 
-            # ── Сбор из Метрики — все срезы ─────────────────────────────
+            # ── Сбор из Метрики ──────────────────────────────────────────
             if account.metrika_counter_id:
                 try:
                     from app.models.models import MetrikaSnapshot
@@ -327,11 +357,8 @@ async def _collect_account_data_async(account_id: int):
                         logger.info(
                             f"Metrika collected for account {account_id}: "
                             f"visits={metrika_data.get('summary', {}).get('visits', 0)}, "
-                            f"keywords={len(metrika_data.get('keywords', []))}, "
-                            f"devices={len(metrika_data.get('devices', []))}, "
-                            f"regions={len(metrika_data.get('regions', []))}"
+                            f"days={len(metrika_data.get('by_day', []))}"
                         )
-                        # Сохранить снапшот
                         snapshot = MetrikaSnapshot(
                             account_id=account_id,
                             date=datetime.utcnow(),
@@ -342,12 +369,10 @@ async def _collect_account_data_async(account_id: int):
                 except Exception as e:
                     logger.warning(f"Metrika collection failed for account {account_id}: {e}")
 
-            # Обновить дату синхронизации
             account.last_sync_at = datetime.utcnow()
             await db.commit()
             logger.info(f"Data collection complete for account {account_id}")
 
-        # Запустить анализ
         run_analysis.delay(account_id)
 
     finally:
@@ -356,7 +381,6 @@ async def _collect_account_data_async(account_id: int):
 
 @celery_app.task(name="app.core.tasks.run_analysis", bind=True, max_retries=2)
 def run_analysis(self, account_id: int):
-    """Запустить CR-анализ и генерацию предложений"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -501,9 +525,7 @@ async def _track_hypothesis_async(hypothesis_id: int):
                 hypothesis.verdict = "insufficient"
                 hypothesis.report = "Недостаточно кликов для статистически значимого вывода."
             else:
-                cr_before = before_stats["clicks"]
-                cr_after = after_stats["clicks"]
-                delta = (cr_after - cr_before) / cr_before * 100
+                delta = (after_stats["clicks"] - before_stats["clicks"]) / before_stats["clicks"] * 100
                 hypothesis.delta_percent = round(delta, 2)
                 if delta >= 10:
                     hypothesis.verdict = "confirmed"
