@@ -2,9 +2,10 @@
 Схема БД PPC Optimizer
 Все таблицы содержат account_id для мультикабинетности с первого дня.
 
-Изменения v1.2:
-  - KeywordStat: добавлены bounce_rate, sessions, weighted_ctr, weighted_impressions
-  - Campaign: добавлен epk_collapse_detected флаг
+v1.2 additions:
+  - KeywordStat: weighted_impressions, weighted_ctr, bounce_rate, sessions
+  - Campaign: epk_collapse_detected
+  - HypothesisVerdict: neutral
 """
 from datetime import datetime
 from decimal import Decimal
@@ -24,6 +25,7 @@ class Base(DeclarativeBase):
 # ─── Справочники ──────────────────────────────────────────────────────────────
 
 class Account(Base):
+    """Рекламный кабинет (один аккаунт Яндекс Директ)"""
     __tablename__ = "accounts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -45,19 +47,20 @@ class Account(Base):
 
 
 class Campaign(Base):
+    """Рекламная кампания"""
     __tablename__ = "campaigns"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
     direct_id: Mapped[str] = mapped_column(String(100))
     name: Mapped[str] = mapped_column(String(500))
-    campaign_type: Mapped[str] = mapped_column(String(50))   # EPK / TGK / etc
+    campaign_type: Mapped[str] = mapped_column(String(50))  # EPK / TGK / etc
     status: Mapped[str] = mapped_column(String(50))
     daily_budget: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
     strategy: Mapped[Optional[str]] = mapped_column(String(100))
     strategy_type: Mapped[Optional[str]] = mapped_column(String(50))  # MANUAL_CPC / AUTO
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    # ЕПК-флаг — выставляется аналитиком при обнаружении обвала
+    # v1.2: флаг ЕПК-обвала — выставляется аналитиком при обнаружении обвала
     epk_collapse_detected: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -70,6 +73,7 @@ class Campaign(Base):
 
 
 class AdGroup(Base):
+    """Группа объявлений"""
     __tablename__ = "ad_groups"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -102,6 +106,7 @@ class Cluster(Base):
 
 
 class Keyword(Base):
+    """Ключевое слово"""
     __tablename__ = "keywords"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -125,6 +130,7 @@ class Keyword(Base):
 # ─── Статистика ───────────────────────────────────────────────────────────────
 
 class CampaignStat(Base):
+    """Статистика кампании по дням"""
     __tablename__ = "campaign_stats"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -146,17 +152,16 @@ class KeywordStat(Base):
     """
     Статистика ключа по дням.
     Поля из API Яндекс Директ (CRITERIA_PERFORMANCE_REPORT):
-      - impressions, clicks, spend, ctr, avg_cpc    — базовые
-      - avg_bid (AvgEffectiveBid / 1_000_000)       — ставка с корректировками
-      - avg_position (AvgImpressionPosition)         — позиция показа
-      - avg_click_position (AvgClickPosition)        — позиция клика
-      - traffic_volume (AvgTrafficVolume)             — объём трафика 0–150
-      - weighted_impressions (WeightedImpressions)   — взвешенные показы
-      - weighted_ctr (WeightedCtr)                   — взвешенный CTR
-      - bounce_rate (BounceRate из Директа)          — отказы по клику
-
+      - impressions, clicks, spend, ctr, avg_cpc     — базовые
+      - avg_bid  (AvgEffectiveBid / 1_000_000)        — ставка с корректировками
+      - avg_position (AvgImpressionPosition)           — позиция показа
+      - avg_click_position (AvgClickPosition)          — позиция клика
+      - traffic_volume (AvgTrafficVolume)              — объём трафика 0–150
+      - weighted_impressions (WeightedImpressions)     — взвешенные показы  [v1.2]
+      - weighted_ctr (WeightedCtr)                     — взвешенный CTR     [v1.2]
+      - bounce_rate (BounceRate из Директа)            — отказы по клику    [v1.2]
     Поля из Яндекс Метрики (обогащение по utm_term):
-      - sessions                                     — визиты (ym:s:visits)
+      - sessions                                       — визиты (ym:s:visits) [v1.2]
     """
     __tablename__ = "keyword_stats"
 
@@ -164,31 +169,31 @@ class KeywordStat(Base):
     account_id: Mapped[int] = mapped_column(Integer, index=True)
     keyword_id: Mapped[int] = mapped_column(ForeignKey("keywords.id"), index=True)
     date: Mapped[datetime] = mapped_column(DateTime, index=True)
-
-    # ── Базовые трафиковые метрики ────────────────────────────────────────
     impressions: Mapped[int] = mapped_column(Integer, default=0)
     clicks: Mapped[int] = mapped_column(Integer, default=0)
     spend: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
-    ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))      # %
-    avg_cpc: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2)) # ₽
 
-    # ── Ставка и аукцион ──────────────────────────────────────────────────
-    avg_bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))  # AvgEffectiveBid в ₽
+    # ── Базовые трафиковые метрики ────────────────────────────────────────────
+    ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))           # %
+    avg_cpc: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))      # ₽
 
-    # ── Позиционные метрики ───────────────────────────────────────────────
-    avg_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))        # AvgImpressionPosition
-    avg_click_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))  # AvgClickPosition
+    # ── Ставка и аукцион ──────────────────────────────────────────────────────
+    avg_bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))      # AvgEffectiveBid в ₽
 
-    # ── Объём рынка ───────────────────────────────────────────────────────
-    traffic_volume: Mapped[Optional[int]] = mapped_column(Integer)                # AvgTrafficVolume 0–150
-    weighted_impressions: Mapped[Optional[int]] = mapped_column(Integer)          # WeightedImpressions
-    weighted_ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))        # WeightedCtr
+    # ── Позиционные метрики ───────────────────────────────────────────────────
+    avg_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
+    avg_click_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
 
-    # ── Поведенческие (из Директа + Метрики) ─────────────────────────────
-    bounce_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))  # BounceRate из Директа, %
-    sessions: Mapped[Optional[int]] = mapped_column(Integer)               # визиты из Метрики по utm_term
+    # ── Объём рынка ───────────────────────────────────────────────────────────
+    traffic_volume: Mapped[Optional[int]] = mapped_column(Integer)           # AvgTrafficVolume 0–150
+    weighted_impressions: Mapped[Optional[int]] = mapped_column(Integer)     # v1.2
+    weighted_ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))  # v1.2
 
-    # ── Служебные ─────────────────────────────────────────────────────────
+    # ── Поведенческие (из Директа + Метрики) ─────────────────────────────────
+    bounce_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))   # v1.2, %
+    sessions: Mapped[Optional[int]] = mapped_column(Integer)                 # v1.2, из Метрики
+
+    # ── Служебные ─────────────────────────────────────────────────────────────
     ad_id: Mapped[Optional[str]] = mapped_column(String(100))
 
     __table_args__ = (
@@ -216,27 +221,22 @@ class Lead(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int] = mapped_column(Integer, index=True)
     external_id: Mapped[Optional[str]] = mapped_column(String(255))
-    created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
-    utm_source: Mapped[Optional[str]] = mapped_column(String(100))
-    utm_campaign: Mapped[Optional[str]] = mapped_column(String(255))
-    utm_term: Mapped[Optional[str]] = mapped_column(Text)
-    client_id: Mapped[Optional[str]] = mapped_column(String(255))
-    roistat_id: Mapped[Optional[str]] = mapped_column(String(255))
+    status: Mapped[LeadStatus] = mapped_column(SAEnum(LeadStatus))
     keyword_id: Mapped[Optional[int]] = mapped_column(ForeignKey("keywords.id"))
-    status: Mapped[LeadStatus] = mapped_column(SAEnum(LeadStatus), default=LeadStatus.lead)
-    status_updated: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    is_qualified: Mapped[bool] = mapped_column(Boolean, default=False)  # SQL
-    is_bad: Mapped[bool] = mapped_column(Boolean, default=False)
-
-    __table_args__ = (
-        Index("ix_lead_utm_term", "account_id", "utm_term"),
-        Index("ix_lead_client_id", "client_id"),
-    )
+    client_id: Mapped[Optional[str]] = mapped_column(String(255))
+    utm_source: Mapped[Optional[str]] = mapped_column(String(255))
+    utm_medium: Mapped[Optional[str]] = mapped_column(String(255))
+    utm_campaign: Mapped[Optional[str]] = mapped_column(String(255))
+    utm_term: Mapped[Optional[str]] = mapped_column(String(500))
+    revenue: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 # ─── Аналитика ────────────────────────────────────────────────────────────────
 
 class AnalysisResult(Base):
+    """Результат еженедельного анализа по кабинету"""
     __tablename__ = "analysis_results"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -276,6 +276,7 @@ class KeywordMetrics(Base):
 # ─── Правила и предложения ────────────────────────────────────────────────────
 
 class MetrikaSnapshot(Base):
+    """Снапшот данных из Метрики — все срезы за один сбор"""
     __tablename__ = "metrika_snapshots"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -285,6 +286,7 @@ class MetrikaSnapshot(Base):
 
 
 class SearchQuery(Base):
+    """Поисковый запрос — реальная фраза по которой показывалась реклама"""
     __tablename__ = "search_queries"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -313,6 +315,7 @@ class SearchQuery(Base):
 
 
 class Rule(Base):
+    """База правил для генерации предложений. Хранится в БД — можно менять без деплоя."""
     __tablename__ = "rules"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -344,10 +347,11 @@ class HypothesisVerdict(str, enum.Enum):
     confirmed   = "confirmed"
     rejected    = "rejected"
     insufficient = "insufficient"
-    neutral     = "neutral"
+    neutral     = "neutral"   # v1.2
 
 
 class Suggestion(Base):
+    """Предложение по изменению (ставка, стратегия, минус-слова и т.д.)"""
     __tablename__ = "suggestions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -374,6 +378,7 @@ class Suggestion(Base):
 
 
 class Hypothesis(Base):
+    """Гипотеза — трекинг результата после применения изменения"""
     __tablename__ = "hypotheses"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -389,5 +394,13 @@ class Hypothesis(Base):
     )
     report: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    # Extra fields for manual hypotheses (no suggestion)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    change_description: Mapped[Optional[str]] = mapped_column(Text)
+    forecast: Mapped[Optional[str]] = mapped_column(Text)
+    object_type: Mapped[Optional[str]] = mapped_column(String(50))
+    object_id: Mapped[Optional[int]] = mapped_column(Integer)
+    source: Mapped[Optional[str]] = mapped_column(String(50))
 
     suggestion: Mapped["Suggestion"] = relationship(back_populates="hypothesis")
