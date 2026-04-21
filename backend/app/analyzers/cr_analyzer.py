@@ -285,8 +285,8 @@ class CRAnalyzer:
         grouped = defaultdict(lambda: {"clicks": [], "impressions": []})
         
         for row in daily_stats:
-            if not _is_workday(row.date): continue
-            if row.date < bl_start or row.date > bl_end: continue
+            if not _is_workday(row.date.date()): continue
+            if row.date.date() < bl_start or row.date.date() > bl_end: continue
             
             grouped[row.keyword_id]["clicks"].append(int(row.clicks or 0))
             grouped[row.keyword_id]["impressions"].append(int(row.impressions or 0))
