@@ -1,6 +1,6 @@
 """
 CR-анализатор v4.1 — Топологический движок (Senior PPC).
-Исправления: Баг выходных дней, контекст цены, логика TrafficVolume, пороги Метрики.
+Исправления: Баг выходных дней, контекст цены, логика TrafficVolume, пороги Метрики, пустые массивы.
 Все SQL запросы однострочные для безопасного копирования.
 """
 import json
@@ -21,6 +21,10 @@ CONFIG = {
 
 def _is_workday(d: date) -> bool:
     return d.weekday() < 5
+
+def safe_median(lst):
+    filtered = [x for x in lst if x > 0]
+    return statistics.median(filtered) if filtered else 0
 
 class CRAnalyzer:
     def __init__(self, db: AsyncSession, account_id: int):
@@ -73,71 +77,58 @@ class CRAnalyzer:
             c_cpc = c_s / c_c if c_c > 0 else 0
             b_cpc = b_s / b_c if b_c > 0 else 0
 
-            # === СИМПТОМ 5: Падение кликов ===
             if c_c < b_c * (1 - cfg["delta_vol"]) and b_c >= cfg["min_bl_clicks"]:
                 impr_drop = (c_i - b_i) / b_i if b_i > 0 else 0
-                
                 if impr_drop < -cfg["delta_vol"]:
-                    # ВЕТВЬ 5A: Просадка показов (Проверка цены перед рекомендацией!)
                     if c_pos > 3.5 and is_manual:
-                        if c_cpc < target_cpl * 1.2: # ПРАВИЛКА 2: Не предлагаем, если уже дорого
+                        if c_cpc < target_cpl * 1.2:
                             rec_bid = round(c_bid * 1.3, 2) if c_bid > 0 else 0
-                            p = self._diag(kw_id, phrase, grp_id, "5A", "critical", f"Клики −{abs((c_c-b_c)/b_c*100):.0f}%. Показы −{abs(impr_drop)*100:.0f}%. Позиция {c_pos:.1f}.", "Ставка не держит аукцион.", f"Поднять ставку до {rec_bid:.0f}₽.", rec_bid)
+                            p = self._diag(kw_id, phrase, grp_id, "5A", "critical", f"Клики -{abs((c_c-b_c)/b_c*100):.0f}%. Показы -{abs(impr_drop)*100:.0f}%. Позиция {c_pos:.1f}.", "Ставка не держит аукцион.", f"Поднять ставку до {rec_bid:.0f} руб.", rec_bid)
                             problems.append(p); tags.add("BID")
-                    # ВЕТВЬ 5B: Спрос просел ИЛИ Конкуренция (ПРАВИЛКО 3: Логика TraffVolume)
                     elif c_pos <= 3.5:
-                        if c_tv < 30 and b_tv.get("avg", 0) > 40:
-                            # Позиция нормальная, но TraffVol рухнул = конкуренты выдавили
-                            p = self._diag(kw_id, phrase, grp_id, "5B", "warning", f"Клики/Показы −{abs(impr_drop)*100:.0f}%. Позиция {c_pos:.1f}, НО TraffVol упал с {b_tv.get('avg',0):.0f} до {c_tv}.", "Конкуренты перебили ставки в аукционе, выдавив вниз.", "Поднять ставку на 15-20%, чтобы вернуть долю трафика.")
+                        if c_tv < 30 and bl.get("traffic_volume", 0) > 40:
+                            p = self._diag(kw_id, phrase, grp_id, "5B", "warning", f"Клики/Показы -{abs(impr_drop)*100:.0f}%. Позиция {c_pos:.1f}, НО TraffVol упал с {bl.get('traffic_volume',0):.0f} до {c_tv}.", "Конкуренты перебили ставки в аукционе.", "Поднять ставку на 15-20%.")
                             problems.append(p); tags.add("BID")
                         else:
-                            p = self._diag(kw_id, phrase, grp_id, "5B", "info", f"Клики/Показы −{abs(impr_drop)*100:.0f}%. Позиция {c_pos:.1f}, TraffVol стабильный.", "Сезонный спад общего спроса на рынке.", "Ставки не трогать.")
+                            p = self._diag(kw_id, phrase, grp_id, "5B", "info", f"Клики/Показы -{abs(impr_drop)*100:.0f}%. Позиция {c_pos:.1f}, TraffVol стабильный.", "Сезонный спад спроса.", "Ставки не трогать.")
                             problems.append(p); tags.add("SEASON")
-
-            # === СИМПТОМ 4: CTR упал при стабильных показах ===
             elif c_i >= b_i * 0.8 and b_i >= cfg["min_bl_impr"]:
                 if c_c < b_c * (1 - cfg["delta_vol"]):
                     ctr_c = (c_c/c_i*100) if c_i>0 else 0
                     ctr_b = (b_c/b_i*100) if b_i>0 else 0
                     pos_gap = curr["avg_click_position"] - c_pos if curr["avg_click_position"] > 0 else 0
                     wctr_drop = (curr.get("weighted_ctr", 0) or 0) < (bl.get("weighted_ctr", 0) or 0) * 0.8
-                    
                     if pos_gap > 1.5 or wctr_drop:
-                        p = self._diag(kw_id, phrase, grp_id, "4A", "warning", f"CTR упал ({ctr_b:.1f}% -> {ctr_c:.1f}%). Разрыв поз. показа/клика {pos_gap:.1f}.", "Объявление проигрывает конкурентам на этой позиции.", "Переписать заголовок под марку. Ставку не трогать.")
+                        p = self._diag(kw_id, phrase, grp_id, "4A", "warning", f"CTR упал ({ctr_b:.1f}% -> {ctr_c:.1f}%). Разрыв поз. показа/клика {pos_gap:.1f}.", "Объявление проигрывает конкурентам на позиции.", "Переписать заголовок под марку.")
                         problems.append(p); tags.add("CREATIVE")
                     else:
-                        p = self._diag(kw_id, phrase, grp_id, "4B", "warning", f"CTR упал ({ctr_b:.1f}% -> {ctr_c:.1f}%). Поз./TraffVol стабильны.", "Выгорание креатива или инфляция аукциона.", "A/B тест заголовка.")
+                        p = self._diag(kw_id, phrase, grp_id, "4B", "warning", f"CTR упал ({ctr_b:.1f}% -> {ctr_c:.1f}%). Поз./TraffVol стабильны.", "Выгорание креатива.", "A/B тест заголовка.")
                         problems.append(p); tags.add("CREATIVE")
-
-            # === СИМПТОМ 8: Поведение (ПРАВИЛО 4: Порог 15 визитов) ===
+            
             if "CREATIVE" not in tags and "BID" not in tags:
                 m_data = metrika_kw.get(phrase, {})
                 m_br = float(m_data.get("bounceRate") or 0)
                 m_visits = int(m_data.get("visits") or 0)
-                
                 if m_visits >= cfg["min_visits_metrika"] and m_br > 70:
                     sev = "critical" if m_br > 80 else "warning"
-                    p = self._diag(kw_id, phrase, grp_id, "8A", sev, f"Bounce Rate {m_br:.0f}% (Visits: {m_visits}).", "Мусорный трафик по широкому соответствию ИЛИ нецелевой лендинг.", "Выгрузить поисковые запросы. Добавить минус-слова.")
+                    p = self._diag(kw_id, phrase, grp_id, "8A", sev, f"Bounce Rate {m_br:.0f}% (Visits: {m_visits}).", "Мусорный трафик ИЛИ нецелевой лендинг.", "Выгрузить поисковые запросы. Добавить минус-слова.")
                     problems.append(p); tags.add("QUALITY")
-                
                 if m_visits >= 5:
                     gap_cv = (c_c - m_visits) / c_c if c_c > 5 else 0
                     if gap_cv > 0.20:
-                        p = self._diag(kw_id, phrase, grp_id, "1E", "critical", f"Кликов: {c_c}, Визитов: {m_visits}. Разрыв {gap_cv*100:.0f}%.", "Сайт недоступен части пользователей (мобильные/корп. сети).", "ПАУЗА СТАВОК. Срочная проверка сайта!")
+                        p = self._diag(kw_id, phrase, grp_id, "1E", "critical", f"Кликов: {c_c}, Визитов: {m_visits}. Разрыв {gap_cv*100:.0f}%.", "Сайт недоступен части пользователей.", "ПАУЗА СТАВОК. Проверить сайт!")
                         problems.append(p); tags.add("SITE_DOWN")
 
-            # === СИМПТОМ 9: Переплата за топ ===
             if "BID" not in tags and c_pos <= 1.5 and c_tv > 100:
                 if b_cpc > 0 and c_cpc > b_cpc * 1.3:
-                    p = self._diag(kw_id, phrase, grp_id, "9A", "warning", f"Поз. {c_pos:.1f}, TraffVol {c_tv}. CPC: {b_cpc:.0f} -> {c_cpc:.0f}₽.", "Потолок трафика. Дальнейший рост ставки не дает кликов, только удорожает.", "Снизить CurrentBid на 15-20%. Целевая TraffVol: 60-80.")
+                    p = self._diag(kw_id, phrase, grp_id, "9A", "warning", f"Поз. {c_pos:.1f}, TraffVol {c_tv}. CPC: {b_cpc:.0f} -> {c_cpc:.0f} руб.", "Потолок трафика. Переплата за топ.", "Снизить ставку на 15-20%.")
                     problems.append(p); tags.add("OVERPAY")
 
-            # === ТОЧКИ РОСТА P1 ===
             if not tags and 2.5 < c_pos < 4.0 and c_tv > 0:
                 m_data_p = metrika_kw.get(phrase, {})
                 m_br_p = float(m_data_p.get("bounceRate") or 100)
                 if m_br_p < 50:
-                    p = self._diag(kw_id, phrase, grp_id, "P1", "info", f"Отл. поведение (BR {m_br_p:.0f}%), Поз. {c_pos:.1f}, TraffVol {c_tv}.", "Недоинвестированный конверсионный ключ.", "Поднять CurrentBid на 30%.")
+                    p = self._diag(kw_id, phrase, grp_id, "P1", "info", f"Отл. поведение (BR {m_br_p:.0f}%), Поз. {c_pos:.1f}, TraffVol {c_tv}.", "Недоинвестированный конверсионник.", "Поднять ставку на 30%.")
                     problems.append(p)
 
         sev_ord = {"critical": 0, "warning": 1, "info": 2}
@@ -160,7 +151,7 @@ class CRAnalyzer:
         for r in stats:
             d = r.date.date()
             is_bl = _is_workday(d) and bl_start <= d < bl_end
-            is_curr = _is_workday(d) and bl_end <= d <= curr_end # ПРАВИЛО 1: Current тоже только рабочие дни!
+            is_curr = _is_workday(d) and bl_end <= d <= curr_end
             c, i, s = int(r.clicks or 0), int(r.impressions or 0), float(r.spend or 0)
             p, cp, ct, b, w, tv = float(r.avg_position or 0), float(r.avg_click_position or 0), float(r.ctr or 0), float(r.avg_bid or 0), float(r.weighted_ctr or 0), int(r.traffic_volume or 0)
             if is_bl and (c > 0 or i > 0):
@@ -171,11 +162,11 @@ class CRAnalyzer:
         def agg(data_list):
             if not data_list: return None
             n = len(data_list)
-            return {"clicks": statistics.median([d["c"] for d in data_list if d["c"]>0]) or 0, "impressions": statistics.median([d["i"] for d in data_list if d["i"]>0]) or 0, "spend": sum(d["s"] for d in data_list), "avg_position": sum(d["p"] for d in data_list)/n if n else 0, "avg_click_position": sum(d["cp"] for d in data_list)/n if n else 0, "ctr": sum(d["ct"] for d in data_list)/n if n else 0, "avg_bid": sum(d["b"] for d in data_list)/n if n else 0, "weighted_ctr": sum(d["w"] for d in data_list)/n if n else 0, "traffic_volume": sum(d["tv"] for d in data_list)/n if n else 0}
+            return {"clicks": safe_median([d["c"] for d in data_list]), "impressions": safe_median([d["i"] for d in data_list]), "spend": sum(d["s"] for d in data_list), "avg_position": sum(d["p"] for d in data_list)/n if n else 0, "avg_click_position": sum(d["cp"] for d in data_list)/n if n else 0, "ctr": sum(d["ct"] for d in data_list)/n if n else 0, "avg_bid": sum(d["b"] for d in data_list)/n if n else 0, "weighted_ctr": sum(d["w"] for d in data_list)/n if n else 0, "traffic_volume": sum(d["tv"] for d in data_list)/n if n else 0}
 
         final_bl, final_curr = {}, {}
         for kid, data in kw_bl_data.items():
-            if sum(d["i"] for d in data) < cfg_min_impr: continue
+            if sum(d["i"] for d in data) < 10: continue
             final_bl[kid] = agg(data)
         for kid, data in kw_curr_data.items():
             final_curr[kid] = agg(data)
@@ -189,6 +180,3 @@ class CRAnalyzer:
             data = snap.data if isinstance(snap.data, dict) else json.loads(snap.data)
             return {row.get("UTMTerm"): row for row in data.get("keywords", []) if row.get("UTMTerm")}
         except: return {}
-
-# Fix for typo in function scope
-cfg_min_impr = 10
