@@ -50,7 +50,10 @@ class CRAnalyzer:
         kw_bl, kw_curr = self._calc_baselines(raw_stats, baseline_start, period_start, period_end)
         metrika_kw = await self._get_metrika_data()
         
-        camp_res = await self.db.execute(select(AdGroup.ad_group_id, AdGroup.campaign_id, Campaign.strategy_type).join(Campaign))
+        # ИСПРАВЛЕНАЯ ЗАГРУЗКА КАМПАНИЙ (используем правильные имена полей из models.py)
+        camp_res = await self.db.execute(
+            select(AdGroup.id, AdGroup.campaign_id, Campaign.strategy_type).join(Campaign, AdGroup.campaign_id == Campaign.id)
+        )
         camp_cache = {}
         for grp_id, camp_id, strat in camp_res.all():
             camp_cache[grp_id] = camp_id
@@ -86,8 +89,9 @@ class CRAnalyzer:
                             p = self._diag(kw_id, phrase, grp_id, "5A", "critical", f"Клики -{abs((c_c-b_c)/b_c*100):.0f}%. Показы -{abs(impr_drop)*100:.0f}%. Позиция {c_pos:.1f}.", "Ставка не держит аукцион.", f"Поднять ставку до {rec_bid:.0f} руб.", rec_bid)
                             problems.append(p); tags.add("BID")
                     elif c_pos <= 3.5:
-                        if c_tv < 30 and bl.get("traffic_volume", 0) > 40:
-                            p = self._diag(kw_id, phrase, grp_id, "5B", "warning", f"Клики/Показы -{abs(impr_drop)*100:.0f}%. Позиция {c_pos:.1f}, НО TraffVol упал с {bl.get('traffic_volume',0):.0f} до {c_tv}.", "Конкуренты перебили ставки в аукционе.", "Поднять ставку на 15-20%.")
+                        bl_tv = bl.get("traffic_volume", 0)
+                        if c_tv < 30 and bl_tv > 40:
+                            p = self._diag(kw_id, phrase, grp_id, "5B", "warning", f"Клики/Показы -{abs(impr_drop)*100:.0f}%. Позиция {c_pos:.1f}, НО TraffVol упал с {bl_tv:.0f} до {c_tv}.", "Конкуренты перебили ставки.", "Поднять ставку на 15-20%.")
                             problems.append(p); tags.add("BID")
                         else:
                             p = self._diag(kw_id, phrase, grp_id, "5B", "info", f"Клики/Показы -{abs(impr_drop)*100:.0f}%. Позиция {c_pos:.1f}, TraffVol стабильный.", "Сезонный спад спроса.", "Ставки не трогать.")
@@ -99,7 +103,7 @@ class CRAnalyzer:
                     pos_gap = curr["avg_click_position"] - c_pos if curr["avg_click_position"] > 0 else 0
                     wctr_drop = (curr.get("weighted_ctr", 0) or 0) < (bl.get("weighted_ctr", 0) or 0) * 0.8
                     if pos_gap > 1.5 or wctr_drop:
-                        p = self._diag(kw_id, phrase, grp_id, "4A", "warning", f"CTR упал ({ctr_b:.1f}% -> {ctr_c:.1f}%). Разрыв поз. показа/клика {pos_gap:.1f}.", "Объявление проигрывает конкурентам на позиции.", "Переписать заголовок под марку.")
+                        p = self._diag(kw_id, phrase, grp_id, "4A", "warning", f"CTR упал ({ctr_b:.1f}% -> {ctr_c:.1f}%). Разрыв поз. показа/клика {pos_gap:.1f}.", "Объявление проигрывает конкурентам.", "Переписать заголовок под марку.")
                         problems.append(p); tags.add("CREATIVE")
                     else:
                         p = self._diag(kw_id, phrase, grp_id, "4B", "warning", f"CTR упал ({ctr_b:.1f}% -> {ctr_c:.1f}%). Поз./TraffVol стабильны.", "Выгорание креатива.", "A/B тест заголовка.")
@@ -111,17 +115,17 @@ class CRAnalyzer:
                 m_visits = int(m_data.get("visits") or 0)
                 if m_visits >= cfg["min_visits_metrika"] and m_br > 70:
                     sev = "critical" if m_br > 80 else "warning"
-                    p = self._diag(kw_id, phrase, grp_id, "8A", sev, f"Bounce Rate {m_br:.0f}% (Visits: {m_visits}).", "Мусорный трафик ИЛИ нецелевой лендинг.", "Выгрузить поисковые запросы. Добавить минус-слова.")
+                    p = self._diag(kw_id, phrase, grp_id, "8A", sev, f"Bounce Rate {m_br:.0f}% (Visits: {m_visits}).", "Мусорный трафик ИЛИ нецелевой лендинг.", "Выгрузить поисковые запросы. Минус-слова.")
                     problems.append(p); tags.add("QUALITY")
                 if m_visits >= 5:
                     gap_cv = (c_c - m_visits) / c_c if c_c > 5 else 0
                     if gap_cv > 0.20:
-                        p = self._diag(kw_id, phrase, grp_id, "1E", "critical", f"Кликов: {c_c}, Визитов: {m_visits}. Разрыв {gap_cv*100:.0f}%.", "Сайт недоступен части пользователей.", "ПАУЗА СТАВОК. Проверить сайт!")
+                        p = self._diag(kw_id, phrase, grp_id, "1E", "critical", f"Кликов: {c_c}, Визитов: {m_visits}. Разрыв {gap_cv*100:.0f}%.", "Сайт недоступен.", "ПАУЗА СТАВОК. Проверить сайт!")
                         problems.append(p); tags.add("SITE_DOWN")
 
             if "BID" not in tags and c_pos <= 1.5 and c_tv > 100:
                 if b_cpc > 0 and c_cpc > b_cpc * 1.3:
-                    p = self._diag(kw_id, phrase, grp_id, "9A", "warning", f"Поз. {c_pos:.1f}, TraffVol {c_tv}. CPC: {b_cpc:.0f} -> {c_cpc:.0f} руб.", "Потолок трафика. Переплата за топ.", "Снизить ставку на 15-20%.")
+                    p = self._diag(kw_id, phrase, grp_id, "9A", "warning", f"Поз. {c_pos:.1f}, TraffVol {c_tv}. CPC: {b_cpc:.0f} -> {c_cpc:.0f} руб.", "Потолок трафика. Переплата.", "Снизить ставку на 15-20%.")
                     problems.append(p); tags.add("OVERPAY")
 
             if not tags and 2.5 < c_pos < 4.0 and c_tv > 0:
@@ -153,7 +157,7 @@ class CRAnalyzer:
             is_bl = _is_workday(d) and bl_start <= d < bl_end
             is_curr = _is_workday(d) and bl_end <= d <= curr_end
             c, i, s = int(r.clicks or 0), int(r.impressions or 0), float(r.spend or 0)
-            p, cp, ct, b, w, tv = float(r.avg_position or 0), float(r.avg_click_position or 0), float(r.ctr or 0), float(r.avg_bid or 0), float(r.weighted_ctr or 0), int(r.traffic_volume or 0)
+            p, cp, ct, b, w, tv = float(r.avg_position or 0), float(r.avg_click_position or 0), float(r. rctr or 0), float(r.avg_bid or 0), float(r.weighted_ctr or 0), int(r.traffic_volume or 0)
             if is_bl and (c > 0 or i > 0):
                 kw_bl_data[r.keyword_id].append({"c": c, "i": i, "s": s, "p": p, "cp": cp, "ct": ct, "b": b, "w": w, "tv": tv})
             if is_curr:
