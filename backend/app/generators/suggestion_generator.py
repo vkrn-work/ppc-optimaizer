@@ -1,240 +1,213 @@
 """
-Генератор предложений по изменениям ставок и стратегий.
-Применяет правила из таблицы rules (хранятся в БД).
-Приоритеты: today / this_week / month / scale
+Генератор предложений (Suggestions) для аппрува директологом.
+
+v1.2: работает на основе сигналов из AnalysisResult.problems,
+не требует CRM-данных (KeywordMetrics). CRM-логика будет
+активирована при подключении Level 2.
+
+Каждый сигнал из cr_analyzer → Suggestion со статусом pending.
+Директолог аппрувает или отклоняет → создаётся Hypothesis.
 """
 from decimal import Decimal
 from typing import Optional
 import logging
-from sqlalchemy import select
+from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import (
-    Keyword, KeywordMetrics, AnalysisResult, Rule, Suggestion, Account, Cluster
+    Keyword, AnalysisResult, Suggestion, SuggestionStatus,
+    Account, Campaign, AdGroup
 )
-from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Типы изменений
-BID_RAISE = "bid_raise"
-BID_LOWER = "bid_lower"
-BID_HOLD = "bid_hold"
-STRATEGY_CPA = "strategy_cpa"
-ADD_NEGATIVES = "add_negatives"
-DISABLE_KEYWORD = "disable_keyword"
-EXPAND_SEMANTICS = "expand_semantics"
+# Маппинг типа сигнала → тип изменения
+SIGNAL_TO_CHANGE_TYPE = {
+    "low_position":         "bid_raise",
+    "traffic_drop":         "bid_raise",
+    "zero_ctr":             "ad_check",
+    "low_ctr":              "ad_check",
+    "click_position_gap":   "bid_check",
+    "spend_no_conversion":  "bid_lower",
+    "epk_bid_collapse":     "strategy_review",
+    "cpc_spike":            "bid_check",
+    "high_bounce_rate":     "landing_fix",
+    "low_page_depth":       "landing_fix",
+    "low_visit_duration":   "landing_fix",
+    "mobile_quality_issue": "bid_adjust",
+    "scale_opportunity":    "bid_raise",
+}
+
+# Типы сигналов которые касаются кампании, не конкретного ключа
+CAMPAIGN_LEVEL_SIGNALS = {"epk_bid_collapse", "high_bounce_rate",
+                          "low_page_depth", "low_visit_duration",
+                          "mobile_quality_issue"}
 
 
 class SuggestionGenerator:
     def __init__(self, db: AsyncSession, account_id: int):
-        self.db = db
+        self.db         = db
         self.account_id = account_id
 
     async def generate_for_analysis(self, analysis: AnalysisResult) -> list[Suggestion]:
-        """Сгенерировать все предложения для результата анализа"""
-        suggestions = []
+        """
+        Конвертирует сигналы из analysis.problems в Suggestion записи.
+        Дубликаты не создаются: если для этого же entity_id и типа
+        уже есть pending-предложение из предыдущего анализа — пропускаем.
+        """
+        if not analysis.problems:
+            return []
 
-        # Загрузить правила (сначала аккаунт-специфичные, потом глобальные)
-        rules = await self._load_rules()
-
-        # Загрузить метрики ключей для этого анализа
-        from sqlalchemy import and_
-        metrics_result = await self.db.execute(
-            select(KeywordMetrics).where(
+        existing_q = await self.db.execute(
+            select(Suggestion).where(
                 and_(
-                    KeywordMetrics.analysis_id == analysis.id,
-                    KeywordMetrics.account_id == self.account_id,
+                    Suggestion.account_id == self.account_id,
+                    Suggestion.status == SuggestionStatus.pending,
                 )
             )
         )
-        keyword_metrics = metrics_result.scalars().all()
+        existing = existing_q.scalars().all()
+        existing_keys = {(s.object_id, s.change_type) for s in existing}
 
-        account_result = await self.db.execute(
-            select(Account).where(Account.id == self.account_id)
-        )
-        account = account_result.scalar_one_or_none()
+        suggestions = []
+        for problem in analysis.problems:
+            sig_type    = problem.get("type", "")
+            priority    = problem.get("priority", "this_week")
+            kw_id       = problem.get("keyword_id")
+            phrase      = problem.get("phrase") or problem.get("entity_name") or ""
+            action      = problem.get("action", "")
+            description = problem.get("description", "")
+            hypothesis  = problem.get("hypothesis", "")
+            expected    = problem.get("expected_outcome", "")
+            calc_logic  = problem.get("calculation_logic", "")
+            rec_bid     = problem.get("recommended_bid")
+            entity_id   = problem.get("entity_id") or kw_id or 0
+            entity_type = "campaign" if sig_type in CAMPAIGN_LEVEL_SIGNALS else "keyword"
 
-        for km in keyword_metrics:
-            kw_result = await self.db.execute(
-                select(Keyword).where(Keyword.id == km.keyword_id)
-            )
-            keyword = kw_result.scalar_one_or_none()
-            if not keyword:
+            change_type = SIGNAL_TO_CHANGE_TYPE.get(sig_type, "check")
+
+            value_before = None
+            value_after  = None
+
+            if kw_id and sig_type in ("low_position", "traffic_drop",
+                                       "spend_no_conversion", "scale_opportunity"):
+                kw_res = await self.db.execute(
+                    select(Keyword).where(Keyword.id == kw_id)
+                )
+                kw = kw_res.scalar_one_or_none()
+                if kw and kw.current_bid:
+                    value_before = f"{float(kw.current_bid):.0f}₽"
+                if rec_bid:
+                    value_after = f"{rec_bid:.0f}₽"
+            elif sig_type == "epk_bid_collapse":
+                value_before = "ЕПК (автоснижение ставок)"
+                value_after  = "Ручное восстановление / перевод на ТГК"
+            elif sig_type in ("zero_ctr", "low_ctr"):
+                value_before = "Текущее объявление"
+                value_after  = "Новый вариант с УТП"
+            elif sig_type in ("high_bounce_rate", "low_page_depth", "low_visit_duration"):
+                value_before = "Текущая посадочная"
+                value_after  = "Оптимизация посадочной"
+            elif sig_type == "mobile_quality_issue":
+                value_before = "Нет корректировки на mobile"
+                value_after  = "Корректировка ставок -50% на mobile"
+
+            dedup_key = (entity_id, change_type)
+            if dedup_key in existing_keys:
                 continue
 
-            suggestion = await self._evaluate_keyword(km, keyword, account, rules, analysis.id)
-            if suggestion:
-                self.db.add(suggestion)
-                suggestions.append(suggestion)
+            rationale_parts = [description]
+            if hypothesis:
+                rationale_parts.append(f"Гипотеза: {hypothesis}")
+            if calc_logic:
+                rationale_parts.append(f"Расчёт: {calc_logic}")
+            rationale = " | ".join(filter(None, rationale_parts))
+
+            s = Suggestion(
+                account_id=self.account_id,
+                analysis_id=analysis.id,
+                object_type=entity_type,
+                object_id=entity_id,
+                object_name=phrase,
+                change_type=change_type,
+                value_before=value_before,
+                value_after=value_after,
+                rationale=rationale,
+                expected_effect=expected or action,
+                priority=priority,
+                status=SuggestionStatus.pending,
+            )
+            self.db.add(s)
+            suggestions.append(s)
+            existing_keys.add(dedup_key)
 
         await self.db.flush()
-        logger.info(f"Generated {len(suggestions)} suggestions for analysis {analysis.id}")
+        logger.info(
+            f"Generated {len(suggestions)} suggestions for analysis {analysis.id}"
+            f" (account {self.account_id})"
+        )
         return suggestions
 
-    async def _load_rules(self) -> list[Rule]:
-        """Загрузить правила — сначала для аккаунта, потом глобальные"""
-        from sqlalchemy import or_, and_
-        result = await self.db.execute(
-            select(Rule).where(
-                and_(
-                    Rule.is_active == True,
-                    or_(Rule.account_id == self.account_id, Rule.account_id == None),
-                )
-            ).order_by(Rule.account_id.desc().nullslast())
-        )
-        return result.scalars().all()
+    async def generate_scale_suggestions(
+        self, analysis: AnalysisResult
+    ) -> list[Suggestion]:
+        """Предложения масштабирования из analysis.opportunities (S-050)."""
+        if not analysis.opportunities:
+            return []
 
-    async def _evaluate_keyword(
-        self,
-        km: KeywordMetrics,
-        keyword: Keyword,
-        account: Optional[Account],
-        rules: list[Rule],
-        analysis_id: int,
-    ) -> Optional[Suggestion]:
-        """Применить правила к ключу и сгенерировать предложение"""
-        cr = float(km.cr_click_lead or 0)
-        clicks = km.clicks
-        cpql = float(km.cpql or 0) if km.cpql else None
-        target_cpql = float(account.target_cpql or 0) if account and account.target_cpql else None
-        current_bid = float(keyword.current_bid or 0)
-        recommended_bid = float(km.recommended_bid or 0) if km.recommended_bid else None
-
-        # ── Правило 1: Высококонверсионный ключ — поднять ставку ──────────────
-        if (cr > settings.CR_HIGH_THRESHOLD and clicks >= settings.MIN_CLICKS_KEYWORD and recommended_bid):
-            if recommended_bid > current_bid * 1.05:  # повышение > 5%
-                return Suggestion(
-                    account_id=self.account_id,
-                    analysis_id=analysis_id,
-                    object_type="keyword",
-                    object_id=keyword.id,
-                    object_name=keyword.phrase,
-                    change_type=BID_RAISE,
-                    value_before=f"{current_bid:.0f}₽",
-                    value_after=f"{recommended_bid:.0f}₽",
-                    rationale=(
-                        f"CR {cr*100:.1f}% > 15% при {clicks} кликах. "
-                        f"Высокая конверсионность — нужно больше трафика. "
-                        f"Ставка рассчитана по формуле CPL_цель × CR."
-                    ),
-                    expected_effect=f"Рост кликов на 20–40%. При сохранении CR: +{int(clicks*0.3 * cr):.0f} лидов/мес.",
-                    priority="today",
-                )
-
-        # ── Правило 2: Нормальный CR — держать или незначительно скорректировать ──
-        if (settings.CR_MID_THRESHOLD <= cr <= settings.CR_HIGH_THRESHOLD
-                and clicks >= settings.MIN_CLICKS_KEYWORD):
-            if recommended_bid and abs(recommended_bid - current_bid) / max(current_bid, 1) > 0.15:
-                direction = BID_RAISE if recommended_bid > current_bid else BID_LOWER
-                return Suggestion(
-                    account_id=self.account_id,
-                    analysis_id=analysis_id,
-                    object_type="keyword",
-                    object_id=keyword.id,
-                    object_name=keyword.phrase,
-                    change_type=direction,
-                    value_before=f"{current_bid:.0f}₽",
-                    value_after=f"{recommended_bid:.0f}₽",
-                    rationale=f"CR {cr*100:.1f}% — хорошая конверсионность. Корректировка ставки для оптимального CPL.",
-                    expected_effect="Стабилизация позиций и CPL.",
-                    priority="this_week",
-                )
-
-        # ── Правило 3: Низкий CR при достаточных данных → CPA стратегия ──────
-        if (settings.CR_CRITICAL_THRESHOLD < cr <= settings.CR_LOW_THRESHOLD
-                and clicks >= settings.MIN_CLICKS_CAMPAIGN):
-            return Suggestion(
-                account_id=self.account_id,
-                analysis_id=analysis_id,
-                object_type="keyword",
-                object_id=keyword.id,
-                object_name=keyword.phrase,
-                change_type=STRATEGY_CPA,
-                value_before="CPC",
-                value_after="CPA",
-                rationale=(
-                    f"CR {cr*100:.1f}% при {clicks} кликах — много кликов, мало заявок. "
-                    f"Расход: {float(km.spend):.0f}₽, лидов: {km.leads}. "
-                    f"CPA-стратегия оптимизирует ставку автоматически."
-                ),
-                expected_effect="Снижение расхода без конверсий. Алгоритм обучится на имеющихся данных.",
-                priority="this_week",
-            )
-
-        # ── Правило 4: Очень низкий CR — информационный трафик → минус/отключить ──
-        if cr < settings.CR_CRITICAL_THRESHOLD and clicks >= settings.MIN_CLICKS_CAMPAIGN:
-            return Suggestion(
-                account_id=self.account_id,
-                analysis_id=analysis_id,
-                object_type="keyword",
-                object_id=keyword.id,
-                object_name=keyword.phrase,
-                change_type=ADD_NEGATIVES,
-                value_before="Активен",
-                value_after="Минус-слова / отключить",
-                rationale=(
-                    f"CR {cr*100:.2f}% < 1% при {clicks} кликах. "
-                    f"Расход {float(km.spend):.0f}₽ без результата. "
-                    f"Вероятен информационный запрос без коммерческого интента."
-                ),
-                expected_effect=f"Экономия ~{float(km.spend):.0f}₽/мес. Перераспределить бюджет на конверсионные ключи.",
-                priority="today",
-            )
-
-        # ── Правило 5: CPQL сильно выше цели — снизить ставку ────────────────
-        if (cpql and target_cpql and cpql > target_cpql * 1.5
-                and clicks >= settings.MIN_CLICKS_KEYWORD):
-            new_bid = current_bid * 0.8
-            return Suggestion(
-                account_id=self.account_id,
-                analysis_id=analysis_id,
-                object_type="keyword",
-                object_id=keyword.id,
-                object_name=keyword.phrase,
-                change_type=BID_LOWER,
-                value_before=f"{current_bid:.0f}₽",
-                value_after=f"{new_bid:.0f}₽",
-                rationale=(
-                    f"CPQL {cpql:.0f}₽ превышает цель {target_cpql:.0f}₽ в {cpql/target_cpql:.1f}×. "
-                    f"Снижение ставки на 20%."
-                ),
-                expected_effect=f"Снижение CPQL до ~{cpql*0.8:.0f}₽. Возможное незначительное падение трафика.",
-                priority="this_week",
-            )
-
-        return None
-
-    async def generate_scale_suggestions(self, analysis: AnalysisResult) -> list[Suggestion]:
-        """Предложения по расширению семантики на основе конверсионных кластеров"""
         suggestions = []
+        for opp in analysis.opportunities:
+            kw_id    = opp.get("keyword_id")
+            phrase   = opp.get("phrase") or ""
+            rec_bid  = opp.get("recommended_bid")
+            action   = opp.get("action", "")
+            expected = opp.get("expected_outcome", "")
 
-        # Найти кластеры с высоким CR для масштабирования
-        clusters_result = await self.db.execute(
-            select(Cluster).where(Cluster.account_id == self.account_id)
-        )
-        clusters = clusters_result.scalars().all()
+            if not kw_id:
+                continue
 
-        for opportunity in (analysis.opportunities or []):
-            if opportunity.get("type") == "high_cr_keyword":
-                s = Suggestion(
-                    account_id=self.account_id,
-                    analysis_id=analysis.id,
-                    object_type="keyword",
-                    object_id=opportunity["keyword_id"],
-                    object_name=opportunity["phrase"],
-                    change_type=EXPAND_SEMANTICS,
-                    value_before="Текущая семантика",
-                    value_after="Расширить кластер",
-                    rationale=(
-                        f"CR {opportunity['cr']}% подтверждён на {opportunity['clicks']} кликах. "
-                        f"Расширение семантики по этому направлению даст дополнительный трафик."
-                    ),
-                    expected_effect="+5–10 кликов/нед по направлению при добавлении 3–5 ключей.",
-                    priority="scale",
+            existing_q = await self.db.execute(
+                select(Suggestion).where(
+                    and_(
+                        Suggestion.account_id == self.account_id,
+                        Suggestion.object_id == kw_id,
+                        Suggestion.change_type == "bid_raise",
+                        Suggestion.status == SuggestionStatus.pending,
+                    )
                 )
-                self.db.add(s)
-                suggestions.append(s)
+            )
+            if existing_q.scalar_one_or_none():
+                continue
+
+            kw_res = await self.db.execute(
+                select(Keyword).where(Keyword.id == kw_id)
+            )
+            kw = kw_res.scalar_one_or_none()
+            if not kw:
+                continue
+
+            s = Suggestion(
+                account_id=self.account_id,
+                analysis_id=analysis.id,
+                object_type="keyword",
+                object_id=kw_id,
+                object_name=phrase,
+                change_type="bid_raise",
+                value_before=f"{float(kw.current_bid):.0f}₽" if kw.current_bid else None,
+                value_after=f"{rec_bid:.0f}₽" if rec_bid else None,
+                rationale=(
+                    f"Точка роста: CTR {opp.get('metric_value', 0):.1f}%"
+                    f" при {opp.get('clicks', 0)} кликах. {action}"
+                ),
+                expected_effect=expected,
+                priority="scale",
+                status=SuggestionStatus.pending,
+            )
+            self.db.add(s)
+            suggestions.append(s)
 
         await self.db.flush()
+        logger.info(
+            f"Generated {len(suggestions)} scale suggestions for analysis {analysis.id}"
+        )
         return suggestions
