@@ -1,6 +1,11 @@
 """
 Коллектор данных из Яндекс Директ API v5.
-Собирает максимум данных для анализа уровня 1 (без CRM).
+Собирает полный набор метрик для анализа уровня 1 (без CRM).
+
+Добавлено в v1.2:
+  - WeightedImpressions, WeightedCtr, BounceRate в keyword stats
+  - UnifiedAdCampaign (ЕПК) в определении стратегии
+  - Sessions обогащается из Метрики через utm_term (в tasks.py)
 """
 import asyncio
 import logging
@@ -20,7 +25,7 @@ class YandexDirectCollector:
     API_URL = settings.YANDEX_DIRECT_API_URL
 
     def __init__(self, oauth_token: str, client_login: Optional[str] = None):
-        self.oauth_token = oauth_token
+        self.oauth_token  = oauth_token
         self.client_login = client_login
         self._client: Optional[httpx.AsyncClient] = None
 
@@ -47,12 +52,15 @@ class YandexDirectCollector:
         payload = {"method": method, "params": params}
         for attempt in range(3):
             try:
-                resp = await self._client.post(url, json=payload, headers=self._headers())
+                resp = await self._client.post(
+                    url, json=payload, headers=self._headers()
+                )
                 resp.raise_for_status()
                 data = resp.json()
                 if "error" in data:
                     raise DirectAPIError(
-                        f"API error {data['error']['error_code']}: {data['error']['error_detail']}"
+                        f"API error {data['error']['error_code']}:"
+                        f" {data['error']['error_detail']}"
                     )
                 return data.get("result", {})
             except httpx.HTTPStatusError as e:
@@ -63,7 +71,7 @@ class YandexDirectCollector:
         raise DirectAPIError("Max retries exceeded")
 
     async def get_campaigns(self) -> list[dict]:
-        """Кампании с полными настройками включая стратегию"""
+        """Кампании с полными настройками включая тип стратегии"""
         result = await self._post("campaigns", "get", {
             "SelectionCriteria": {
                 "States": ["ON"],
@@ -76,24 +84,22 @@ class YandexDirectCollector:
             "TextCampaignFieldNames": ["BiddingStrategy"],
             "DynamicTextCampaignFieldNames": ["BiddingStrategy"],
             "SmartCampaignFieldNames": ["BiddingStrategy"],
+            "UnifiedAdCampaignFieldNames": ["BiddingStrategy"],
             "Page": {"Limit": 10000},
         })
         campaigns = result.get("Campaigns", [])
-        # Нормализуем стратегию
         for c in campaigns:
-            strategy = None
-            for key in ["TextCampaign", "DynamicTextCampaign", "SmartCampaign"]:
+            strategy = "UNKNOWN"
+            for key in ["TextCampaign", "DynamicTextCampaign", "SmartCampaign",
+                        "UnifiedAdCampaign"]:
                 if key in c:
-                    bs = c[key].get("BiddingStrategy", {})
-                    # Определяем тип стратегии
-                    if "ManualCpc" in str(bs) or "WbMaximumClicks" not in str(bs):
+                    bs_str = str(c[key].get("BiddingStrategy", {}))
+                    if "ManualCpc" in bs_str:
                         strategy = "MANUAL_CPC"
-                    elif "AutotargetingCategories" in str(bs):
-                        strategy = "AUTO"
                     else:
                         strategy = "AUTO"
                     break
-            c["_strategy"] = strategy or "UNKNOWN"
+            c["_strategy"] = strategy
         return campaigns
 
     async def get_ad_groups(self, campaign_ids: list[str]) -> list[dict]:
@@ -117,7 +123,6 @@ class YandexDirectCollector:
         return result.get("Keywords", [])
 
     async def get_ads(self, campaign_ids: list[str]) -> list[dict]:
-        """Объявления с ID для отслеживания изменений"""
         result = await self._post("ads", "get", {
             "SelectionCriteria": {"CampaignIds": campaign_ids},
             "FieldNames": [
@@ -135,12 +140,19 @@ class YandexDirectCollector:
         campaign_ids: Optional[list[str]] = None,
     ) -> list[dict]:
         """
-        Полная статистика по ключевым словам.
-        Включает все показатели для анализа уровня 1.
+        Полная статистика по ключевым словам за период.
+
+        Поля:
+          Базовые:      Date, CampaignId, AdGroupId, CriterionId, Criterion
+          Трафик:       Impressions, Clicks, Ctr, Cost, AvgCpc
+          Ставка:       AvgEffectiveBid   (в микрорублях → делим на 1_000_000)
+          Позиции:      AvgImpressionPosition, AvgClickPosition
+          Объём рынка:  AvgTrafficVolume, WeightedImpressions, WeightedCtr
+          Поведение:    BounceRate (из Директа — % кликов-отказов)
         """
-        selection = {
+        selection: dict = {
             "DateFrom": date_from.isoformat(),
-            "DateTo": date_to.isoformat(),
+            "DateTo":   date_to.isoformat(),
             "Filter": [
                 {"Field": "Impressions", "Operator": "GREATER_THAN", "Values": ["0"]}
             ],
@@ -164,18 +176,22 @@ class YandexDirectCollector:
                     "CriterionId",
                     "Criterion",
                     "CriterionType",
-                    # Показатели
+                    # ── Трафиковые ──────────────────────────────────────
                     "Impressions",
                     "Clicks",
                     "Ctr",
                     "Cost",
                     "AvgCpc",
-                    "AvgEffectiveBid",
-                    "AvgTrafficVolume",
+                    # ── Ставка и аукцион ────────────────────────────────
+                    "AvgEffectiveBid",        # в микрорублях
+                    # ── Позиции ─────────────────────────────────────────
                     "AvgImpressionPosition",
                     "AvgClickPosition",
-                    "WeightedCtr",
+                    # ── Объём рынка ─────────────────────────────────────
+                    "AvgTrafficVolume",
                     "WeightedImpressions",
+                    "WeightedCtr",
+                    # ── Поведение ────────────────────────────────────────
                     "BounceRate",
                 ],
                 "ReportName": f"kw_stats_{date_from}_{date_to}",
@@ -195,12 +211,12 @@ class YandexDirectCollector:
         campaign_ids: Optional[list[str]] = None,
     ) -> list[dict]:
         """
-        Отчёт по поисковым запросам — реальные фразы по которым показывалась реклама.
-        Ключевой источник для анализа нерелевантного трафика и расширения семантики.
+        Отчёт по поисковым запросам (SEARCH_QUERY_PERFORMANCE_REPORT).
+        Источник нерелевантного трафика и расширения семантики.
         """
-        selection = {
+        selection: dict = {
             "DateFrom": date_from.isoformat(),
-            "DateTo": date_to.isoformat(),
+            "DateTo":   date_to.isoformat(),
             "Filter": [
                 {"Field": "Clicks", "Operator": "GREATER_THAN", "Values": ["0"]}
             ],
@@ -246,7 +262,7 @@ class YandexDirectCollector:
     async def _request_report(self, payload: dict) -> list[dict]:
         """Запрос отчёта через Reports API с polling"""
         url = "https://api.direct.yandex.com/json/v5/reports"
-        for attempt in range(10):
+        for attempt in range(12):
             resp = await self._client.post(
                 url,
                 json=payload,
@@ -263,7 +279,9 @@ class YandexDirectCollector:
                 logger.info(f"Report not ready, waiting {wait}s...")
                 await asyncio.sleep(wait)
             else:
-                logger.error(f"Report error {resp.status_code}: {resp.text[:200]}")
+                logger.error(
+                    f"Report error {resp.status_code}: {resp.text[:300]}"
+                )
                 return []
         logger.error("Report not ready after max retries")
         return []
