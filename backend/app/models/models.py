@@ -1,6 +1,10 @@
 """
 Схема БД PPC Optimizer
 Все таблицы содержат account_id для мультикабинетности с первого дня.
+
+Изменения v1.2:
+  - KeywordStat: добавлены bounce_rate, sessions, weighted_ctr, weighted_impressions
+  - Campaign: добавлен epk_collapse_detected флаг
 """
 from datetime import datetime
 from decimal import Decimal
@@ -17,10 +21,9 @@ class Base(DeclarativeBase):
     pass
 
 
-# ─── Справочники ────────────────────────────────────────────────────────────
+# ─── Справочники ──────────────────────────────────────────────────────────────
 
 class Account(Base):
-    """Рекламный кабинет (один аккаунт Яндекс Директ)"""
     __tablename__ = "accounts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -28,7 +31,7 @@ class Account(Base):
     yandex_login: Mapped[str] = mapped_column(String(255), unique=True)
     direct_client_id: Mapped[Optional[str]] = mapped_column(String(100))
     metrika_counter_id: Mapped[Optional[str]] = mapped_column(String(100))
-    oauth_token: Mapped[Optional[str]] = mapped_column(Text)  # зашифровать в проде
+    oauth_token: Mapped[Optional[str]] = mapped_column(Text)
     refresh_token: Mapped[Optional[str]] = mapped_column(Text)
     token_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -42,19 +45,20 @@ class Account(Base):
 
 
 class Campaign(Base):
-    """Рекламная кампания"""
     __tablename__ = "campaigns"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
     direct_id: Mapped[str] = mapped_column(String(100))
     name: Mapped[str] = mapped_column(String(500))
-    campaign_type: Mapped[str] = mapped_column(String(50))  # EPK, TGK, etc.
+    campaign_type: Mapped[str] = mapped_column(String(50))   # EPK / TGK / etc
     status: Mapped[str] = mapped_column(String(50))
     daily_budget: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
     strategy: Mapped[Optional[str]] = mapped_column(String(100))
     strategy_type: Mapped[Optional[str]] = mapped_column(String(50))  # MANUAL_CPC / AUTO
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # ЕПК-флаг — выставляется аналитиком при обнаружении обвала
+    epk_collapse_detected: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -66,7 +70,6 @@ class Campaign(Base):
 
 
 class AdGroup(Base):
-    """Группа объявлений"""
     __tablename__ = "ad_groups"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -91,7 +94,7 @@ class Cluster(Base):
     account_id: Mapped[int] = mapped_column(Integer, index=True)
     name: Mapped[str] = mapped_column(String(255))
     description: Mapped[Optional[str]] = mapped_column(Text)
-    direction: Mapped[Optional[str]] = mapped_column(String(255))  # товарное направление
+    direction: Mapped[Optional[str]] = mapped_column(String(255))
     target_cpl: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -99,7 +102,6 @@ class Cluster(Base):
 
 
 class Keyword(Base):
-    """Ключевое слово"""
     __tablename__ = "keywords"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -120,10 +122,9 @@ class Keyword(Base):
     stats: Mapped[list["KeywordStat"]] = relationship(back_populates="keyword")
 
 
-# ─── Статистика ──────────────────────────────────────────────────────────────
+# ─── Статистика ───────────────────────────────────────────────────────────────
 
 class CampaignStat(Base):
-    """Статистика кампании по дням"""
     __tablename__ = "campaign_stats"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -142,22 +143,52 @@ class CampaignStat(Base):
 
 
 class KeywordStat(Base):
-    """Статистика ключа по дням"""
+    """
+    Статистика ключа по дням.
+    Поля из API Яндекс Директ (CRITERIA_PERFORMANCE_REPORT):
+      - impressions, clicks, spend, ctr, avg_cpc    — базовые
+      - avg_bid (AvgEffectiveBid / 1_000_000)       — ставка с корректировками
+      - avg_position (AvgImpressionPosition)         — позиция показа
+      - avg_click_position (AvgClickPosition)        — позиция клика
+      - traffic_volume (AvgTrafficVolume)             — объём трафика 0–150
+      - weighted_impressions (WeightedImpressions)   — взвешенные показы
+      - weighted_ctr (WeightedCtr)                   — взвешенный CTR
+      - bounce_rate (BounceRate из Директа)          — отказы по клику
+
+    Поля из Яндекс Метрики (обогащение по utm_term):
+      - sessions                                     — визиты (ym:s:visits)
+    """
     __tablename__ = "keyword_stats"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int] = mapped_column(Integer, index=True)
     keyword_id: Mapped[int] = mapped_column(ForeignKey("keywords.id"), index=True)
     date: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+    # ── Базовые трафиковые метрики ────────────────────────────────────────
     impressions: Mapped[int] = mapped_column(Integer, default=0)
     clicks: Mapped[int] = mapped_column(Integer, default=0)
     spend: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
-    avg_cpc: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
-    avg_bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
-    avg_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
-    avg_click_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
-    traffic_volume: Mapped[Optional[int]] = mapped_column(Integer)
-    ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))
+    ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))      # %
+    avg_cpc: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2)) # ₽
+
+    # ── Ставка и аукцион ──────────────────────────────────────────────────
+    avg_bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))  # AvgEffectiveBid в ₽
+
+    # ── Позиционные метрики ───────────────────────────────────────────────
+    avg_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))        # AvgImpressionPosition
+    avg_click_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))  # AvgClickPosition
+
+    # ── Объём рынка ───────────────────────────────────────────────────────
+    traffic_volume: Mapped[Optional[int]] = mapped_column(Integer)                # AvgTrafficVolume 0–150
+    weighted_impressions: Mapped[Optional[int]] = mapped_column(Integer)          # WeightedImpressions
+    weighted_ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))        # WeightedCtr
+
+    # ── Поведенческие (из Директа + Метрики) ─────────────────────────────
+    bounce_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))  # BounceRate из Директа, %
+    sessions: Mapped[Optional[int]] = mapped_column(Integer)               # визиты из Метрики по utm_term
+
+    # ── Служебные ─────────────────────────────────────────────────────────
     ad_id: Mapped[Optional[str]] = mapped_column(String(100))
 
     __table_args__ = (
@@ -168,28 +199,28 @@ class KeywordStat(Base):
     keyword: Mapped["Keyword"] = relationship(back_populates="stats")
 
 
-# ─── Лиды и воронка ──────────────────────────────────────────────────────────
+# ─── Лиды и воронка ───────────────────────────────────────────────────────────
 
 class LeadStatus(str, enum.Enum):
-    lead = "lead"
-    sql = "sql"
+    lead     = "lead"
+    sql      = "sql"
     proposal = "proposal"
-    deal = "deal"
-    lost = "lost"
+    deal     = "deal"
+    lost     = "lost"
 
 
 class Lead(Base):
-    """Заявка из CRM с атрибуцией"""
+    """Заявка из CRM с атрибуцией (Level 2 — подключается через CSV/API 1С)"""
     __tablename__ = "leads"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int] = mapped_column(Integer, index=True)
-    external_id: Mapped[Optional[str]] = mapped_column(String(255))  # ID в 1С
+    external_id: Mapped[Optional[str]] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     utm_source: Mapped[Optional[str]] = mapped_column(String(100))
     utm_campaign: Mapped[Optional[str]] = mapped_column(String(255))
     utm_term: Mapped[Optional[str]] = mapped_column(Text)
-    client_id: Mapped[Optional[str]] = mapped_column(String(255))  # Метрика clientID
+    client_id: Mapped[Optional[str]] = mapped_column(String(255))
     roistat_id: Mapped[Optional[str]] = mapped_column(String(255))
     keyword_id: Mapped[Optional[int]] = mapped_column(ForeignKey("keywords.id"))
     status: Mapped[LeadStatus] = mapped_column(SAEnum(LeadStatus), default=LeadStatus.lead)
@@ -203,10 +234,9 @@ class Lead(Base):
     )
 
 
-# ─── Аналитика ───────────────────────────────────────────────────────────────
+# ─── Аналитика ────────────────────────────────────────────────────────────────
 
 class AnalysisResult(Base):
-    """Результат еженедельного анализа по кабинету"""
     __tablename__ = "analysis_results"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -214,15 +244,15 @@ class AnalysisResult(Base):
     period_start: Mapped[datetime] = mapped_column(DateTime)
     period_end: Mapped[datetime] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    summary: Mapped[Optional[dict]] = mapped_column(JSON)  # сводные KPI
-    problems: Mapped[Optional[list]] = mapped_column(JSON)  # топ-5 проблем
-    opportunities: Mapped[Optional[list]] = mapped_column(JSON)  # точки роста
+    summary: Mapped[Optional[dict]] = mapped_column(JSON)
+    problems: Mapped[Optional[list]] = mapped_column(JSON)
+    opportunities: Mapped[Optional[list]] = mapped_column(JSON)
 
     suggestions: Mapped[list["Suggestion"]] = relationship(back_populates="analysis")
 
 
 class KeywordMetrics(Base):
-    """Рассчитанные метрики по ключу за скользящее окно"""
+    """Рассчитанные метрики по ключу за скользящее окно (CRM Level 2)"""
     __tablename__ = "keyword_metrics"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -240,34 +270,30 @@ class KeywordMetrics(Base):
     cpql: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
     is_significant: Mapped[bool] = mapped_column(Boolean, default=False)
     recommended_bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
-    bid_source: Mapped[str] = mapped_column(String(50), default="cluster")  # cluster/individual
+    bid_source: Mapped[str] = mapped_column(String(50), default="cluster")
 
 
-# ─── Правила и предложения ───────────────────────────────────────────────────
-
-
+# ─── Правила и предложения ────────────────────────────────────────────────────
 
 class MetrikaSnapshot(Base):
-    """Снапшот данных из Метрики — все срезы за один сбор"""
     __tablename__ = "metrika_snapshots"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int] = mapped_column(Integer, index=True)
     date: Mapped[datetime] = mapped_column(DateTime, index=True)
-    data: Mapped[dict] = mapped_column(JSON)  # все 12 срезов
+    data: Mapped[dict] = mapped_column(JSON)
 
 
 class SearchQuery(Base):
-    """Поисковый запрос — реальная фраза по которой показывалась реклама"""
     __tablename__ = "search_queries"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int] = mapped_column(Integer, index=True)
     keyword_id: Mapped[Optional[int]] = mapped_column(ForeignKey("keywords.id"), index=True)
     date: Mapped[datetime] = mapped_column(DateTime, index=True)
-    query: Mapped[str] = mapped_column(Text)  # реальный поисковый запрос
-    keyword_phrase: Mapped[Optional[str]] = mapped_column(Text)  # ключ который сматчился
-    match_type: Mapped[Optional[str]] = mapped_column(String(50))  # EXACT/PHRASE/BROAD
+    query: Mapped[str] = mapped_column(Text)
+    keyword_phrase: Mapped[Optional[str]] = mapped_column(Text)
+    match_type: Mapped[Optional[str]] = mapped_column(String(50))
     campaign_id: Mapped[Optional[int]] = mapped_column(ForeignKey("campaigns.id"))
     ad_group_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ad_groups.id"))
     impressions: Mapped[int] = mapped_column(Integer, default=0)
@@ -277,9 +303,8 @@ class SearchQuery(Base):
     avg_cpc: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
     avg_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
     avg_click_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
-    # Флаги для анализа
-    is_irrelevant: Mapped[bool] = mapped_column(Boolean, default=False)  # нерелевантный
-    is_added_as_keyword: Mapped[bool] = mapped_column(Boolean, default=False)  # добавлен как ключ
+    is_irrelevant: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_added_as_keyword: Mapped[bool] = mapped_column(Boolean, default=False)
 
     __table_args__ = (
         Index("ix_sq_account_date", "account_id", "date"),
@@ -288,25 +313,19 @@ class SearchQuery(Base):
 
 
 class Rule(Base):
-    """
-    База правил для генерации предложений.
-    Хранится в БД — можно менять без деплоя.
-    """
     __tablename__ = "rules"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    account_id: Mapped[Optional[int]] = mapped_column(ForeignKey("accounts.id"))  # NULL = глобальное
+    account_id: Mapped[Optional[int]] = mapped_column(ForeignKey("accounts.id"))
     name: Mapped[str] = mapped_column(String(255))
     condition_type: Mapped[str] = mapped_column(String(100))
-    # Параметры условия
     min_clicks: Mapped[Optional[int]] = mapped_column(Integer)
     cr_min: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 4))
     cr_max: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 4))
     cpql_multiplier: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
-    # Действие
     action_type: Mapped[str] = mapped_column(String(100))
     action_params: Mapped[Optional[dict]] = mapped_column(JSON)
-    priority: Mapped[str] = mapped_column(String(20), default="this_week")  # today/this_week/month/scale
+    priority: Mapped[str] = mapped_column(String(20), default="this_week")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     description: Mapped[Optional[str]] = mapped_column(Text)
 
@@ -314,28 +333,28 @@ class Rule(Base):
 
 
 class SuggestionStatus(str, enum.Enum):
-    pending = "pending"
-    approved = "approved"
-    rejected = "rejected"
-    applied = "applied"
+    pending     = "pending"
+    approved    = "approved"
+    rejected    = "rejected"
+    applied     = "applied"
     rolled_back = "rolled_back"
 
 
 class HypothesisVerdict(str, enum.Enum):
-    confirmed = "confirmed"
-    rejected = "rejected"
+    confirmed   = "confirmed"
+    rejected    = "rejected"
     insufficient = "insufficient"
+    neutral     = "neutral"
 
 
 class Suggestion(Base):
-    """Предложение по изменению (ставка, стратегия, минус-слова и т.д.)"""
     __tablename__ = "suggestions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int] = mapped_column(Integer, index=True)
     analysis_id: Mapped[int] = mapped_column(ForeignKey("analysis_results.id"), index=True)
     rule_id: Mapped[Optional[int]] = mapped_column(ForeignKey("rules.id"))
-    object_type: Mapped[str] = mapped_column(String(50))  # keyword/cluster/campaign/ad_group
+    object_type: Mapped[str] = mapped_column(String(50))
     object_id: Mapped[int] = mapped_column(Integer)
     object_name: Mapped[str] = mapped_column(Text)
     change_type: Mapped[str] = mapped_column(String(100))
@@ -355,18 +374,19 @@ class Suggestion(Base):
 
 
 class Hypothesis(Base):
-    """Гипотеза — трекинг результата после применения изменения"""
     __tablename__ = "hypotheses"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int] = mapped_column(Integer, index=True)
     suggestion_id: Mapped[int] = mapped_column(ForeignKey("suggestions.id"), unique=True)
     applied_at: Mapped[datetime] = mapped_column(DateTime)
-    track_until: Mapped[datetime] = mapped_column(DateTime)  # applied_at + 7 days
+    track_until: Mapped[datetime] = mapped_column(DateTime)
     metrics_before: Mapped[Optional[dict]] = mapped_column(JSON)
     metrics_after: Mapped[Optional[dict]] = mapped_column(JSON)
     delta_percent: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 2))
-    verdict: Mapped[Optional[HypothesisVerdict]] = mapped_column(SAEnum(HypothesisVerdict), nullable=True)
+    verdict: Mapped[Optional[HypothesisVerdict]] = mapped_column(
+        SAEnum(HypothesisVerdict), nullable=True
+    )
     report: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
