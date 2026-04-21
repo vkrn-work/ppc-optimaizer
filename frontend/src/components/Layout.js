@@ -10,17 +10,17 @@ const NAV = [
     { href: '/adjustments', icon: '⊕', label: 'Корректировки' },
   ]},
   { section: 'ПОИСКОВЫЕ ФРАЗЫ', items: [
-    { href: '/new-keywords', icon: '+', label: 'Новые ключи',  badgeKey: 'new_kw',  badgeColor: 'green' },
+    { href: '/new-keywords', icon: '+', label: 'Новые ключи', badgeKey: 'new_kw', badgeColor: 'green' },
     { href: '/negatives',    icon: '×', label: 'Минуса',       badgeKey: 'neg' },
   ]},
   { section: 'ОПТИМИЗАЦИЯ', items: [
-    { href: '/suggestions', icon: '◈', label: 'Предложения',  badgeKey: 'suggest', badgeColor: 'accent' },
-    { href: '/hypotheses',  icon: '◇', label: 'Гипотезы' },
+    { href: '/suggestions', icon: '◈', label: 'Предложения', ersetKey: 'suggest', badgeColor: 'accent' },
+    { href: '/hypotheses', icon: '◇', label: 'Гипотезы' },
   ]},
   { section: 'СИСТЕМА', items: [
     { href: '/settings',    icon: '⊙', label: 'Кабинеты' },
     { href: '/rules',       icon: '≋', label: 'Правила' },
-    { href: '/diagnostics', icon: '⚠', label: 'Диагностика',  badgeKey: 'errors',  danger: true },
+    { href: '/diagnostics', icon: '⚠', label: 'Диагностика', badgeKey: 'errors', danger: true },
   ]},
 ]
 
@@ -32,8 +32,6 @@ function getMSK() {
   })
 }
 
-// Форматировать UTC-дату из БД как МСК
-// last_sync_at приходит без Z — добавляем чтобы браузер трактовал как UTC
 function formatSyncTime(isoString) {
   if (!isoString) return null
   const s = isoString.endsWith('Z') ? isoString : isoString + 'Z'
@@ -55,6 +53,7 @@ export default function Layout({ children, account, accounts, onAccountChange })
   })
   const [time, setTime] = useState(getMSK())
   const [syncing, setSyncing] = useState(false)
+  const [analyzing, setAnalyzing] = useState(false)
   const [badges, setBadges] = useState({})
   const accountId = account?.id
 
@@ -77,7 +76,7 @@ export default function Layout({ children, account, accounts, onAccountChange })
         const urgentProblems = (a?.problems || []).filter(p => p.priority === 'today').length
         setBadges(prev => ({ ...prev, suggest: urgentProblems || null }))
       }).catch(() => {})
-    fetch(`https://ppc-optimaizer-production.up.railway.app/health`)
+    fetch(`https://ppc-optimaizer-production.up.railway.app/api/v1/health`)
       .then(r => r.json())
       .then(h => {
         if (!account?.oauth_token || !account?.metrika_counter_id) {
@@ -87,10 +86,23 @@ export default function Layout({ children, account, accounts, onAccountChange })
   }, [accountId, account])
 
   async function handleSync() {
-    if (!accountId || syncing) return
+    if (!accountId || syncing || analyzing) return
     setSyncing(true)
     try { await api.triggerSync(accountId) } catch (e) {}
     finally { setTimeout(() => setSyncing(false), 2000) }
+  }
+
+  async function handleAnalyze() {
+    if (!accountId || syncing || analyzing) return
+    setAnalyzing(true)
+    try {
+      await api.runAnalysis(accountId)
+      alert('✅ Анализ завершен на текущих данных')
+    } catch (e) {
+      alert('❌ Ошибка запуска анализа')
+    } finally {
+      setTimeout(() => setAnalyzing(false), 1500)
+    }
   }
 
   const syncFormatted = formatSyncTime(account?.last_sync_at)
@@ -111,8 +123,21 @@ export default function Layout({ children, account, accounts, onAccountChange })
           {lastSync}
         </div>
         <div className="topbar-right">
-          <button className="btn btn-sm btn-primary" onClick={handleSync} disabled={syncing} style={{ minWidth: 120 }}>
+          <button 
+            className="btn btn-sm btn-primary" 
+            onClick={handleSync} 
+            disabled={syncing || analyzing}
+            style={{ minWidth: 130 }}
+          >
             {syncing ? '⏳ Запуск...' : '↻ Обновить данные'}
+          </button>
+          <button 
+            className="btn btn-sm btn-success" 
+            onClick={handleAnalyze} 
+            disabled={syncing || analyzing}
+            style={{ minWidth: 130 }}
+          >
+            {analyzing ? '🧠 Анализ...' : '🧠 Только анализ'}
           </button>
           <div className="sb-toggle" onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
             title={isDark ? 'Светлая тема' : 'Тёмная тема'} style={{ fontSize: 14 }}>
