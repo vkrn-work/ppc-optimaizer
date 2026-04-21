@@ -145,10 +145,10 @@ class YandexDirectCollector:
         Поля:
           Базовые:      Date, CampaignId, AdGroupId, CriterionId, Criterion
           Трафик:       Impressions, Clicks, Ctr, Cost, AvgCpc
-          Ставка:       AvgEffectiveBid   (в микрорублях → делим на 1_000_000)
+          Ставка:       AvgEffectiveBid   (в микрорублях -> делим на 1_000_000)
           Позиции:      AvgImpressionPosition, AvgClickPosition
           Объём рынка:  AvgTrafficVolume, WeightedImpressions, WeightedCtr
-          Поведение:    BounceRate (из Директа — % кликов-отказов)
+          Поведение:    BounceRate (из Директа - % кликов-отказов)
         """
         selection: dict = {
             "DateFrom": date_from.isoformat(),
@@ -168,30 +168,12 @@ class YandexDirectCollector:
             "params": {
                 "SelectionCriteria": selection,
                 "FieldNames": [
-                    "Date",
-                    "CampaignId",
-                    "CampaignName",
-                    "AdGroupId",
-                    "AdGroupName",
-                    "CriterionId",
-                    "Criterion",
-                    "CriterionType",
-                    # ── Трафиковые ──────────────────────────────────────
-                    "Impressions",
-                    "Clicks",
-                    "Ctr",
-                    "Cost",
-                    "AvgCpc",
-                    # ── Ставка и аукцион ────────────────────────────────
-                    "AvgEffectiveBid",        # в микрорублях
-                    # ── Позиции ─────────────────────────────────────────
-                    "AvgImpressionPosition",
-                    "AvgClickPosition",
-                    # ── Объём рынка ─────────────────────────────────────
-                    "AvgTrafficVolume",
-                    "WeightedImpressions",
-                    "WeightedCtr",
-                    # ── Поведение ────────────────────────────────────────
+                    "Date", "CampaignId", "CampaignName", "AdGroupId", "AdGroupName",
+                    "CriterionId", "Criterion", "CriterionType",
+                    "Impressions", "Clicks", "Ctr", "Cost", "AvgCpc",
+                    "AvgEffectiveBid",
+                    "AvgImpressionPosition", "AvgClickPosition",
+                    "AvgTrafficVolume", "WeightedImpressions", "WeightedCtr",
                     "BounceRate",
                 ],
                 "ReportName": f"kw_stats_{date_from}_{date_to}",
@@ -232,22 +214,10 @@ class YandexDirectCollector:
             "params": {
                 "SelectionCriteria": selection,
                 "FieldNames": [
-                    "Date",
-                    "CampaignId",
-                    "CampaignName",
-                    "AdGroupId",
-                    "AdGroupName",
-                    "CriterionId",
-                    "Criterion",
-                    "Query",
-                    "Impressions",
-                    "Clicks",
-                    "Ctr",
-                    "Cost",
-                    "AvgCpc",
-                    "AvgImpressionPosition",
-                    "AvgClickPosition",
-                    "MatchType",
+                    "Date", "CampaignId", "CampaignName", "AdGroupId", "AdGroupName",
+                    "CriterionId", "Criterion", "Query",
+                    "Impressions", "Clicks", "Ctr", "Cost", "AvgCpc",
+                    "AvgImpressionPosition", "AvgClickPosition", "MatchType",
                 ],
                 "ReportName": f"search_queries_{date_from}_{date_to}",
                 "ReportType": "SEARCH_QUERY_PERFORMANCE_REPORT",
@@ -279,9 +249,7 @@ class YandexDirectCollector:
                 logger.info(f"Report not ready, waiting {wait}s...")
                 await asyncio.sleep(wait)
             else:
-                logger.error(
-                    f"Report error {resp.status_code}: {resp.text[:300]}"
-                )
+                logger.error(f"Report error {resp.status_code}: {resp.text[:300]}")
                 return []
         logger.error("Report not ready after max retries")
         return []
