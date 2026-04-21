@@ -97,9 +97,10 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
             date_from = date_to - timedelta(days=days)
             logger.info(
                 f"Collecting account {account_id} for {days} days:"
-                f" {date_from} -- {date_to}"
+                f" {date_from} — {date_to}"
             )
 
+            # ── Директ: кампании, группы, ключи ─────────────────────────
             async with YandexDirectCollector(
                 account.oauth_token, account.yandex_login
             ) as dc:
@@ -132,6 +133,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                 if not campaign_ids:
                     return
 
+                # Группы
                 groups_data = []
                 for i in range(0, len(campaign_ids), 10):
                     batch = campaign_ids[i:i+10]
@@ -160,6 +162,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                     await db.execute(stmt)
                 await db.commit()
 
+                # Ключи
                 keywords_data = []
                 for i in range(0, len(campaign_ids), 10):
                     batch = campaign_ids[i:i+10]
@@ -195,6 +198,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                     await db.execute(stmt)
                 await db.commit()
 
+                # Статистика ключей — с новыми полями
                 stats_data = await dc.get_keyword_stats(date_from, date_to)
                 logger.info(f"Keyword stats rows: {len(stats_data)}")
                 saved_stats = 0
@@ -231,11 +235,20 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                         if clicks == 0 and impressions == 0:
                             continue
 
-                        ctr_val     = safe_float(row.get("Ctr"))
+                        # CTR в процентах ("5.23")
+                        ctr_val = safe_float(row.get("Ctr"))
+
+                        # AvgEffectiveBid в микрорублях → рубли
                         avg_bid_raw = safe_float(row.get("AvgEffectiveBid"))
                         avg_bid_rub = avg_bid_raw / 1_000_000 if avg_bid_raw else None
+
+                        # AvgCpc уже в рублях
                         avg_cpc_val = safe_float(row.get("AvgCpc"))
-                        w_ctr       = safe_float(row.get("WeightedCtr"))
+
+                        # WeightedCtr в процентах
+                        w_ctr = safe_float(row.get("WeightedCtr"))
+
+                        # BounceRate в процентах (--  если нет данных API вернёт "--")
                         br_raw = row.get("BounceRate", "")
                         bounce_rate_val = safe_float(br_raw) if br_raw != "--" else None
 
@@ -252,14 +265,20 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                             avg_position=safe_float(row.get("AvgImpressionPosition")),
                             avg_click_position=safe_float(row.get("AvgClickPosition")),
                             traffic_volume=safe_int(row.get("AvgTrafficVolume")),
+                            # ── Новые поля v1.2 ────────────────────────
                             weighted_impressions=safe_int(row.get("WeightedImpressions")),
                             weighted_ctr=w_ctr,
                             bounce_rate=bounce_rate_val,
+                            # sessions будет заполнен при обогащении из Метрики
                         ).on_conflict_do_update(
                             index_elements=["account_id", "keyword_id", "date"],
                             set_={
-                                "clicks": clicks, "spend": spend, "impressions": impressions,
-                                "ctr": ctr_val, "avg_cpc": avg_cpc_val, "avg_bid": avg_bid_rub,
+                                "clicks": clicks,
+                                "spend": spend,
+                                "impressions": impressions,
+                                "ctr": ctr_val,
+                                "avg_cpc": avg_cpc_val,
+                                "avg_bid": avg_bid_rub,
                                 "avg_position": safe_float(row.get("AvgImpressionPosition")),
                                 "avg_click_position": safe_float(row.get("AvgClickPosition")),
                                 "traffic_volume": safe_int(row.get("AvgTrafficVolume")),
@@ -275,6 +294,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                 await db.commit()
                 logger.info(f"Stats saved: {saved_stats} rows for account {account_id}")
 
+                # Поисковые запросы
                 try:
                     from app.models.models import SearchQuery
                     sq_data = await dc.get_search_queries(date_from, date_to)
@@ -286,6 +306,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                             sq_impr   = int(float(row.get("Impressions", 0) or 0))
                             if sq_clicks == 0 and sq_impr == 0:
                                 continue
+
                             kw_res = await db.execute(
                                 select(Keyword).where(
                                     Keyword.account_id == account_id,
@@ -307,6 +328,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                                 )
                             )
                             ag = ag_res.scalar_one_or_none()
+
                             db.add(SearchQuery(
                                 account_id=account_id,
                                 keyword_id=kw.id if kw else None,
@@ -330,6 +352,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                 except Exception as e:
                     logger.warning(f"Search queries collection failed: {e}")
 
+            # ── Метрика ──────────────────────────────────────────────────
             if account.metrika_counter_id:
                 try:
                     from app.models.models import MetrikaSnapshot
@@ -348,9 +371,14 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                         )
                         db.add(snap)
                         await db.commit()
+
+                        # ── Обогащение sessions в keyword_stats ───────────
+                        # Матчим по utm_term → keyword.phrase → keyword_stats
                         kw_data = metrika_data.get("keywords", [])
                         if kw_data:
-                            await _enrich_sessions(db, account_id, kw_data, date_from, date_to)
+                            await _enrich_sessions(
+                                db, account_id, kw_data, date_from, date_to
+                            )
                 except Exception as e:
                     logger.warning(f"Metrika collection failed: {e}")
 
@@ -367,9 +395,11 @@ async def _enrich_sessions(db, account_id, kw_metrika: list, date_from, date_to)
     """
     Обогащает keyword_stats полем sessions из данных Метрики.
     Матчинг: utm_term (Метрика) == keyword.phrase (Директ).
+    Это приближение — точный матчинг требует client_id/roistat_id.
     """
     from sqlalchemy import select, update, and_
     from app.models.models import Keyword, KeywordStat
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     enriched = 0
     for row in kw_metrika:
@@ -377,6 +407,7 @@ async def _enrich_sessions(db, account_id, kw_metrika: list, date_from, date_to)
         visits   = int(row.get("visits", 0) or 0)
         if not utm_term or visits == 0:
             continue
+
         kw_res = await db.execute(
             select(Keyword).where(
                 Keyword.account_id == account_id,
@@ -386,6 +417,8 @@ async def _enrich_sessions(db, account_id, kw_metrika: list, date_from, date_to)
         kw = kw_res.scalar_one_or_none()
         if not kw:
             continue
+
+        # Обновляем все строки за период (приближённо распределяем visits)
         await db.execute(
             update(KeywordStat)
             .where(and_(
@@ -398,6 +431,7 @@ async def _enrich_sessions(db, account_id, kw_metrika: list, date_from, date_to)
             .values(sessions=visits)
         )
         enriched += 1
+
     await db.commit()
     if enriched:
         logger.info(f"Sessions enriched for {enriched} keywords, account {account_id}")
@@ -562,6 +596,6 @@ async def _track_hypothesis_async(hypothesis_id: int):
                     hypothesis.report  = f"Изменение нейтральное ({delta:+.1f}%). Продолжить наблюдение."
 
             await db.commit()
-            logger.info(f"Hypothesis {hypothesis_id} -> {hypothesis.verdict}")
+            logger.info(f"Hypothesis {hypothesis_id} → {hypothesis.verdict}")
     finally:
         await engine.dispose()
