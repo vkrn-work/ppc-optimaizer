@@ -219,14 +219,14 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
 
                 for row in stats_data:
                     kw_res = await db.execute(
-            select(Keyword).where(
-                Keyword.account_id == account_id,
-                Keyword.phrase == utm_term,
-            ).limit(1)
-        )
-        kw = kw_res.scalars().first()
-        if not kw:
-            continue
+                        select(Keyword).where(
+                            Keyword.account_id == account_id,
+                            Keyword.direct_id == str(row.get("CriterionId", "")),
+                        )
+                    )
+                    kw = kw_res.scalar_one_or_none()
+                    if not kw:
+                        continue
                     try:
                         stat_date  = datetime.strptime(row["Date"], "%Y-%m-%d")
                         clicks     = int(float(row.get("Clicks", 0) or 0))
