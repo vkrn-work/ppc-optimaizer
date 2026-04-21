@@ -52,12 +52,13 @@ class SuggestionGenerator:
     async def generate_for_analysis(self, analysis: AnalysisResult) -> list[Suggestion]:
         """
         Конвертирует сигналы из analysis.problems в Suggestion записи.
-        Дубликаты не создаются: если для этого же entity_id и типа
+        Дубликаты не создаются: если для этого же keyword_id и типа
         уже есть pending-предложение из предыдущего анализа — пропускаем.
         """
         if not analysis.problems:
             return []
 
+        # Загрузить уже существующие pending-предложения для этого кабинета
         existing_q = await self.db.execute(
             select(Suggestion).where(
                 and_(
@@ -67,25 +68,29 @@ class SuggestionGenerator:
             )
         )
         existing = existing_q.scalars().all()
-        existing_keys = {(s.object_id, s.change_type) for s in existing}
+        existing_keys = {
+            (s.object_id, s.change_type) for s in existing
+        }
 
         suggestions = []
         for problem in analysis.problems:
-            sig_type    = problem.get("type", "")
-            priority    = problem.get("priority", "this_week")
-            kw_id       = problem.get("keyword_id")
-            phrase      = problem.get("phrase") or problem.get("entity_name") or ""
-            action      = problem.get("action", "")
+            sig_type   = problem.get("type", "")
+            severity   = problem.get("severity", "warning")
+            priority   = problem.get("priority", "this_week")
+            kw_id      = problem.get("keyword_id")
+            phrase     = problem.get("phrase") or problem.get("entity_name") or ""
+            action     = problem.get("action", "")
             description = problem.get("description", "")
             hypothesis  = problem.get("hypothesis", "")
             expected    = problem.get("expected_outcome", "")
             calc_logic  = problem.get("calculation_logic", "")
-            rec_bid     = problem.get("recommended_bid")
-            entity_id   = problem.get("entity_id") or kw_id or 0
+            rec_bid    = problem.get("recommended_bid")
+            entity_id  = problem.get("entity_id") or kw_id or 0
             entity_type = "campaign" if sig_type in CAMPAIGN_LEVEL_SIGNALS else "keyword"
 
             change_type = SIGNAL_TO_CHANGE_TYPE.get(sig_type, "check")
 
+            # Для ключевых предложений со ставкой — нужен актуальный current_bid
             value_before = None
             value_after  = None
 
@@ -99,23 +104,30 @@ class SuggestionGenerator:
                     value_before = f"{float(kw.current_bid):.0f}₽"
                 if rec_bid:
                     value_after = f"{rec_bid:.0f}₽"
+
             elif sig_type == "epk_bid_collapse":
                 value_before = "ЕПК (автоснижение ставок)"
                 value_after  = "Ручное восстановление / перевод на ТГК"
+
             elif sig_type in ("zero_ctr", "low_ctr"):
                 value_before = "Текущее объявление"
                 value_after  = "Новый вариант с УТП"
-            elif sig_type in ("high_bounce_rate", "low_page_depth", "low_visit_duration"):
+
+            elif sig_type in ("high_bounce_rate", "low_page_depth",
+                               "low_visit_duration"):
                 value_before = "Текущая посадочная"
                 value_after  = "Оптимизация посадочной"
+
             elif sig_type == "mobile_quality_issue":
                 value_before = "Нет корректировки на mobile"
                 value_after  = "Корректировка ставок -50% на mobile"
 
+            # Составить ключ для дедупликации
             dedup_key = (entity_id, change_type)
             if dedup_key in existing_keys:
                 continue
 
+            # Собрать полное обоснование
             rationale_parts = [description]
             if hypothesis:
                 rationale_parts.append(f"Гипотеза: {hypothesis}")
@@ -151,21 +163,25 @@ class SuggestionGenerator:
     async def generate_scale_suggestions(
         self, analysis: AnalysisResult
     ) -> list[Suggestion]:
-        """Предложения масштабирования из analysis.opportunities (S-050)."""
+        """
+        Предложения масштабирования из analysis.opportunities.
+        Создаёт записи для точек роста (S-050 scale_opportunity).
+        """
         if not analysis.opportunities:
             return []
 
         suggestions = []
         for opp in analysis.opportunities:
-            kw_id    = opp.get("keyword_id")
-            phrase   = opp.get("phrase") or ""
-            rec_bid  = opp.get("recommended_bid")
-            action   = opp.get("action", "")
+            kw_id   = opp.get("keyword_id")
+            phrase  = opp.get("phrase") or ""
+            rec_bid = opp.get("recommended_bid")
+            action  = opp.get("action", "")
             expected = opp.get("expected_outcome", "")
 
             if not kw_id:
                 continue
 
+            # Проверяем нет ли уже такого
             existing_q = await self.db.execute(
                 select(Suggestion).where(
                     and_(
@@ -186,6 +202,9 @@ class SuggestionGenerator:
             if not kw:
                 continue
 
+            value_before = f"{float(kw.current_bid):.0f}₽" if kw.current_bid else None
+            value_after  = f"{rec_bid:.0f}₽" if rec_bid else None
+
             s = Suggestion(
                 account_id=self.account_id,
                 analysis_id=analysis.id,
@@ -193,8 +212,8 @@ class SuggestionGenerator:
                 object_id=kw_id,
                 object_name=phrase,
                 change_type="bid_raise",
-                value_before=f"{float(kw.current_bid):.0f}₽" if kw.current_bid else None,
-                value_after=f"{rec_bid:.0f}₽" if rec_bid else None,
+                value_before=value_before,
+                value_after=value_after,
                 rationale=(
                     f"Точка роста: CTR {opp.get('metric_value', 0):.1f}%"
                     f" при {opp.get('clicks', 0)} кликах. {action}"
