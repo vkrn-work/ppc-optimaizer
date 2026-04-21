@@ -324,7 +324,13 @@ async def trigger_sync(
     label = "ретроспективных данных" if days > 28 else "данных"
     return {"status": "started", "message": f"Сбор {label} запущен для кабинета '{account.name}' за {days} дней"}
 
-
+@router.post("/accounts/{account_id}/run-analysis")
+async def trigger_analysis(account_id: int, db: AsyncSession = Depends(get_db)):
+    """Перезапуск анализа на существующих данных (без сбора из API)"""
+    from app.core.tasks import run_analysis
+    run_analysis.delay(account_id)
+    return {"status": "started"}
+      
 # ─── Daily Stats (эндпоинты для графиков по произвольному диапазону) ──────────
 
 @router.get("/accounts/{account_id}/daily-stats")
