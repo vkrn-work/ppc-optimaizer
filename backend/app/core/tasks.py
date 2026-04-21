@@ -399,7 +399,6 @@ async def _enrich_sessions(db, account_id, kw_metrika: list, date_from, date_to)
     """
     from sqlalchemy import select, update, and_
     from app.models.models import Keyword, KeywordStat
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     enriched = 0
     for row in kw_metrika:
@@ -412,9 +411,9 @@ async def _enrich_sessions(db, account_id, kw_metrika: list, date_from, date_to)
             select(Keyword).where(
                 Keyword.account_id == account_id,
                 Keyword.phrase == utm_term,
-            )
+            ).limit(1)
         )
-        kw = kw_res.scalar_one_or_none()
+        kw = kw_res.scalars().first()
         if not kw:
             continue
 
