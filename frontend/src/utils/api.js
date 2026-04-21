@@ -19,6 +19,7 @@ export const api = {
   deleteAccount: (id) => req(`/accounts/${id}`, { method: 'DELETE' }),
   triggerSync: (id) => req(`/accounts/${id}/sync`, { method: 'POST' }),
   triggerHistoricalSync: (id, days = 90) => req(`/accounts/${id}/sync?days=${days}`, { method: 'POST' }),
+  runAnalysis: (id) => api.get(`/accounts/${id}/run-analysis`),
 
   // period: yesterday | 3d | week | month
   // или custom: date_from=YYYY-MM-DD&date_to=YYYY-MM-DD&compare_from=YYYY-MM-DD&compare_to=YYYY-MM-DD
