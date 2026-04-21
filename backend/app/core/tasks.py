@@ -1,5 +1,9 @@
 """
 Celery задачи — сбор данных, анализ, трекинг гипотез.
+
+Изменения v1.2:
+  - Сохранение WeightedImpressions, WeightedCtr, BounceRate в keyword_stats
+  - После сбора Метрики — обогащение sessions по utm_term в keyword_stats
 """
 import asyncio
 import logging
@@ -18,7 +22,6 @@ def run_async(coro):
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-
     if loop.is_running():
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as pool:
@@ -32,11 +35,10 @@ def get_sync_db():
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
     from app.core.config import settings
-
     sync_url = settings.DATABASE_URL.replace(
         "postgresql+asyncpg://", "postgresql://"
     )
-    engine = create_engine(sync_url, pool_pre_ping=True)
+    engine  = create_engine(sync_url, pool_pre_ping=True)
     Session = sessionmaker(bind=engine)
     return Session(), engine
 
@@ -60,18 +62,13 @@ def collect_and_analyze_all(self):
 
 @celery_app.task(name="app.core.tasks.collect_account_data", bind=True, max_retries=3)
 def collect_account_data(self, account_id: int, days: int = 28):
-    """
-    Собрать данные из Директа и Метрики для одного кабинета.
-    days: за сколько дней собирать статистику (28 по умолчанию, 90 для истории).
-    """
-    import asyncio as _asyncio
-    loop = _asyncio.new_event_loop()
-    _asyncio.set_event_loop(loop)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(_collect_account_data_async(account_id, days=days))
     finally:
         loop.close()
-        _asyncio.set_event_loop(None)
+        asyncio.set_event_loop(None)
 
 
 async def _collect_account_data_async(account_id: int, days: int = 28):
@@ -88,25 +85,29 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
 
     try:
         async with AsyncSessionLocal() as db:
-            acc_result = await db.execute(select(Account).where(Account.id == account_id))
+            acc_result = await db.execute(
+                select(Account).where(Account.id == account_id)
+            )
             account = acc_result.scalar_one_or_none()
             if not account or not account.oauth_token:
                 logger.error(f"Account {account_id} not found or no token")
                 return
 
-            date_to = date.today()
+            date_to   = date.today()
             date_from = date_to - timedelta(days=days)
-            logger.info(f"Collecting account {account_id} for {days} days: {date_from} — {date_to}")
+            logger.info(
+                f"Collecting account {account_id} for {days} days:"
+                f" {date_from} — {date_to}"
+            )
 
-            # ── Сбор из Директа ──────────────────────────────────────────
-            async with YandexDirectCollector(account.oauth_token, account.yandex_login) as dc:
+            # ── Директ: кампании, группы, ключи ─────────────────────────
+            async with YandexDirectCollector(
+                account.oauth_token, account.yandex_login
+            ) as dc:
                 campaigns_data = await dc.get_campaigns()
-                logger.info(f"Campaigns from Yandex Direct: {len(campaigns_data)}")
+                logger.info(f"Campaigns: {len(campaigns_data)}")
 
                 for c in campaigns_data:
-                    # ВАЖНО: запрос фильтрует States:ON + Statuses:ACCEPTED,
-                    # значит все пришедшие кампании уже активны.
-                    # is_active=c.get("Status")=="ON" — это БАГ (Status != State).
                     strategy = c.get("_strategy", "UNKNOWN")
                     stmt = insert(Campaign).values(
                         account_id=account_id,
@@ -115,7 +116,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                         campaign_type=c.get("Type", ""),
                         status=c.get("Status", ""),
                         strategy_type=strategy,
-                        is_active=True,  # все из этого запроса активны
+                        is_active=True,
                     ).on_conflict_do_update(
                         index_elements=["account_id", "direct_id"],
                         set_={
@@ -129,254 +130,296 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                 await db.commit()
 
                 campaign_ids = [str(c["Id"]) for c in campaigns_data]
-                if campaign_ids:
-                    # Группы
-                    groups_data = []
-                    for i in range(0, len(campaign_ids), 10):
-                        batch = campaign_ids[i:i+10]
-                        batch_result = await dc.get_ad_groups(batch)
-                        groups_data.extend(batch_result)
-                    logger.info(f"AdGroups: {len(groups_data)}")
-                    for g in groups_data:
-                        camp_result = await db.execute(
-                            select(Campaign).where(
-                                Campaign.account_id == account_id,
-                                Campaign.direct_id == str(g["CampaignId"]),
-                            )
-                        )
-                        camp = camp_result.scalar_one_or_none()
-                        if not camp:
-                            continue
-                        stmt = insert(AdGroup).values(
-                            account_id=account_id,
-                            campaign_id=camp.id,
-                            direct_id=str(g["Id"]),
-                            name=g.get("Name", ""),
-                            status=g.get("Status", ""),
-                        ).on_conflict_do_update(
-                            index_elements=["account_id", "direct_id"],
-                            set_={"name": g.get("Name", ""), "status": g.get("Status", "")},
-                        )
-                        await db.execute(stmt)
-                    await db.commit()
+                if not campaign_ids:
+                    return
 
-                    # Ключи
-                    keywords_data = []
-                    for i in range(0, len(campaign_ids), 10):
-                        batch = campaign_ids[i:i+10]
-                        batch_result = await dc.get_keywords(batch)
-                        keywords_data.extend(batch_result)
-                    logger.info(f"Keywords: {len(keywords_data)}")
-                    for kw in keywords_data:
-                        group_result = await db.execute(
-                            select(AdGroup).where(
-                                AdGroup.account_id == account_id,
-                                AdGroup.direct_id == str(kw["AdGroupId"]),
-                            )
+                # Группы
+                groups_data = []
+                for i in range(0, len(campaign_ids), 10):
+                    batch = campaign_ids[i:i+10]
+                    groups_data.extend(await dc.get_ad_groups(batch))
+                logger.info(f"AdGroups: {len(groups_data)}")
+                for g in groups_data:
+                    camp_res = await db.execute(
+                        select(Campaign).where(
+                            Campaign.account_id == account_id,
+                            Campaign.direct_id == str(g["CampaignId"]),
                         )
-                        group = group_result.scalar_one_or_none()
-                        if not group:
+                    )
+                    camp = camp_res.scalar_one_or_none()
+                    if not camp:
+                        continue
+                    stmt = insert(AdGroup).values(
+                        account_id=account_id,
+                        campaign_id=camp.id,
+                        direct_id=str(g["Id"]),
+                        name=g.get("Name", ""),
+                        status=g.get("Status", ""),
+                    ).on_conflict_do_update(
+                        index_elements=["account_id", "direct_id"],
+                        set_={"name": g.get("Name", ""), "status": g.get("Status", "")},
+                    )
+                    await db.execute(stmt)
+                await db.commit()
+
+                # Ключи
+                keywords_data = []
+                for i in range(0, len(campaign_ids), 10):
+                    batch = campaign_ids[i:i+10]
+                    keywords_data.extend(await dc.get_keywords(batch))
+                logger.info(f"Keywords: {len(keywords_data)}")
+                for kw in keywords_data:
+                    group_res = await db.execute(
+                        select(AdGroup).where(
+                            AdGroup.account_id == account_id,
+                            AdGroup.direct_id == str(kw["AdGroupId"]),
+                        )
+                    )
+                    group = group_res.scalar_one_or_none()
+                    if not group:
+                        continue
+                    bid = kw.get("Bid")
+                    bid_rub = float(bid) / 1_000_000 if bid and float(bid) > 0 else None
+                    stmt = insert(Keyword).values(
+                        account_id=account_id,
+                        ad_group_id=group.id,
+                        direct_id=str(kw["Id"]),
+                        phrase=kw.get("Keyword", ""),
+                        current_bid=bid_rub,
+                        status=kw.get("Status", "ACTIVE"),
+                    ).on_conflict_do_update(
+                        index_elements=["account_id", "direct_id"],
+                        set_={
+                            "phrase": kw.get("Keyword", ""),
+                            "current_bid": bid_rub,
+                            "status": kw.get("Status", "ACTIVE"),
+                        },
+                    )
+                    await db.execute(stmt)
+                await db.commit()
+
+                # Статистика ключей — с новыми полями v1.2
+                stats_data = await dc.get_keyword_stats(date_from, date_to)
+                logger.info(f"Keyword stats rows: {len(stats_data)}")
+                saved_stats = 0
+
+                def safe_float(v):
+                    try:
+                        r = float(v)
+                        return r if r > 0 else None
+                    except Exception:
+                        return None
+
+                def safe_int(v):
+                    try:
+                        r = int(float(v))
+                        return r if r > 0 else None
+                    except Exception:
+                        return None
+
+                for row in stats_data:
+                    kw_res = await db.execute(
+                        select(Keyword).where(
+                            Keyword.account_id == account_id,
+                            Keyword.direct_id == str(row.get("CriterionId", "")),
+                        )
+                    )
+                    kw = kw_res.scalar_one_or_none()
+                    if not kw:
+                        continue
+                    try:
+                        stat_date   = datetime.strptime(row["Date"], "%Y-%m-%d")
+                        clicks      = int(float(row.get("Clicks", 0) or 0))
+                        impressions = int(float(row.get("Impressions", 0) or 0))
+                        spend       = float(row.get("Cost", 0) or 0)
+                        if clicks == 0 and impressions == 0:
                             continue
-                        bid = kw.get("Bid")
-                        # Bid приходит в микрорублях (1 руб = 1_000_000 микрорублей)
-                        bid_rub = float(bid) / 1_000_000 if bid and float(bid) > 0 else None
-                        stmt = insert(Keyword).values(
+
+                        ctr_val     = safe_float(row.get("Ctr"))
+                        avg_bid_raw = safe_float(row.get("AvgEffectiveBid"))
+                        avg_bid_rub = avg_bid_raw / 1_000_000 if avg_bid_raw else None
+                        avg_cpc_val = safe_float(row.get("AvgCpc"))
+                        w_ctr       = safe_float(row.get("WeightedCtr"))
+
+                        br_raw = row.get("BounceRate", "")
+                        bounce_rate_val = safe_float(br_raw) if br_raw != "--" else None
+
+                        stmt = insert(KeywordStat).values(
                             account_id=account_id,
-                            ad_group_id=group.id,
-                            direct_id=str(kw["Id"]),
-                            phrase=kw.get("Keyword", ""),
-                            current_bid=bid_rub,
-                            status=kw.get("Status", "ACTIVE"),
+                            keyword_id=kw.id,
+                            date=stat_date,
+                            impressions=impressions,
+                            clicks=clicks,
+                            spend=spend,
+                            ctr=ctr_val,
+                            avg_cpc=avg_cpc_val,
+                            avg_bid=avg_bid_rub,
+                            avg_position=safe_float(row.get("AvgImpressionPosition")),
+                            avg_click_position=safe_float(row.get("AvgClickPosition")),
+                            traffic_volume=safe_int(row.get("AvgTrafficVolume")),
+                            # ── Новые поля v1.2 ────────────────────────
+                            weighted_impressions=safe_int(row.get("WeightedImpressions")),
+                            weighted_ctr=w_ctr,
+                            bounce_rate=bounce_rate_val,
                         ).on_conflict_do_update(
-                            index_elements=["account_id", "direct_id"],
+                            index_elements=["account_id", "keyword_id", "date"],
                             set_={
-                                "phrase": kw.get("Keyword", ""),
-                                "current_bid": bid_rub,
-                                "status": kw.get("Status", "ACTIVE"),
+                                "clicks": clicks,
+                                "spend": spend,
+                                "impressions": impressions,
+                                "ctr": ctr_val,
+                                "avg_cpc": avg_cpc_val,
+                                "avg_bid": avg_bid_rub,
+                                "avg_position": safe_float(row.get("AvgImpressionPosition")),
+                                "avg_click_position": safe_float(row.get("AvgClickPosition")),
+                                "traffic_volume": safe_int(row.get("AvgTrafficVolume")),
+                                "weighted_impressions": safe_int(row.get("WeightedImpressions")),
+                                "weighted_ctr": w_ctr,
+                                "bounce_rate": bounce_rate_val,
                             },
                         )
                         await db.execute(stmt)
-                    await db.commit()
+                        saved_stats += 1
+                    except (ValueError, KeyError) as e:
+                        logger.warning(f"Error parsing stat row: {e} | row={row}")
+                await db.commit()
+                logger.info(f"Stats saved: {saved_stats} rows for account {account_id}")
 
-                    # Объявления
-                    for i in range(0, len(campaign_ids), 10):
-                        batch = campaign_ids[i:i+10]
-                        try:
-                            await dc.get_ads(batch)
-                        except Exception as e:
-                            logger.warning(f"Ads collection error: {e}")
-
-                    # Статистика по ключам
-                    stats_data = await dc.get_keyword_stats(date_from, date_to)
-                    logger.info(f"Keyword stats rows: {len(stats_data)}")
-                    saved_stats = 0
-                    for row in stats_data:
-                        kw_result = await db.execute(
-                            select(Keyword).where(
-                                Keyword.account_id == account_id,
-                                Keyword.direct_id == str(row.get("CriterionId", "")),
-                            )
-                        )
-                        kw = kw_result.scalar_one_or_none()
-                        if not kw:
-                            continue
-                        try:
-                            stat_date = datetime.strptime(row["Date"], "%Y-%m-%d")
-                            clicks = int(float(row.get("Clicks", 0) or 0))
-                            spend = float(row.get("Cost", 0) or 0)
-                            impressions = int(float(row.get("Impressions", 0) or 0))
-                            if clicks == 0 and impressions == 0:
-                                continue
-
-                            def safe_float(v):
-                                try:
-                                    r = float(v)
-                                    return r if r > 0 else None
-                                except:
-                                    return None
-
-                            def safe_int(v):
-                                try:
-                                    r = int(float(v))
-                                    return r if r > 0 else None
-                                except:
-                                    return None
-
-                            # CTR приходит в процентах ("5.23")
-                            ctr_val = safe_float(row.get("Ctr"))
-                            # AvgEffectiveBid приходит в микрорублях — конвертируем
-                            avg_bid_raw = safe_float(row.get("AvgEffectiveBid"))
-                            avg_bid_rub = avg_bid_raw / 1_000_000 if avg_bid_raw else None
-                            # AvgCpc уже в рублях
-                            avg_cpc_val = safe_float(row.get("AvgCpc"))
-
-                            stmt = insert(KeywordStat).values(
-                                account_id=account_id,
-                                keyword_id=kw.id,
-                                date=stat_date,
-                                impressions=impressions,
-                                clicks=clicks,
-                                spend=spend,
-                                avg_cpc=avg_cpc_val,
-                                avg_bid=avg_bid_rub,
-                                traffic_volume=safe_int(row.get("AvgTrafficVolume")),
-                                avg_position=safe_float(row.get("AvgImpressionPosition")),
-                                avg_click_position=safe_float(row.get("AvgClickPosition")),
-                                ctr=ctr_val,
-                            ).on_conflict_do_update(
-                                index_elements=["account_id", "keyword_id", "date"],
-                                set_={
-                                    "clicks": clicks,
-                                    "spend": spend,
-                                    "impressions": impressions,
-                                    "ctr": ctr_val,
-                                    "avg_cpc": avg_cpc_val,
-                                    "avg_bid": avg_bid_rub,
-                                    "avg_position": safe_float(row.get("AvgImpressionPosition")),
-                                    "avg_click_position": safe_float(row.get("AvgClickPosition")),
-                                    "traffic_volume": safe_int(row.get("AvgTrafficVolume")),
-                                },
-                            )
-                            await db.execute(stmt)
-                            saved_stats += 1
-                        except (ValueError, KeyError) as e:
-                            logger.warning(f"Error parsing stat row: {e} | row={row}")
-                    await db.commit()
-                    logger.info(f"Stats saved: {saved_stats} rows for account {account_id}")
-
-            # ── Сбор поисковых запросов ──────────────────────────────────
-            async with YandexDirectCollector(account.oauth_token, account.yandex_login) as dc2:
+                # Поисковые запросы
                 try:
                     from app.models.models import SearchQuery
-                    sq_data = await dc2.get_search_queries(date_from, date_to)
-                    logger.info(f"Search queries for account {account_id}: {len(sq_data)} rows")
+                    sq_data = await dc.get_search_queries(date_from, date_to)
+                    logger.info(f"Search queries: {len(sq_data)}")
                     for row in sq_data:
                         try:
-                            sq_date = datetime.strptime(row["Date"], "%Y-%m-%d")
+                            sq_date  = datetime.strptime(row["Date"], "%Y-%m-%d")
                             sq_clicks = int(float(row.get("Clicks", 0) or 0))
-                            sq_impressions = int(float(row.get("Impressions", 0) or 0))
-                            if sq_clicks == 0 and sq_impressions == 0:
+                            sq_impr   = int(float(row.get("Impressions", 0) or 0))
+                            if sq_clicks == 0 and sq_impr == 0:
                                 continue
-                            kw_result = await db.execute(
+                            kw_res = await db.execute(
                                 select(Keyword).where(
                                     Keyword.account_id == account_id,
                                     Keyword.direct_id == str(row.get("CriterionId", "")),
                                 )
                             )
-                            kw = kw_result.scalar_one_or_none()
-                            camp_result = await db.execute(
+                            kw_sq  = kw_res.scalar_one_or_none()
+                            cp_res = await db.execute(
                                 select(Campaign).where(
                                     Campaign.account_id == account_id,
                                     Campaign.direct_id == str(row.get("CampaignId", "")),
                                 )
                             )
-                            camp = camp_result.scalar_one_or_none()
-                            ag_result = await db.execute(
+                            cp  = cp_res.scalar_one_or_none()
+                            ag_res = await db.execute(
                                 select(AdGroup).where(
                                     AdGroup.account_id == account_id,
                                     AdGroup.direct_id == str(row.get("AdGroupId", "")),
                                 )
                             )
-                            ag = ag_result.scalar_one_or_none()
-
-                            def safe_float(v):
-                                try: return float(v) or None
-                                except: return None
-
-                            sq = SearchQuery(
+                            ag = ag_res.scalar_one_or_none()
+                            db.add(SearchQuery(
                                 account_id=account_id,
-                                keyword_id=kw.id if kw else None,
+                                keyword_id=kw_sq.id if kw_sq else None,
                                 date=sq_date,
                                 query=row.get("Query", ""),
                                 keyword_phrase=row.get("Criterion", ""),
                                 match_type=row.get("MatchType", ""),
-                                campaign_id=camp.id if camp else None,
+                                campaign_id=cp.id if cp else None,
                                 ad_group_id=ag.id if ag else None,
-                                impressions=sq_impressions,
+                                impressions=sq_impr,
                                 clicks=sq_clicks,
                                 spend=float(row.get("Cost", 0) or 0),
                                 ctr=safe_float(row.get("Ctr")),
                                 avg_cpc=safe_float(row.get("AvgCpc")),
                                 avg_position=safe_float(row.get("AvgImpressionPosition")),
                                 avg_click_position=safe_float(row.get("AvgClickPosition")),
-                            )
-                            db.add(sq)
+                            ))
                         except Exception as e:
                             logger.warning(f"Error saving search query: {e}")
                     await db.commit()
-                    logger.info(f"Search queries saved for account {account_id}")
                 except Exception as e:
                     logger.warning(f"Search queries collection failed: {e}")
 
-            # ── Сбор из Метрики ──────────────────────────────────────────
+            # ── Метрика ──────────────────────────────────────────────────
             if account.metrika_counter_id:
                 try:
                     from app.models.models import MetrikaSnapshot
-                    async with MetrikaCollector(account.oauth_token, account.metrika_counter_id) as mc:
+                    async with MetrikaCollector(
+                        account.oauth_token, account.metrika_counter_id
+                    ) as mc:
                         metrika_data = await mc.collect_all(date_from, date_to)
                         logger.info(
-                            f"Metrika collected for account {account_id}: "
-                            f"visits={metrika_data.get('summary', {}).get('visits', 0)}, "
-                            f"days={len(metrika_data.get('by_day', []))}"
+                            f"Metrika collected: visits="
+                            f"{metrika_data.get('summary', {}).get('visits', 0)}"
                         )
-                        snapshot = MetrikaSnapshot(
+                        snap = MetrikaSnapshot(
                             account_id=account_id,
                             date=datetime.utcnow(),
                             data=metrika_data,
                         )
-                        db.add(snapshot)
+                        db.add(snap)
                         await db.commit()
+
+                        # ── Обогащение sessions в keyword_stats ───────────
+                        kw_data = metrika_data.get("keywords", [])
+                        if kw_data:
+                            await _enrich_sessions(
+                                db, account_id, kw_data, date_from, date_to
+                            )
                 except Exception as e:
-                    logger.warning(f"Metrika collection failed for account {account_id}: {e}")
+                    logger.warning(f"Metrika collection failed: {e}")
 
             account.last_sync_at = datetime.utcnow()
             await db.commit()
             logger.info(f"Data collection complete for account {account_id}")
 
         run_analysis.delay(account_id)
-
     finally:
         await engine.dispose()
+
+
+async def _enrich_sessions(db, account_id, kw_metrika: list, date_from, date_to):
+    """
+    Обогащает keyword_stats полем sessions из данных Метрики.
+    Матчинг: utm_term (Метрика) == keyword.phrase (Директ).
+    """
+    from sqlalchemy import select, update, and_
+    from app.models.models import Keyword, KeywordStat
+
+    enriched = 0
+    for row in kw_metrika:
+        utm_term = row.get("UTMTerm") or row.get("UTMMedium") or ""
+        visits   = int(row.get("visits", 0) or 0)
+        if not utm_term or visits == 0:
+            continue
+
+        kw_res = await db.execute(
+            select(Keyword).where(
+                Keyword.account_id == account_id,
+                Keyword.phrase == utm_term,
+            )
+        )
+        kw = kw_res.scalar_one_or_none()
+        if not kw:
+            continue
+
+        await db.execute(
+            update(KeywordStat)
+            .where(and_(
+                KeywordStat.account_id == account_id,
+                KeywordStat.keyword_id == kw.id,
+                KeywordStat.date >= datetime.combine(date_from, datetime.min.time()),
+                KeywordStat.date <= datetime.combine(date_to, datetime.min.time()),
+                KeywordStat.sessions == None,
+            ))
+            .values(sessions=visits)
+        )
+        enriched += 1
+
+    await db.commit()
+    if enriched:
+        logger.info(f"Sessions enriched for {enriched} keywords, account {account_id}")
 
 
 @celery_app.task(name="app.core.tasks.run_analysis", bind=True, max_retries=2)
@@ -401,16 +444,14 @@ async def _run_analysis_async(account_id: int):
 
     try:
         async with AsyncSessionLocal() as db:
-            analyzer = CRAnalyzer(db, account_id)
-            analysis = await analyzer.run_full_analysis()
-
-            generator = SuggestionGenerator(db, account_id)
+            analyzer    = CRAnalyzer(db, account_id)
+            analysis    = await analyzer.run_full_analysis()
+            generator   = SuggestionGenerator(db, account_id)
             suggestions = await generator.generate_for_analysis(analysis)
-            scale_suggestions = await generator.generate_scale_suggestions(analysis)
-
+            scale_s     = await generator.generate_scale_suggestions(analysis)
             logger.info(
-                f"Analysis complete for account {account_id}: "
-                f"{len(suggestions) + len(scale_suggestions)} suggestions generated"
+                f"Analysis done for account {account_id}:"
+                f" {len(suggestions) + len(scale_s)} suggestions"
             )
             return analysis.id
     finally:
@@ -439,13 +480,10 @@ async def _track_all_hypotheses_async():
 
     try:
         async with AsyncSessionLocal() as db:
-            now = datetime.utcnow()
+            now    = datetime.utcnow()
             result = await db.execute(
                 select(Hypothesis).where(
-                    and_(
-                        Hypothesis.track_until >= now,
-                        Hypothesis.verdict == None,
-                    )
+                    and_(Hypothesis.track_until >= now, Hypothesis.verdict == None)
                 )
             )
             hypotheses = result.scalars().all()
@@ -478,8 +516,10 @@ async def _track_hypothesis_async(hypothesis_id: int):
 
     try:
         async with AsyncSessionLocal() as db:
-            h_result = await db.execute(select(Hypothesis).where(Hypothesis.id == hypothesis_id))
-            hypothesis = h_result.scalar_one_or_none()
+            h_res = await db.execute(
+                select(Hypothesis).where(Hypothesis.id == hypothesis_id)
+            )
+            hypothesis = h_res.scalar_one_or_none()
             if not hypothesis:
                 return
 
@@ -487,57 +527,60 @@ async def _track_hypothesis_async(hypothesis_id: int):
             if now < hypothesis.track_until:
                 return
 
-            s_result = await db.execute(
+            s_res = await db.execute(
                 select(Suggestion).where(Suggestion.id == hypothesis.suggestion_id)
             )
-            suggestion = s_result.scalar_one_or_none()
+            suggestion = s_res.scalar_one_or_none()
             if not suggestion or suggestion.object_type != "keyword":
                 return
 
             keyword_id = suggestion.object_id
             applied_at = hypothesis.applied_at
-            before_start = applied_at - timedelta(days=7)
-            after_end = applied_at + timedelta(days=7)
 
             async def get_stats(start, end):
-                result = await db.execute(
+                res = await db.execute(
                     select(
                         func.sum(KeywordStat.clicks).label("clicks"),
                         func.sum(KeywordStat.spend).label("spend"),
-                    ).where(
-                        and_(
-                            KeywordStat.keyword_id == keyword_id,
-                            KeywordStat.date >= start,
-                            KeywordStat.date <= end,
-                        )
-                    )
+                        func.avg(KeywordStat.avg_position).label("avg_position"),
+                        func.avg(KeywordStat.ctr).label("ctr"),
+                    ).where(and_(
+                        KeywordStat.keyword_id == keyword_id,
+                        KeywordStat.date >= start,
+                        KeywordStat.date <= end,
+                    ))
                 )
-                row = result.one()
-                return {"clicks": int(row.clicks or 0), "spend": float(row.spend or 0)}
+                row = res.one()
+                return {
+                    "clicks":       int(row.clicks or 0),
+                    "spend":        float(row.spend or 0),
+                    "avg_position": round(float(row.avg_position), 2) if row.avg_position else None,
+                    "ctr":          round(float(row.ctr), 2) if row.ctr else None,
+                }
 
-            before_stats = await get_stats(before_start, applied_at)
-            after_stats = await get_stats(applied_at, after_end)
+            before = await get_stats(applied_at - timedelta(days=7), applied_at)
+            after  = await get_stats(applied_at, applied_at + timedelta(days=7))
 
-            hypothesis.metrics_before = before_stats
-            hypothesis.metrics_after = after_stats
+            hypothesis.metrics_before = before
+            hypothesis.metrics_after  = after
 
-            if before_stats["clicks"] < 10 or after_stats["clicks"] < 10:
+            if before["clicks"] < 10 or after["clicks"] < 10:
                 hypothesis.verdict = "insufficient"
-                hypothesis.report = "Недостаточно кликов для статистически значимого вывода."
+                hypothesis.report  = "Недостаточно кликов для статистически значимого вывода."
             else:
-                delta = (after_stats["clicks"] - before_stats["clicks"]) / before_stats["clicks"] * 100
+                delta = (after["clicks"] - before["clicks"]) / before["clicks"] * 100
                 hypothesis.delta_percent = round(delta, 2)
                 if delta >= 10:
                     hypothesis.verdict = "confirmed"
-                    hypothesis.report = f"Гипотеза подтверждена. Трафик вырос на {delta:.1f}%."
+                    hypothesis.report  = f"Гипотеза подтверждена. Трафик вырос на {delta:.1f}%."
                 elif delta <= -10:
                     hypothesis.verdict = "rejected"
-                    hypothesis.report = f"Гипотеза отклонена. Трафик упал на {abs(delta):.1f}%."
+                    hypothesis.report  = f"Гипотеза отклонена. Трафик упал на {abs(delta):.1f}%."
                 else:
                     hypothesis.verdict = "neutral"
-                    hypothesis.report = f"Изменение нейтральное ({delta:+.1f}%). Продолжить наблюдение."
+                    hypothesis.report  = f"Изменение нейтральное ({delta:+.1f}%). Продолжить наблюдение."
 
             await db.commit()
-            logger.info(f"Hypothesis {hypothesis_id} tracked: {hypothesis.verdict}")
+            logger.info(f"Hypothesis {hypothesis_id} → {hypothesis.verdict}")
     finally:
         await engine.dispose()
