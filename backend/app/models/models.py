@@ -374,7 +374,10 @@ class Suggestion(Base):
     applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     analysis: Mapped["AnalysisResult"] = relationship(back_populates="suggestions")
-    hypothesis: Mapped[Optional["Hypothesis"]] = relationship(back_populates="suggestion")
+    hypothesis: Mapped[Optional["Hypothesis"]] = relationship(
+        back_populates="suggestion",
+        foreign_keys="Hypothesis.suggestion_id",
+    )
 
 
 class Hypothesis(Base):
@@ -383,7 +386,10 @@ class Hypothesis(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int] = mapped_column(Integer, index=True)
-    suggestion_id: Mapped[int] = mapped_column(ForeignKey("suggestions.id"), unique=True)
+    # suggestion_id nullable — гипотезы могут создаваться вручную без предложения
+    suggestion_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("suggestions.id"), unique=True, nullable=True
+    )
     applied_at: Mapped[datetime] = mapped_column(DateTime)
     track_until: Mapped[datetime] = mapped_column(DateTime)
     metrics_before: Mapped[Optional[dict]] = mapped_column(JSON)
@@ -403,4 +409,7 @@ class Hypothesis(Base):
     object_id: Mapped[Optional[int]] = mapped_column(Integer)
     source: Mapped[Optional[str]] = mapped_column(String(50))
 
-    suggestion: Mapped["Suggestion"] = relationship(back_populates="hypothesis")
+    suggestion: Mapped[Optional["Suggestion"]] = relationship(
+        back_populates="hypothesis",
+        foreign_keys=[suggestion_id],
+    )

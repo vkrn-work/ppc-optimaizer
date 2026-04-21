@@ -70,7 +70,12 @@ class YandexDirectCollector:
         raise DirectAPIError("Max retries exceeded")
 
     async def get_campaigns(self) -> list[dict]:
-        """Кампании с полными настройками включая тип стратегии"""
+        """Кампании с полными настройками включая тип стратегии.
+
+        Примечание: UnifiedAdCampaignFieldNames намеренно исключён —
+        API v5 возвращает ошибку 8000 на этот параметр.
+        ЕПК-кампании попадут в ветку else → strategy = UNKNOWN.
+        """
         result = await self._post("campaigns", "get", {
             "SelectionCriteria": {
                 "States": ["ON"],
@@ -83,14 +88,13 @@ class YandexDirectCollector:
             "TextCampaignFieldNames": ["BiddingStrategy"],
             "DynamicTextCampaignFieldNames": ["BiddingStrategy"],
             "SmartCampaignFieldNames": ["BiddingStrategy"],
-            "UnifiedAdCampaignFieldNames": ["BiddingStrategy"],
+            # UnifiedAdCampaignFieldNames убран — API 8000: неизвестный параметр
             "Page": {"Limit": 10000},
         })
         campaigns = result.get("Campaigns", [])
         for c in campaigns:
             strategy = "UNKNOWN"
-            for key in ["TextCampaign", "DynamicTextCampaign", "SmartCampaign",
-                        "UnifiedAdCampaign"]:
+            for key in ["TextCampaign", "DynamicTextCampaign", "SmartCampaign"]:
                 if key in c:
                     bs_str = str(c[key].get("BiddingStrategy", {}))
                     if "ManualCpc" in bs_str:
