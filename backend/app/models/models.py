@@ -6,6 +6,9 @@ v1.2 additions:
   - KeywordStat: weighted_impressions, weighted_ctr, bounce_rate, sessions
   - Campaign: epk_collapse_detected
   - HypothesisVerdict: neutral
+
+v2.0 additions:
+  - Account: analysis_config (JSONB для динамических порогов анализатора)
 """
 from datetime import datetime
 from decimal import Decimal
@@ -14,6 +17,7 @@ from sqlalchemy import (
     String, Integer, Numeric, Boolean, DateTime, Text, JSON,
     ForeignKey, UniqueConstraint, Index, Enum as SAEnum
 )
+from sqlalchemy.dialects.postgresql import JSONB  # <-- ДОБАВЛЕНО ДЛЯ analysis_config
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 import enum
 
@@ -39,6 +43,10 @@ class Account(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     target_cpl: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
     target_cpql: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    
+    # ── Настройки анализатора v2.0 ──────────────────────────────────────
+    analysis_config: Mapped[Optional[dict]] = mapped_column(JSONB, default={}, server_default='{}')
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     last_sync_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
