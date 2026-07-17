@@ -3,6 +3,11 @@ API routes — PPC Optimizer
 v1.2: добавлены новые метрики (bounce_rate, sessions, weighted_ctr),
       сигналы по кампаниям, расширенные поля ключей.
       Все эндпоинты v1 сохранены (daily-stats, custom date range и т.д.)
+
+CHANGED v1.3.0:
+  - GET /suggestions читает реальную таблицу suggestions (было: летучие p_0/o_1)
+  - POST /suggestions/{id}/action: числовой id, статус, Hypothesis со ссылкой
+  - h_status: убраны мёртвые ветки positive/negative
 """
 from datetime import datetime, date, timedelta
 from decimal import Decimal
@@ -26,7 +31,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── Helpers ────────────────────────────────────────────────────
 
 def period_dates(period: str, date_from: Optional[str] = None, date_to: Optional[str] = None,
                  compare_from: Optional[str] = None, compare_to: Optional[str] = None):
@@ -36,7 +41,6 @@ def period_dates(period: str, date_from: Optional[str] = None, date_to: Optional
     """
     today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Произвольный диапазон через date_from / date_to
     if date_from and date_to:
         try:
             curr_start = datetime.strptime(date_from, "%Y-%m-%d")
@@ -52,7 +56,6 @@ def period_dates(period: str, date_from: Optional[str] = None, date_to: Optional
         except ValueError:
             pass
 
-    # Preset period
     if period == "yesterday":
         curr_end   = today
         curr_start = today - timedelta(days=1)
@@ -78,11 +81,6 @@ def period_dates(period: str, date_from: Optional[str] = None, date_to: Optional
 
 async def agg_kw_stats(db, account_id: int, date_from: datetime, date_to: datetime,
                        campaign_id: Optional[int] = None) -> dict:
-    """
-    Агрегировать keyword_stats за период → сводные KPI.
-    Опционально фильтр по campaign_id.
-    v1.2: добавлены bounce_rate, sessions, weighted_ctr.
-    """
     conditions = [
         KeywordStat.account_id == account_id,
         KeywordStat.date >= date_from,
@@ -103,7 +101,6 @@ async def agg_kw_stats(db, account_id: int, date_from: datetime, date_to: dateti
         func.avg(KeywordStat.avg_position).label("avg_position"),
         func.avg(KeywordStat.avg_click_position).label("avg_click_position"),
         func.avg(KeywordStat.traffic_volume).label("avg_traffic_volume"),
-        # v1.2 fields
         func.avg(KeywordStat.bounce_rate).label("bounce_rate"),
         func.sum(KeywordStat.sessions).label("sessions"),
         func.avg(KeywordStat.weighted_ctr).label("weighted_ctr"),
@@ -113,9 +110,7 @@ async def agg_kw_stats(db, account_id: int, date_from: datetime, date_to: dateti
     clicks      = int(row.clicks or 0)
     impressions = int(row.impressions or 0)
     spend       = float(row.spend or 0)
-    # CPC = sum(spend)/sum(clicks) — правильный способ
     avg_cpc = round(spend / clicks, 2) if clicks > 0 else None
-    # CTR = sum(clicks)/sum(impressions)*100
     ctr     = round(clicks / impressions * 100, 2) if impressions > 0 else None
     return {
         "clicks":               clicks,
@@ -126,7 +121,6 @@ async def agg_kw_stats(db, account_id: int, date_from: datetime, date_to: dateti
         "avg_cpc":              avg_cpc,
         "avg_traffic_volume":   round(float(row.avg_traffic_volume)) if row.avg_traffic_volume else None,
         "ctr":                  ctr,
-        # v1.2
         "bounce_rate":          round(float(row.bounce_rate), 1) if row.bounce_rate else None,
         "sessions":             int(row.sessions or 0) if row.sessions else None,
         "weighted_ctr":         round(float(row.weighted_ctr), 2) if row.weighted_ctr else None,
@@ -141,7 +135,6 @@ def calc_delta(curr, prev, invert=False):
 
 
 def mk_kpi_block(curr_kpi: dict, prev_kpi: dict) -> dict:
-    """Собрать блок KPI с дельтами и предыдущими значениями."""
     def mk_delta(key, invert=False):
         d = calc_delta(curr_kpi.get(key), prev_kpi.get(key))
         if d is None:
@@ -157,7 +150,6 @@ def mk_kpi_block(curr_kpi: dict, prev_kpi: dict) -> dict:
         "avg_position":       {"value": curr_kpi["avg_position"],       "delta": mk_delta("avg_position", invert=True),       "prev": prev_kpi["avg_position"]},
         "avg_click_position": {"value": curr_kpi["avg_click_position"], "delta": mk_delta("avg_click_position", invert=True), "prev": prev_kpi["avg_click_position"]},
         "avg_traffic_volume": {"value": curr_kpi["avg_traffic_volume"], "delta": mk_delta("avg_traffic_volume"),               "prev": prev_kpi["avg_traffic_volume"]},
-        # v1.2
         "bounce_rate":        {"value": curr_kpi.get("bounce_rate"),  "delta": mk_delta("bounce_rate", invert=True), "prev": prev_kpi.get("bounce_rate")},
         "sessions":           {"value": curr_kpi.get("sessions"),     "delta": mk_delta("sessions"),                "prev": prev_kpi.get("sessions")},
         "weighted_ctr":       {"value": curr_kpi.get("weighted_ctr"), "delta": mk_delta("weighted_ctr"),             "prev": prev_kpi.get("weighted_ctr")},
@@ -166,7 +158,6 @@ def mk_kpi_block(curr_kpi: dict, prev_kpi: dict) -> dict:
 
 async def get_daily_series(db, account_id: int, date_from: datetime, date_to: datetime,
                             campaign_id: Optional[int] = None) -> list:
-    """Посуточная статистика за диапазон. Источник для спарклайнов и графиков."""
     conditions = [
         KeywordStat.account_id == account_id,
         KeywordStat.date >= date_from,
@@ -213,7 +204,7 @@ async def get_daily_series(db, account_id: int, date_from: datetime, date_to: da
     return rows
 
 
-# ─── Accounts ─────────────────────────────────────────────────────────────────
+# ─── Accounts ──────────────────────────────────────────────────
 
 class AccountCreate(BaseModel):
     name: str
@@ -330,8 +321,8 @@ async def trigger_analysis(account_id: int, db: AsyncSession = Depends(get_db)):
     from app.core.tasks import run_analysis
     run_analysis.delay(account_id)
     return {"status": "started"}
-      
-# ─── Daily Stats (эндпоинты для графиков по произвольному диапазону) ──────────
+
+# ─── Daily Stats ──────────────────────────────────────────────
 
 @router.get("/accounts/{account_id}/daily-stats")
 async def get_daily_stats(
@@ -340,10 +331,6 @@ async def get_daily_stats(
     date_to: str   = Query(..., description="YYYY-MM-DD"),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Посуточная статистика по всему кабинету за произвольный диапазон.
-    Используется для построения честных графиков и спарклайнов.
-    """
     try:
         dt_from = datetime.strptime(date_from, "%Y-%m-%d")
         dt_to   = datetime.strptime(date_to,   "%Y-%m-%d") + timedelta(days=1)
@@ -361,10 +348,6 @@ async def get_campaign_daily_stats(
     date_to: str   = Query(..., description="YYYY-MM-DD"),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Посуточная статистика конкретной кампании.
-    Используется для графика динамики на странице Кампании.
-    """
     try:
         dt_from = datetime.strptime(date_from, "%Y-%m-%d")
         dt_to   = datetime.strptime(date_to,   "%Y-%m-%d") + timedelta(days=1)
@@ -374,7 +357,7 @@ async def get_campaign_daily_stats(
     return {"campaign_id": campaign_id, "date_from": date_from, "date_to": date_to, "rows": rows}
 
 
-# ─── Dashboard ────────────────────────────────────────────────────────────────
+# ─── Dashboard ──────────────────────────────────────────────
 
 @router.get("/accounts/{account_id}/dashboard")
 async def get_dashboard(
@@ -425,12 +408,11 @@ async def get_dashboard(
         )
     )
 
-    # ── Метрика ──────────────────────────────────────────────────────────────
     metrika_result = await db.execute(
         select(MetrikaSnapshot)
         .where(MetrikaSnapshot.account_id == account_id)
         .order_by(desc(MetrikaSnapshot.date))
-        .limit(2)  # текущий и предыдущий для сравнения
+        .limit(2)
     )
     metrika_rows = metrika_result.scalars().all()
     metrika      = metrika_rows[0] if metrika_rows else None
@@ -456,7 +438,6 @@ async def get_dashboard(
         curr_duration = avg_f(period_by_day, "avgVisitDurationSeconds")
         curr_depth    = avg_f(period_by_day, "pageDepth")
 
-        # Если нет посуточных данных за выбранный период — берём из summary снапшота
         if not period_by_day:
             s = metrika.data.get("summary", {})
             curr_visits   = s.get("visits")
@@ -464,13 +445,11 @@ async def get_dashboard(
             curr_duration = s.get("avgVisitDurationSeconds")
             curr_depth    = s.get("pageDepth")
 
-        # Предыдущие значения — из предыдущего периода того же снапшота
         prev_visits   = sum_f(prev_by_day, "visits")   if prev_by_day else None
         prev_bounce   = avg_f(prev_by_day, "bounceRate") if prev_by_day else None
         prev_duration = avg_f(prev_by_day, "avgVisitDurationSeconds") if prev_by_day else None
         prev_depth    = avg_f(prev_by_day, "pageDepth") if prev_by_day else None
 
-        # Если предыдущих данных нет в текущем снапшоте — берём из предыдущего снапшота
         if metrika_prev and metrika_prev.data and not prev_by_day:
             ps = metrika_prev.data.get("summary", {})
             prev_visits   = ps.get("visits")
@@ -515,10 +494,8 @@ async def get_dashboard(
             "browsers":          metrika.data.get("browsers", [])[:10],
         }
 
-    # ── Посуточная статистика из real keyword_stats (честные спарклайны) ──────
     daily_stats = await get_daily_series(db, account_id, curr_start, curr_end)
 
-    # ── Топ кампании ──────────────────────────────────────────────────────────
     top_campaigns_q = await db.execute(
         select(
             Campaign.id, Campaign.name, Campaign.strategy_type, Campaign.direct_id,
@@ -579,7 +556,7 @@ async def get_dashboard(
     }
 
 
-# ─── Campaigns ────────────────────────────────────────────────────────────────
+# ─── Campaigns ──────────────────────────────────────────────
 
 @router.get("/accounts/{account_id}/campaigns")
 async def get_campaigns(
@@ -592,16 +569,6 @@ async def get_campaigns(
     compare_to:   Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Список кампаний со статистикой, дельтами и агрегированными сигналами.
-
-    Метрики per кампания:
-      clicks, impressions, spend, ctr, avg_cpc
-      avg_position, avg_click_position, traffic_volume
-      bounce_rate, sessions (v1.2)
-      delta_* — структуры {value, is_good} для фронтенда
-      signals_count, signals_critical, has_epk_collapse (v1.2)
-    """
     curr_start, curr_end, prev_start, prev_end = period_dates(
         period, date_from, date_to, compare_from, compare_to
     )
@@ -611,7 +578,6 @@ async def get_campaigns(
     campaigns_result = await db.execute(camp_q.order_by(Campaign.name))
     campaigns = campaigns_result.scalars().all()
 
-    # Вспомогательная функция для запроса статистики по периоду
     def make_stats_q(dt_from, dt_to):
         return (
             select(
@@ -642,7 +608,6 @@ async def get_campaigns(
     prev_q   = await db.execute(make_stats_q(prev_start, prev_end))
     prev_map = {r.id: r for r in prev_q}
 
-    # ── Сигналы из последнего анализа → группируем по campaign_id ────────────
     analysis_result = await db.execute(
         select(AnalysisResult)
         .where(AnalysisResult.account_id == account_id)
@@ -651,7 +616,6 @@ async def get_campaigns(
     )
     analysis = analysis_result.scalar_one_or_none()
 
-    # Маппинг keyword_id → campaign_id
     camp_by_kw: dict[int, int] = {}
     if analysis and analysis.problems:
         kw_ids_in_sigs = [p["keyword_id"] for p in analysis.problems if p.get("keyword_id")]
@@ -714,7 +678,6 @@ async def get_campaigns(
             "strategy_type": c.strategy_type,
             "status":       c.status,
             "is_active":    c.is_active,
-            # ── Текущие метрики ───────────────────────────────────────────────
             "spend":        round(sp, 2),
             "clicks":       cl,
             "impressions":  im,
@@ -723,23 +686,20 @@ async def get_campaigns(
             "avg_position": pos,
             "avg_click_position": cpos,
             "traffic_volume": traf,
-            "bounce_rate":  br,       # v1.2
-            "sessions":     sess,     # v1.2
-            # ── Предыдущие значения ───────────────────────────────────────────
+            "bounce_rate":  br,
+            "sessions":     sess,
             "prev_spend":       round(psp, 2),
             "prev_clicks":      pcl,
             "prev_impressions": pim,
             "prev_avg_cpc":     p_cpc,
             "prev_ctr":         p_ctr,
             "prev_avg_position": round(p_pos, 2) if p_pos else None,
-            # ── Дельты как объекты {value, is_good} ──────────────────────────
             "delta_spend":       d(sp,  psp, invert=True),
             "delta_clicks":      d(cl,  pcl),
             "delta_impressions": d(im,  pim),
             "delta_cpc":         d(cpc, p_cpc, invert=True),
             "delta_ctr":         d(ctr, p_ctr),
             "delta_position":    d(pos, p_pos, invert=True),
-            # ── Сигналы v1.2 ─────────────────────────────────────────────────
             "signals_count":    len(camp_signals),
             "signals_critical": signals_critical,
             "signals_warning":  sum(1 for sig in camp_signals if sig.get("severity") == "warning"),
@@ -747,7 +707,6 @@ async def get_campaigns(
             "top_signal":       camp_signals[0] if camp_signals else None,
         })
 
-    # Сортировка: сначала с критичными сигналами, потом по расходу
     result.sort(key=lambda x: (
         0 if x["signals_critical"] > 0 else (1 if x["signals_count"] > 0 else 2),
         -x["spend"]
@@ -755,7 +714,7 @@ async def get_campaigns(
     return result
 
 
-# ─── Ad Groups ────────────────────────────────────────────────────────────────
+# ─── Ad Groups ──────────────────────────────────────────────
 
 @router.get("/accounts/{account_id}/ad-groups")
 async def get_ad_groups(
@@ -764,7 +723,6 @@ async def get_ad_groups(
     period: str = Query("week"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Группы объявлений с базовой статистикой"""
     curr_start, curr_end, _, _ = period_dates(period)
     q = select(AdGroup).where(AdGroup.account_id == account_id)
     if campaign_id:
@@ -775,7 +733,6 @@ async def get_ad_groups(
     if not group_ids:
         return []
 
-    # Статистика по группам через ключи
     stats_q = await db.execute(
         select(
             Keyword.ad_group_id,
@@ -813,7 +770,7 @@ async def get_ad_groups(
     } for g in groups]
 
 
-# ─── Keywords ─────────────────────────────────────────────────────────────────
+# ─── Keywords ───────────────────────────────────────────────
 
 @router.get("/accounts/{account_id}/keywords")
 async def get_keywords(
@@ -828,20 +785,6 @@ async def get_keywords(
     date_to:     Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Список ключевых слов со статистикой, дельтами и сигналами.
-
-    Возвращаемые метрики:
-      Базовые:       clicks, impressions, spend, ctr, avg_cpc
-      Ставка:        current_bid, avg_bid (AvgEffectiveBid)
-      Позиции:       avg_position, avg_click_position, click_position_gap
-      Объём рынка:   traffic_volume, weighted_ctr, weighted_impressions (v1.2)
-      Поведение:     bounce_rate, sessions (v1.2)
-      Расчётные:     traffic_quality_score (v1.2)
-      Сравнение:     click_delta, bid_delta, position_delta
-      Рекомендации:  recommended_bid, signal (из последнего анализа)
-      Спарклайн:     sparkline (посуточные клики)
-    """
     curr_start, curr_end, prev_start, prev_end = period_dates(period, date_from, date_to)
 
     q = select(Keyword).where(Keyword.account_id == account_id)
@@ -863,7 +806,6 @@ async def get_keywords(
     if not kw_ids:
         return []
 
-    # Текущий период — все метрики включая v1.2
     curr_q = await db.execute(
         select(
             KeywordStat.keyword_id,
@@ -875,7 +817,6 @@ async def get_keywords(
             func.avg(KeywordStat.traffic_volume).label("traffic_volume"),
             func.avg(KeywordStat.avg_bid).label("avg_bid"),
             func.avg(KeywordStat.avg_cpc).label("avg_cpc_raw"),
-            # v1.2
             func.avg(KeywordStat.weighted_ctr).label("weighted_ctr"),
             func.sum(KeywordStat.weighted_impressions).label("weighted_impressions"),
             func.avg(KeywordStat.bounce_rate).label("bounce_rate"),
@@ -890,7 +831,6 @@ async def get_keywords(
     )
     curr_map = {r.keyword_id: r for r in curr_q}
 
-    # Предыдущий период — для дельт
     prev_q = await db.execute(
         select(
             KeywordStat.keyword_id,
@@ -909,7 +849,6 @@ async def get_keywords(
     )
     prev_map = {r.keyword_id: r for r in prev_q}
 
-    # Посуточные данные для спарклайнов по каждому ключу
     sparkline_q = await db.execute(
         select(
             KeywordStat.keyword_id,
@@ -929,7 +868,6 @@ async def get_keywords(
             {"date": r.date.strftime("%Y-%m-%d"), "clicks": int(r.clicks or 0)}
         )
 
-    # Сигналы из последнего анализа
     analysis_result = await db.execute(
         select(AnalysisResult)
         .where(AnalysisResult.account_id == account_id)
@@ -957,27 +895,22 @@ async def get_keywords(
         avg_cpos     = round(float(cs.avg_click_position), 2) if cs and cs.avg_click_position else None
         traf         = round(float(cs.traffic_volume)) if cs and cs.traffic_volume else None
         avg_bid      = round(float(cs.avg_bid), 2) if cs and cs.avg_bid else None
-        # v1.2 fields
         w_ctr        = round(float(cs.weighted_ctr), 2) if cs and cs.weighted_ctr else None
         w_impr       = int(cs.weighted_impressions or 0) if cs and cs.weighted_impressions else None
         bounce_rate  = round(float(cs.bounce_rate), 1) if cs and cs.bounce_rate else None
         sessions     = int(cs.sessions or 0) if cs and cs.sessions else None
 
-        # Дельты
         click_delta  = calc_delta(clicks, prev_clicks)
         prev_bid     = float(ps.avg_bid) if ps and ps.avg_bid else None
         bid_delta    = calc_delta(avg_bid, prev_bid)
         prev_pos     = float(ps.avg_position) if ps and ps.avg_position else None
         pos_delta    = calc_delta(prev_pos, avg_pos, invert=True) if prev_pos and avg_pos else None
 
-        # CPC и CTR через суммы
         avg_cpc = round(spend / clicks, 2) if clicks > 0 else None
         ctr     = round(clicks / impressions * 100, 2) if impressions > 0 else None
 
-        # Позиционный разрыв
         pos_gap = round(avg_cpos - avg_pos, 2) if avg_pos and avg_cpos else None
 
-        # Рекомендованная ставка — из сигнала или по формуле
         sig = signal_map.get(kw.id)
         recommended_bid = None
         if sig and sig.get("recommended_bid"):
@@ -989,7 +922,6 @@ async def get_keywords(
             elif avg_pos and avg_pos < 1.5:
                 recommended_bid = round(cb * 0.9, 2)
 
-        # Скоринг качества трафика 0–100
         traffic_quality = None
         if bounce_rate is not None and bounce_rate > 0:
             q_score = (
@@ -1003,36 +935,28 @@ async def get_keywords(
             "id":               kw.id,
             "phrase":           kw.phrase,
             "status":           kw.status,
-            # ── Ставки ───────────────────────────────────────────────────────
             "current_bid":      float(kw.current_bid) if kw.current_bid else None,
             "avg_bid":          avg_bid,
             "recommended_bid":  recommended_bid,
             "bid_delta":        bid_delta,
-            # ── Трафик ───────────────────────────────────────────────────────
             "clicks":           clicks,
             "impressions":      impressions,
             "spend":            round(spend, 2),
             "ctr":              ctr,
             "avg_cpc":          avg_cpc,
-            # ── Позиции ──────────────────────────────────────────────────────
             "avg_position":     avg_pos,
             "avg_click_position": avg_cpos,
             "click_position_gap": pos_gap,
-            # ── Объём рынка ──────────────────────────────────────────────────
             "traffic_volume":   traf,
-            "weighted_ctr":     w_ctr,          # v1.2
-            "weighted_impressions": w_impr,     # v1.2
-            # ── Поведение ────────────────────────────────────────────────────
-            "bounce_rate":      bounce_rate,    # v1.2
-            "sessions":         sessions,       # v1.2
-            # ── Дельты ───────────────────────────────────────────────────────
+            "weighted_ctr":     w_ctr,
+            "weighted_impressions": w_impr,
+            "bounce_rate":      bounce_rate,
+            "sessions":         sessions,
             "click_delta":      click_delta,
             "position_delta":   pos_delta,
-            # ── Качество и сигналы ───────────────────────────────────────────
-            "traffic_quality":  traffic_quality,  # v1.2
+            "traffic_quality":  traffic_quality,
             "signal":           sig,
-            "problem":          sig,   # alias для совместимости с v1 фронтендом
-            # ── Спарклайн ────────────────────────────────────────────────────
+            "problem":          sig,
             "sparkline":        sparkline_map.get(kw.id, []),
         })
 
@@ -1040,7 +964,7 @@ async def get_keywords(
     return result
 
 
-# ─── Analysis ─────────────────────────────────────────────────────────────────
+# ─── Analysis ───────────────────────────────────────────────
 
 @router.get("/accounts/{account_id}/analyses")
 async def get_analyses(account_id: int, limit: int = 10, db: AsyncSession = Depends(get_db)):
@@ -1062,7 +986,7 @@ async def get_analyses(account_id: int, limit: int = 10, db: AsyncSession = Depe
     } for a in analyses]
 
 
-# ─── Suggestions ──────────────────────────────────────────────────────────────
+# ─── Suggestions ─────────────────────────────────────────────
 
 @router.get("/accounts/{account_id}/suggestions")
 async def get_suggestions(
@@ -1070,49 +994,88 @@ async def get_suggestions(
     status: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    analysis_result = await db.execute(
-        select(AnalysisResult)
-        .where(AnalysisResult.account_id == account_id)
-        .order_by(desc(AnalysisResult.created_at))
-        .limit(1)
-    )
-    analysis = analysis_result.scalar_one_or_none()
-    if not analysis:
-        return []
-    items = [
-        *[{**p, "_cat": "problem", "id": f"p_{i}"} for i, p in enumerate(analysis.problems or [])],
-        *[{**o, "_cat": "opportunity", "id": f"o_{i}", "severity": "info"} for i, o in enumerate(analysis.opportunities or [])],
-    ]
-    return items
+    # CHANGED v2.0: читаем реальную таблицу suggestions (раньше собирались на лету
+    # из analysis.problems с фиктивными id p_0/o_1 — из-за чего таблица и весь
+    # SuggestionGenerator были мёртвым кодом, а аппрув не связывался с гипотезой).
+    q = select(Suggestion).where(Suggestion.account_id == account_id)
+    if status:
+        try:
+            q = q.where(Suggestion.status == SuggestionStatus(status))
+        except ValueError:
+            pass
+    else:
+        q = q.where(Suggestion.status == SuggestionStatus.pending)
+    q = q.order_by(desc(Suggestion.created_at))
+    result = await db.execute(q)
+    rows = result.scalars().all()
+
+    prio_sev = {"today": "critical", "this_week": "warning", "month": "info", "scale": "info"}
+    return [{
+        "id":            s.id,
+        "object_type":   s.object_type,
+        "object_id":     s.object_id,
+        "keyword_id":    s.object_id if s.object_type == "keyword" else None,
+        "object_name":   s.object_name,
+        "phrase":        s.object_name,
+        "change_type":   s.change_type,
+        "value_before":  s.value_before,
+        "value_after":   s.value_after,
+        "description":   s.rationale,
+        "hypothesis":    (s.rationale.split("Гипотеза:")[-1].strip()
+                          if s.rationale and "Гипотеза:" in s.rationale else None),
+        "action":        s.expected_effect,
+        "expected_effect": s.expected_effect,
+        "rationale":     s.rationale,
+        "recommended_bid": (float(s.value_after.replace("₽", ""))
+                            if s.value_after and s.value_after.replace("₽", "").replace(".", "").isdigit()
+                            else None),
+        "priority":      s.priority,
+        "severity":      prio_sev.get(s.priority, "warning"),
+        "status":        s.status.value,
+    } for s in rows]
 
 
 @router.post("/suggestions/{suggestion_id}/action")
-async def action_suggestion(suggestion_id: str, data: dict, db: AsyncSession = Depends(get_db)):
-    action          = data.get("action", "accept")
-    account_id      = data.get("account_id")
-    suggestion_data = data.get("suggestion", {})
-    if action == "accept" and account_id:
-        hypothesis = Hypothesis(
-            account_id=account_id,
-            suggestion_id=None,
-            object_type=suggestion_data.get("type", "keyword"),
-            object_id=suggestion_data.get("keyword_id"),
-            description=suggestion_data.get("description", ""),
-            change_description=suggestion_data.get("action", ""),
-            forecast=suggestion_data.get("description", ""),
-            source="algorithm",
-            verdict=None,
-            applied_at=datetime.utcnow(),
-            track_until=datetime.utcnow() + timedelta(days=7),
-        )
-        db.add(hypothesis)
+async def action_suggestion(suggestion_id: int, data: dict, db: AsyncSession = Depends(get_db)):
+    # CHANGED v2.0: работаем с реальным числовым id из таблицы suggestions.
+    # accept → status=approved + Hypothesis СО ССЫЛКОЙ suggestion_id (иначе трекер
+    # гипотез не мог их оценивать). reject → status=rejected + причина.
+    action = data.get("action", "accept")
+    reason = data.get("reason")
+
+    res = await db.execute(select(Suggestion).where(Suggestion.id == int(suggestion_id)))
+    s = res.scalar_one_or_none()
+    if not s:
+        raise HTTPException(404, "Suggestion not found")
+
+    if action == "reject":
+        s.status = SuggestionStatus.rejected
+        s.reject_reason = reason
         await db.commit()
-        await db.refresh(hypothesis)
-        return {"status": "created", "hypothesis_id": hypothesis.id}
-    return {"status": "rejected"}
+        return {"status": "rejected", "suggestion_id": s.id}
+
+    s.status = SuggestionStatus.approved
+    s.approved_by = data.get("approved_by") or "director"
+    hypothesis = Hypothesis(
+        account_id=s.account_id,
+        suggestion_id=s.id,
+        object_type=s.object_type,
+        object_id=s.object_id,
+        description=f"{s.object_name}: {s.rationale or ''}",
+        change_description=s.expected_effect or s.change_type,
+        forecast=s.expected_effect,
+        source="algorithm",
+        verdict=None,
+        applied_at=datetime.utcnow(),
+        track_until=datetime.utcnow() + timedelta(days=7),
+    )
+    db.add(hypothesis)
+    await db.commit()
+    await db.refresh(hypothesis)
+    return {"status": "approved", "suggestion_id": s.id, "hypothesis_id": hypothesis.id}
 
 
-# ─── Hypotheses ───────────────────────────────────────────────────────────────
+# ─── Hypotheses ──────────────────────────────────────────────
 
 class HypothesisCreate(BaseModel):
     object_type: str = "keyword"
@@ -1138,14 +1101,15 @@ async def get_hypotheses(account_id: int, db: AsyncSession = Depends(get_db)):
     hyps = result.scalars().all()
 
     def h_status(h):
+        # CHANGED: убраны мёртвые ветки positive/negative (нет в enum).
         v = h.verdict.value if h.verdict else "pending"
-        if v == "pending":    return "planned"
-        if v == "positive":   return "success"
-        if v == "confirmed":  return "success"
-        if v == "negative":   return "failed"
-        if v == "rejected":   return "failed"
-        if v == "neutral":    return "neutral"
-        return v
+        return {
+            "pending":      "planned",
+            "confirmed":    "success",
+            "rejected":     "failed",
+            "neutral":      "neutral",
+            "insufficient": "insufficient",
+        }.get(v, v)
 
     return [{
         "id":               h.id,
@@ -1189,7 +1153,7 @@ async def create_hypothesis(account_id: int, data: HypothesisCreate, db: AsyncSe
     return {"id": hypothesis.id, "status": "created"}
 
 
-# ─── Rules ────────────────────────────────────────────────────────────────────
+# ─── Rules ──────────────────────────────────────────────────
 
 @router.get("/accounts/{account_id}/rules")
 async def get_rules(account_id: int, db: AsyncSession = Depends(get_db)):
@@ -1208,7 +1172,7 @@ async def get_rules(account_id: int, db: AsyncSession = Depends(get_db)):
     } for r in rules]
 
 
-# ─── Metrika snapshot ─────────────────────────────────────────────────────────
+# ─── Metrika snapshot ─────────────────────────────────────────
 
 @router.get("/accounts/{account_id}/metrika-snapshot")
 async def get_metrika_snapshot(account_id: int, db: AsyncSession = Depends(get_db)):
@@ -1216,7 +1180,7 @@ async def get_metrika_snapshot(account_id: int, db: AsyncSession = Depends(get_d
         select(MetrikaSnapshot)
         .where(MetrikaSnapshot.account_id == account_id)
         .order_by(desc(MetrikaSnapshot.date))
-        .limit(2)  # текущий и предыдущий для сравнения на фронтенде
+        .limit(2)
     )
     snapshots = result.scalars().all()
     if not snapshots:
@@ -1231,7 +1195,7 @@ async def get_metrika_snapshot(account_id: int, db: AsyncSession = Depends(get_d
     }
 
 
-# ─── Search queries ───────────────────────────────────────────────────────────
+# ─── Search queries ──────────────────────────────────────────
 
 @router.get("/accounts/{account_id}/search-queries")
 async def get_search_queries(
@@ -1297,7 +1261,7 @@ async def get_search_queries(
     } for r in rows]
 
 
-# ─── Diagnostics ──────────────────────────────────────────────────────────────
+# ─── Diagnostics ─────────────────────────────────────────────
 
 @router.get("/accounts/{account_id}/diagnostics")
 async def get_diagnostics(account_id: int, db: AsyncSession = Depends(get_db)):
@@ -1306,7 +1270,6 @@ async def get_diagnostics(account_id: int, db: AsyncSession = Depends(get_db)):
     kw_count   = await db.execute(select(func.count(Keyword.id)).where(Keyword.account_id == account_id))
     stat_count = await db.execute(select(func.count(KeywordStat.id)).where(KeywordStat.account_id == account_id))
 
-    # Диапазон дат статистики
     date_range = await db.execute(
         select(func.min(KeywordStat.date), func.max(KeywordStat.date))
         .where(KeywordStat.account_id == account_id)
@@ -1356,7 +1319,7 @@ async def get_diagnostics(account_id: int, db: AsyncSession = Depends(get_db)):
     }
 
 
-# ─── Health ───────────────────────────────────────────────────────────────────
+# ─── Health ───────────────────────────────────────────────
 
 @router.get("/health")
 async def health():

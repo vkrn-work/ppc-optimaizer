@@ -53,6 +53,17 @@ async def _run_migrations(conn):
         "CREATE INDEX IF NOT EXISTS ix_ms_account_date ON metrika_snapshots (account_id, date)",
         # Фильтровать только активные кампании в представлении
         "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS state VARCHAR(50)",
+        # CHANGED: v1.2 колонки — раньше отсутствовали в миграциях, из-за чего
+        # на уже существующей БД сбор статистики падал на INSERT этих полей.
+        "ALTER TABLE keyword_stats ADD COLUMN IF NOT EXISTS weighted_impressions INTEGER",
+        "ALTER TABLE keyword_stats ADD COLUMN IF NOT EXISTS weighted_ctr NUMERIC(8,4)",
+        "ALTER TABLE keyword_stats ADD COLUMN IF NOT EXISTS bounce_rate NUMERIC(6,2)",
+        "ALTER TABLE keyword_stats ADD COLUMN IF NOT EXISTS sessions INTEGER",
+        "ALTER TABLE keyword_stats ADD COLUMN IF NOT EXISTS avg_bid NUMERIC(10,2)",
+        "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS epk_collapse_detected BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS analysis_config JSONB DEFAULT '{}'::jsonb",
+        # enum hypothesisverdict: добавить значение neutral, если его нет
+        "ALTER TYPE hypothesisverdict ADD VALUE IF NOT EXISTS 'neutral'",
     ]
     for sql in migrations:
         try:

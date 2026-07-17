@@ -4,6 +4,11 @@ Celery задачи — сбор данных, анализ, трекинг ги
 Изменения v1.2:
   - Сохранение WeightedImpressions, WeightedCtr, BounceRate в keyword_stats
   - После сбора Метрики — обогащение sessions по utm_term в keyword_stats
+
+CHANGED v1.3.0 (трекер гипотез):
+  - track_all_hypotheses: track_until >= now → <= now (баг инверсии условия)
+  - _track_hypothesis_async: поддержка ручных гипотез (suggestion_id=None) по object_id
+  - порог значимости 10→5 кликов, динамика позиции в отчёте
 """
 import asyncio
 import logging
@@ -100,7 +105,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                 f" {date_from} — {date_to}"
             )
 
-            # ── Директ: кампании, группы, ключи ─────────────────────────
+            # ── Директ: кампании, группы, ключи ───────────
             async with YandexDirectCollector(
                 account.oauth_token, account.yandex_login
             ) as dc:
@@ -235,20 +240,11 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                         if clicks == 0 and impressions == 0:
                             continue
 
-                        # CTR в процентах ("5.23")
                         ctr_val = safe_float(row.get("Ctr"))
-
-                        # AvgEffectiveBid в микрорублях → рубли
                         avg_bid_raw = safe_float(row.get("AvgEffectiveBid"))
                         avg_bid_rub = avg_bid_raw / 1_000_000 if avg_bid_raw else None
-
-                        # AvgCpc уже в рублях
                         avg_cpc_val = safe_float(row.get("AvgCpc"))
-
-                        # WeightedCtr в процентах
                         w_ctr = safe_float(row.get("WeightedCtr"))
-
-                        # BounceRate в процентах (--  если нет данных API вернёт "--")
                         br_raw = row.get("BounceRate", "")
                         bounce_rate_val = safe_float(br_raw) if br_raw != "--" else None
 
@@ -265,11 +261,9 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                             avg_position=safe_float(row.get("AvgImpressionPosition")),
                             avg_click_position=safe_float(row.get("AvgClickPosition")),
                             traffic_volume=safe_int(row.get("AvgTrafficVolume")),
-                            # ── Новые поля v1.2 ────────────────────────
                             weighted_impressions=safe_int(row.get("WeightedImpressions")),
                             weighted_ctr=w_ctr,
                             bounce_rate=bounce_rate_val,
-                            # sessions будет заполнен при обогащении из Метрики
                         ).on_conflict_do_update(
                             index_elements=["account_id", "keyword_id", "date"],
                             set_={
@@ -352,7 +346,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                 except Exception as e:
                     logger.warning(f"Search queries collection failed: {e}")
 
-            # ── Метрика ──────────────────────────────────────────────────
+            # ── Метрика ────────────────────────────────────────
             if account.metrika_counter_id:
                 try:
                     from app.models.models import MetrikaSnapshot
@@ -372,8 +366,6 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                         db.add(snap)
                         await db.commit()
 
-                        # ── Обогащение sessions в keyword_stats ───────────
-                        # Матчим по utm_term → keyword.phrase → keyword_stats
                         kw_data = metrika_data.get("keywords", [])
                         if kw_data:
                             await _enrich_sessions(
@@ -417,7 +409,6 @@ async def _enrich_sessions(db, account_id, kw_metrika: list, date_from, date_to)
         if not kw:
             continue
 
-        # Обновляем все строки за период (приближённо распределяем visits)
         await db.execute(
             update(KeywordStat)
             .where(and_(
@@ -497,7 +488,9 @@ async def _track_all_hypotheses_async():
             now    = datetime.utcnow()
             result = await db.execute(
                 select(Hypothesis).where(
-                    and_(Hypothesis.track_until >= now, Hypothesis.verdict == None)
+                    # CHANGED: было track_until >= now (срок ещё НЕ наступил) —
+                    # из-за чего ни одна гипотеза не доходила до оценки.
+                    and_(Hypothesis.track_until <= now, Hypothesis.verdict == None)
                 )
             )
             hypotheses = result.scalars().all()
@@ -541,14 +534,27 @@ async def _track_hypothesis_async(hypothesis_id: int):
             if now < hypothesis.track_until:
                 return
 
-            s_res = await db.execute(
-                select(Suggestion).where(Suggestion.id == hypothesis.suggestion_id)
-            )
-            suggestion = s_res.scalar_one_or_none()
-            if not suggestion or suggestion.object_type != "keyword":
+            # CHANGED: поддержка и алгоритмических (через suggestion), и ручных
+            # гипотез (suggestion_id=None, но object_id заполнен из UI).
+            keyword_id = None
+            object_type = hypothesis.object_type
+            if hypothesis.suggestion_id:
+                s_res = await db.execute(
+                    select(Suggestion).where(Suggestion.id == hypothesis.suggestion_id)
+                )
+                suggestion = s_res.scalar_one_or_none()
+                if suggestion:
+                    object_type = suggestion.object_type
+                    keyword_id = suggestion.object_id
+            if keyword_id is None:
+                keyword_id = hypothesis.object_id
+
+            if object_type != "keyword" or not keyword_id:
+                hypothesis.verdict = "insufficient"
+                hypothesis.report = "Трекинг доступен только для ключевых гипотез."
+                await db.commit()
                 return
 
-            keyword_id = suggestion.object_id
             applied_at = hypothesis.applied_at
 
             async def get_stats(start, end):
@@ -578,21 +584,34 @@ async def _track_hypothesis_async(hypothesis_id: int):
             hypothesis.metrics_before = before
             hypothesis.metrics_after  = after
 
-            if before["clicks"] < 10 or after["clicks"] < 10:
+            # CHANGED: порог смягчён 10→5 (нишевой B2B даёт мало кликов),
+            # в отчёт добавлена динамика позиции как вторичный сигнал.
+            def pos_note(b, a):
+                if b.get("avg_position") and a.get("avg_position"):
+                    d = b["avg_position"] - a["avg_position"]
+                    if abs(d) >= 0.3:
+                        return f" Позиция {'улучшилась' if d > 0 else 'ухудшилась'} ({b['avg_position']}→{a['avg_position']})."
+                return ""
+
+            if before["clicks"] < 5 or after["clicks"] < 5:
                 hypothesis.verdict = "insufficient"
-                hypothesis.report  = "Недостаточно кликов для статистически значимого вывода."
+                hypothesis.report  = (
+                    f"Недостаточно кликов для значимого вывода "
+                    f"(до {before['clicks']}, после {after['clicks']})."
+                )
             else:
                 delta = (after["clicks"] - before["clicks"]) / before["clicks"] * 100
                 hypothesis.delta_percent = round(delta, 2)
+                note = pos_note(before, after)
                 if delta >= 10:
                     hypothesis.verdict = "confirmed"
-                    hypothesis.report  = f"Гипотеза подтверждена. Трафик вырос на {delta:.1f}%."
+                    hypothesis.report  = f"Гипотеза подтверждена. Трафик вырос на {delta:.1f}%.{note}"
                 elif delta <= -10:
                     hypothesis.verdict = "rejected"
-                    hypothesis.report  = f"Гипотеза отклонена. Трафик упал на {abs(delta):.1f}%."
+                    hypothesis.report  = f"Гипотеза отклонена. Трафик упал на {abs(delta):.1f}%.{note}"
                 else:
                     hypothesis.verdict = "neutral"
-                    hypothesis.report  = f"Изменение нейтральное ({delta:+.1f}%). Продолжить наблюдение."
+                    hypothesis.report  = f"Изменение нейтральное ({delta:+.1f}%). Продолжить наблюдение.{note}"
 
             await db.commit()
             logger.info(f"Hypothesis {hypothesis_id} → {hypothesis.verdict}")

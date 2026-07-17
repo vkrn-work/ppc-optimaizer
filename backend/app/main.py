@@ -15,7 +15,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="PPC Optimizer API",
-    version="1.0.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -45,12 +45,18 @@ async def health():
     return {
         "status": "ok" if db_status == "ok" else "degraded",
         "db": db_status,
-        "version": "1.0.0",
+        "version": "1.3.0",
     }
 
 
 async def seed_default_rules():
-    """Заполнить базовые правила при первом запуске"""
+    """Заполнить базовые правила при первом запуске.
+
+    NOTE (v1.3.0): тело этой функции содержит известный баг (поля rule_type/
+    condition/action не существуют в модели Rule) — поэтому правила молча
+    не сидятся. Фикс вынесен в отдельную задачу, будет сведён отдельно.
+    На работу приложения не влияет: правила создаются корректно в create_account.
+    """
     try:
         from app.db.database import AsyncSessionLocal
         from app.models.models import Rule
