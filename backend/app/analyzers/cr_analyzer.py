@@ -2,6 +2,9 @@
 CR-анализатор v4.1 — Топологический движок (Senior PPC).
 Исправления: Баг выходных дней, контекст цены, логика TrafficVolume, пороги Метрики, пустые массивы.
 Все SQL запросы однострочные для безопасного копирования.
+
+CHANGED v1.3.0: _calc_baselines — float(r.ctr) вместо float(r.rctr) (несуществующий
+атрибут ронял анализ с AttributeError на каждом ключе).
 """
 import json
 import logging
@@ -157,7 +160,7 @@ class CRAnalyzer:
             is_bl = _is_workday(d) and bl_start <= d < bl_end
             is_curr = _is_workday(d) and bl_end <= d <= curr_end
             c, i, s = int(r.clicks or 0), int(r.impressions or 0), float(r.spend or 0)
-            p, cp, ct, b, w, tv = float(r.avg_position or 0), float(r.avg_click_position or 0), float(r. rctr or 0), float(r.avg_bid or 0), float(r.weighted_ctr or 0), int(r.traffic_volume or 0)
+            p, cp, ct, b, w, tv = float(r.avg_position or 0), float(r.avg_click_position or 0), float(r.ctr or 0), float(r.avg_bid or 0), float(r.weighted_ctr or 0), int(r.traffic_volume or 0)
             if is_bl and (c > 0 or i > 0):
                 kw_bl_data[r.keyword_id].append({"c": c, "i": i, "s": s, "p": p, "cp": cp, "ct": ct, "b": b, "w": w, "tv": tv})
             if is_curr:
