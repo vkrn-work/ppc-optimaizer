@@ -95,6 +95,20 @@ async def _run_migrations(conn):
         # дефолтом вместо добавления в модель — код на них нигде не опирается.
         "ALTER TABLE leads ALTER COLUMN is_qualified SET DEFAULT false",
         "ALTER TABLE leads ALTER COLUMN is_bad SET DEFAULT false",
+        # v1.4.4 HOTFIX — та же болезнь для hypotheses: модель Hypothesis давно объявляет
+        # 6 полей для ручных/алгоритмических гипотез, которых не было в таблице —
+        # POST /suggestions/{id}/action при approve падал с UndefinedColumnError
+        # (видно в браузере как "Failed to fetch" из-за отсутствия CORS-заголовков
+        # на упавшем процессе).
+        "ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS description TEXT",
+        "ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS change_description TEXT",
+        "ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS forecast TEXT",
+        "ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS object_type VARCHAR(50)",
+        "ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS object_id INTEGER",
+        "ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS source VARCHAR(50)",
+        # suggestion_id в БД оказался NOT NULL, хотя в модели Optional — ручные
+        # гипотезы без suggestion_id (со страницы /hypotheses) упали бы по той же схеме.
+        "ALTER TABLE hypotheses ALTER COLUMN suggestion_id DROP NOT NULL",
     ]
     for sql in migrations:
         try:
