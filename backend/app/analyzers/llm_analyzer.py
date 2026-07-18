@@ -11,8 +11,12 @@ LLM-анализатор. В отличие от cr_analyzer.py (жёсткие 
   3. generate_suggestions() — валидация ответа модели (лимиты из config.py) и запись
                               в таблицу suggestions (общая с cr_analyzer, status=pending).
 
-Так же, как для cr_analyzer, safety-валидация лимитов ставки происходит на этапе
+Так же, как и для cr_analyzer, safety-валидация лимитов ставки происходит на этапе
 записи — модель не может напрямую менять кабинет.
+
+v1.4.0: CRM-метрики в датасете переведены с "сделки/выручка" на воронку
+MQL/SQL (см. app/importers/crm_importer.py) — для этого аккаунта модель
+"продажа" не в приоритете, важны стоимость и конверсия в MQL/SQL.
 """
 import logging
 from datetime import datetime, timedelta
@@ -69,12 +73,16 @@ class LLMAnalyzer:
         )
         keywords = {kw.id: kw for kw in kw_q.scalars().all()}
 
+        # ── CRM: воронка lead → MQL → SQL по ключевому слову ─────────────────
+        # (заменяет прежнюю агрегацию по deals/revenue — для этого аккаунта
+        # интересны не продажи, а количество/стоимость/конверсия в MQL и SQL,
+        # см. app/importers/crm_importer.py)
         leads_q = await self.db.execute(
             select(
                 Lead.keyword_id,
                 func.count(Lead.id).label("leads_count"),
-                func.sum(case((Lead.status == LeadStatus.deal, 1), else_=0)).label("deals"),
-                func.sum(Lead.revenue).label("revenue"),
+                func.sum(case((Lead.is_mql.is_(True), 1), else_=0)).label("mql_count"),
+                func.sum(case((Lead.is_sql.is_(True), 1), else_=0)).label("sql_count"),
             )
             .where(and_(Lead.account_id == self.account_id, Lead.keyword_id.isnot(None)))
             .group_by(Lead.keyword_id)
@@ -101,12 +109,18 @@ class LLMAnalyzer:
                 "bounce_rate_pct": round(float(s.bounce_rate or 0), 1) if s.bounce_rate else None,
                 "traffic_volume": round(float(s.traffic_volume or 0), 1) if s.traffic_volume else None,
             }
-            if leads:
-                row["crm_leads"] = int(leads.leads_count or 0)
-                row["crm_deals"] = int(leads.deals or 0)
-                row["crm_revenue_rub"] = round(float(leads.revenue or 0), 2) if leads.revenue else None
-                if leads.leads_count:
-                    row["cpl_rub"] = round(row["spend_rub"] / leads.leads_count, 2)
+            if leads and leads.leads_count:
+                leads_count = int(leads.leads_count or 0)
+                mql_count = int(leads.mql_count or 0)
+                sql_count = int(leads.sql_count or 0)
+                row["crm_leads"] = leads_count
+                row["crm_mql"] = mql_count
+                row["crm_sql"] = sql_count
+                row["cr_lead_to_mql_pct"] = round(mql_count / leads_count * 100, 1) if leads_count else None
+                row["cr_mql_to_sql_pct"] = round(sql_count / mql_count * 100, 1) if mql_count else None
+                row["cpl_rub"] = round(row["spend_rub"] / leads_count, 2) if leads_count else None
+                row["cost_per_mql_rub"] = round(row["spend_rub"] / mql_count, 2) if mql_count else None
+                row["cost_per_sql_rub"] = round(row["spend_rub"] / sql_count, 2) if sql_count else None
             dataset.append(row)
 
         dataset.sort(key=lambda r: r["spend_rub"], reverse=True)
