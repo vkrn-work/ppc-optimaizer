@@ -88,6 +88,13 @@ async def _run_migrations(conn):
         "ALTER TABLE leads ADD COLUMN IF NOT EXISTS revenue NUMERIC(14,2)",
         "ALTER TABLE leads ADD COLUMN IF NOT EXISTS created_at TIMESTAMP",
         "ALTER TABLE leads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP",
+        # v1.4.3 HOTFIX — найдено через GET /_debug/table-schema/leads: в таблице есть
+        # 2 orphaned-колонки (is_qualified, is_bad) — boolean NOT NULL без дефолта, которых
+        # нет в модели Lead и нет ни одного упоминания в коде (проверено поиском по всему
+        # репозиторию) — остатки от более ранней версии схемы. Снимаем блокировку
+        # дефолтом вместо добавления в модель — код на них нигде не опирается.
+        "ALTER TABLE leads ALTER COLUMN is_qualified SET DEFAULT false",
+        "ALTER TABLE leads ALTER COLUMN is_bad SET DEFAULT false",
     ]
     for sql in migrations:
         try:
