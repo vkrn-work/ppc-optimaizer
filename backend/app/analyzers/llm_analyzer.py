@@ -3,6 +3,13 @@ LLM-анализатор. В отличие от cr_analyzer.py (жёсткие 
 получает агрегированные данные по ключевым словам (Директ + CRM) и сам решает,
 какие проблемы есть и что с ними делать.
 
+v1.5.0: в датасет добавлен bid_editable (см. _build_dataset) — выяснилось на
+реальном apply, что в этом кабинете нет ни одной кампании на MANUAL_CPC — для
+авто-стратегий/ЕПК Yandex Direct API не принимает Keywords[].Bid вообще
+("API error 8000: неизвестный параметр Bid") — это ограничение самого API, не баг.
+_validate_change теперь жёстко отклоняет bid_raise/bid_lower для bid_editable=false даже
+если модель всё равно их предложит — не полагаемся только на послушность промпту.
+
 Пайплайн:
   1. _build_dataset()      — джойн keyword_stats + leads по keyword_id/utm_term,
                               агрегация в компактную таблицу (не сырые построчные данные).
@@ -73,6 +80,27 @@ class LLMAnalyzer:
         )
         keywords = {kw.id: kw for kw in kw_q.scalars().all()}
 
+        # ── Стратегия кампании: bid_raise/bid_lower применимы через API только
+        #    для MANUAL_CPC. Для автостратегий (AUTO/ЕПК) Yandex Direct API
+        #    вообще не принимает Keywords[].Bid ("unknown parameter") — ставкой
+        #    управляет алгоритм, не рекламодатель напрямую. Прокидываем флаг в
+        #    датасет, чтобы модель не предлагала неприменимые изменения ставки.
+        ag_ids = list({kw.ad_group_id for kw in keywords.values() if kw.ad_group_id})
+        ad_groups = {}
+        if ag_ids:
+            ag_q = await self.db.execute(select(AdGroup).where(AdGroup.id.in_(ag_ids)))
+            ad_groups = {ag.id: ag for ag in ag_q.scalars().all()}
+        campaign_ids = list({ag.campaign_id for ag in ad_groups.values() if ag.campaign_id})
+        campaigns = {}
+        if campaign_ids:
+            camp_q = await self.db.execute(select(Campaign).where(Campaign.id.in_(campaign_ids)))
+            campaigns = {c.id: c for c in camp_q.scalars().all()}
+
+        def _bid_editable(kw) -> bool:
+            ag = ad_groups.get(kw.ad_group_id)
+            camp = campaigns.get(ag.campaign_id) if ag else None
+            return bool(camp and camp.strategy_type == "MANUAL_CPC")
+
         # ── CRM: воронка lead → MQL → SQL по ключевому слову ─────────────────
         # (заменяет прежнюю агрегацию по deals/revenue — для этого аккаунта
         # интересны не продажи, а количество/стоимость/конверсия в MQL и SQL,
@@ -101,6 +129,7 @@ class LLMAnalyzer:
                 "keyword_id": kw_id,
                 "phrase": kw.phrase,
                 "current_bid_rub": float(kw.current_bid) if kw.current_bid else None,
+                "bid_editable": _bid_editable(kw),
                 "impressions": int(s.impressions or 0),
                 "clicks": int(s.clicks or 0),
                 "spend_rub": round(float(s.spend or 0), 2),
@@ -129,10 +158,15 @@ class LLMAnalyzer:
     def _call_llm(self, dataset: list[dict], provider: str) -> list[dict]:
         return llm_providers.call_llm(provider, dataset)
 
-    def _validate_change(self, change: dict, kw: Optional[Keyword]) -> Optional[str]:
+    def _validate_change(self, change: dict, kw: Optional[Keyword], bid_editable: bool = True) -> Optional[str]:
         """Проверка изменения на безопасные лимиты. Возвращает None если ок,
         иначе текст причины отклонения."""
         if change["change_type"] in ("bid_raise", "bid_lower"):
+            if not bid_editable:
+                return (
+                    "кампания на автоматической стратегии (не MANUAL_CPC) — "
+                    "ставка ключевого слова не редактируется через Yandex Direct API"
+                )
             if not kw or not kw.current_bid:
                 return "нет текущей ставки в БД для сравнения"
             try:
@@ -160,6 +194,8 @@ class LLMAnalyzer:
         if not dataset:
             logger.info(f"LLM analyzer: no data for account {self.account_id}")
             return []
+
+        bid_editable_map = {r["keyword_id"]: r.get("bid_editable", True) for r in dataset}
 
         analysis = AnalysisResult(
             account_id=self.account_id,
@@ -215,7 +251,8 @@ class LLMAnalyzer:
                 continue
 
             kw = kw_map.get(kw_id)
-            reject_reason = self._validate_change(change, kw)
+            bid_editable = bid_editable_map.get(kw_id, True)
+            reject_reason = self._validate_change(change, kw, bid_editable)
             if reject_reason:
                 logger.warning(f"LLM change rejected (safety): {change.get('phrase')} — {reject_reason}")
                 rejected_count += 1
