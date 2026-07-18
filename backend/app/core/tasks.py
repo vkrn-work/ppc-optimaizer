@@ -1,5 +1,5 @@
 """
-Celery задачи — сбор данных, анализ, трекинг гипотез.
+Сelery задачи — сбор данных, анализ, трекинг гипотез.
 
 Изменения v1.2:
   - Сохранение WeightedImpressions, WeightedCtr, BounceRate в keyword_stats
@@ -105,7 +105,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                 f" {date_from} — {date_to}"
             )
 
-            # ── Директ: кампании, группы, ключи ───────────
+            # ── Директ: кампании, группы, ключи ───
             async with YandexDirectCollector(
                 account.oauth_token, account.yandex_login
             ) as dc:
@@ -346,7 +346,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                 except Exception as e:
                     logger.warning(f"Search queries collection failed: {e}")
 
-            # ── Метрика ────────────────────────────────────────
+            # ── Метрика ─────────────────────────
             if account.metrika_counter_id:
                 try:
                     from app.models.models import MetrikaSnapshot
@@ -615,5 +615,141 @@ async def _track_hypothesis_async(hypothesis_id: int):
 
             await db.commit()
             logger.info(f"Hypothesis {hypothesis_id} → {hypothesis.verdict}")
+    finally:
+        await engine.dispose()
+
+
+# ─── LLM-анализ ──────────────────────────────────────────────────
+
+@celery_app.task(name="app.core.tasks.run_llm_analysis", bind=True, max_retries=1)
+def run_llm_analysis(self, account_id: int, period_days: int = 28, provider: str = "claude"):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(_run_llm_analysis_async(account_id, period_days, provider))
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+async def _run_llm_analysis_async(account_id: int, period_days: int = 28, provider: str = "claude"):
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+    from app.core.config import settings
+    from app.analyzers.llm_analyzer import LLMAnalyzer
+
+    engine = create_async_engine(settings.DATABASE_URL, pool_pre_ping=True)
+    AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with AsyncSessionLocal() as db:
+            analyzer = LLMAnalyzer(db, account_id)
+            suggestions = await analyzer.generate_suggestions(period_days, provider=provider)
+            logger.info(f"LLM analysis done for account {account_id} (provider={provider}): {len(suggestions)} suggestions")
+            return len(suggestions)
+    finally:
+        await engine.dispose()
+
+
+# ─── Применение изменений в Яндекс.Директ ──────────────────────────
+#
+# Вызывается ПОСЛЕ того, как suggestion.status уже переведён в approved
+# через POST /suggestions/{id}/action. Здесь происходит фактическая запись
+# в кабинет через Direct API v5 (write). При успехе status -> applied,
+# при ошибке -> approved остаётся (можно повторить) + причина в reject_reason.
+
+@celery_app.task(name="app.core.tasks.apply_suggestion", bind=True, max_retries=1)
+def apply_suggestion(self, suggestion_id: int):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(_apply_suggestion_async(suggestion_id))
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+async def _apply_suggestion_async(suggestion_id: int) -> dict:
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+    from sqlalchemy import select
+    from app.core.config import settings
+    from app.models.models import Suggestion, SuggestionStatus, Keyword, AdGroup, Account
+    from app.collectors.direct_writer import YandexDirectWriter
+
+    engine = create_async_engine(settings.DATABASE_URL, pool_pre_ping=True)
+    AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(select(Suggestion).where(Suggestion.id == suggestion_id))
+            s = res.scalar_one_or_none()
+            if not s:
+                return {"status": "error", "detail": "suggestion not found"}
+            if s.status != SuggestionStatus.approved:
+                return {"status": "error", "detail": f"suggestion status is {s.status}, expected approved"}
+
+            acc_res = await db.execute(select(Account).where(Account.id == s.account_id))
+            account = acc_res.scalar_one_or_none()
+            if not account or not account.oauth_token:
+                return {"status": "error", "detail": "account has no oauth_token"}
+
+            kw = None
+            if s.object_type == "keyword" and s.object_id:
+                kw_res = await db.execute(select(Keyword).where(Keyword.id == s.object_id))
+                kw = kw_res.scalar_one_or_none()
+
+            ok, detail = False, "unknown change_type"
+            async with YandexDirectWriter(account.oauth_token, account.yandex_login) as writer:
+                if s.change_type in ("bid_raise", "bid_lower"):
+                    if not kw:
+                        ok, detail = False, "keyword not found in DB"
+                    else:
+                        try:
+                            new_bid = float(str(s.value_after).replace("₽", "").strip())
+                        except (ValueError, TypeError):
+                            ok, detail = False, f"cannot parse value_after={s.value_after}"
+                        else:
+                            ok, detail = await writer.set_keyword_bid(kw.direct_id, new_bid)
+
+                elif s.change_type == "add_negatives":
+                    if not kw:
+                        ok, detail = False, "keyword not found in DB"
+                    else:
+                        ag_res = await db.execute(select(AdGroup).where(AdGroup.id == kw.ad_group_id))
+                        ag = ag_res.scalar_one_or_none()
+                        negatives = [w.strip() for w in (s.value_after or "").split(",") if w.strip()]
+                        # Защита: старый rule-based генератор (cr_analyzer 8A) кладёт в
+                        # value_after текстовую инструкцию ("Добавить минус-слова по мусорным
+                        # запросам"), а не реальный список слов — такие значения нельзя
+                        # отправлять в Direct как NegativeKeywords. Отсекаем по эвристике:
+                        # настоящее минус-слово короткое и не похоже на предложение.
+                        looks_like_sentence = any(
+                            len(w) > 30 or "." in w or w.count(" ") > 4 for w in negatives
+                        )
+                        if not ag or not negatives:
+                            ok, detail = False, "no ad_group or empty negatives list"
+                        elif looks_like_sentence:
+                            ok, detail = False, (
+                                "value_after похож на текстовое описание, а не список минус-слов "
+                                "(вероятно, предложение создано старым rule-based анализатором без "
+                                "реального списка слов) — применение заблокировано, нужна ручная проверка"
+                            )
+                        else:
+                            ok, detail = await writer.add_negative_keywords(ag.direct_id, negatives)
+
+                elif s.change_type in ("pause", "site_check"):
+                    if not kw:
+                        ok, detail = False, "keyword not found in DB"
+                    else:
+                        ok, detail = await writer.suspend_keyword(kw.direct_id)
+
+                else:
+                    ok, detail = False, f"change_type '{s.change_type}' requires manual action (not auto-applicable)"
+
+            if ok:
+                s.status = SuggestionStatus.applied
+                s.applied_at = datetime.utcnow()
+            else:
+                s.reject_reason = f"Apply failed: {detail}"
+            await db.commit()
+            logger.info(f"apply_suggestion {suggestion_id}: ok={ok} detail={detail}")
+            return {"status": "applied" if ok else "failed", "detail": detail}
     finally:
         await engine.dispose()

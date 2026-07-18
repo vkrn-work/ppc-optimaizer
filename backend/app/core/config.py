@@ -39,6 +39,28 @@ class Settings(BaseSettings):
     MIN_CLICKS_CAMPAIGN: int = 100
     ANALYSIS_WINDOW_DAYS: int = 28
 
+    # ── LLM-анализатор: выбор провайдера перед стартом анализа ─────────
+    # Пользователь выбирает провайдера на фронте (кнопка "Запустить ИИ-анализ"),
+    # ключ должен быть настроен хотя бы для одного из них.
+    ANTHROPIC_API_KEY: Optional[str] = None
+    ANTHROPIC_MODEL: str = "claude-sonnet-4-5"
+
+    GEMINI_API_KEY: Optional[str] = None
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+
+    GROQ_API_KEY: Optional[str] = None
+    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+
+    OPENROUTER_API_KEY: Optional[str] = None
+    OPENROUTER_MODEL: str = "meta-llama/llama-3.3-70b-instruct:free"
+
+    LLM_MAX_KEYWORDS_PER_CALL: int = 150  # ограничение контекста на один запрос
+
+    # ── Безопасные пределы записи в Директ (защита от каскадных ошибок) ──
+    MAX_BID_CHANGE_PCT: float = 50.0        # запрет менять ставку более чем на 50% за раз
+    MAX_BID_ABSOLUTE_RUB: float = 3000.0    # потолок ставки, которую можно выставить автоматически
+    MAX_APPLY_BATCH_SIZE: int = 20          # максимум изменений за один запуск apply
+
     @property
     def allowed_origins_list(self) -> list[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",")]
