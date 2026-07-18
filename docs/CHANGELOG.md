@@ -5,108 +5,146 @@
 
 ---
 
+## [1.3.0] — 2026-07-18
+
+### Главное
+
+Добавлен выбор LLM-провайдера для ИИ-анализа. Раньше `run-llm-analysis` был
+жёстко привязан к Claude (платный, без постоянного бесплатного тарифа) — теперь
+можно выбрать Gemini, Groq или OpenRouter и прогнать весь пайплайн бесплатно,
+без карты, а на Claude переключиться только когда логика подтверждена.
+
+### Добавлено
+
+**`app/analyzers/llm_providers.py` — новый модуль**
+
+Единая точка вызова 4 провайдеров с общей JSON-схемой результата (`{"changes": [...]}`)
+и одним system-промптом:
+
+| Провайдер | Механизм | Стоимость |
+|---|---|---|
+| Claude | `tool_use` (Anthropic SDK) | платный |
+| Gemini | structured output (`response_schema`), без function calling — надёжнее для бесплатной модели | бесплатно |
+| Groq | OpenAI-совместимый `tool_choice` (function calling) | бесплатно |
+| OpenRouter | OpenAI-совместимый `tool_choice` (function calling) | бесплатные модели |
+
+**`llm_analyzer.py`** — `generate_suggestions()` и `_call_llm()` принимают параметр
+`provider`, вызов делегируется в `llm_providers.call_llm()`. Провайдер и модель
+сохраняются в `analysis.summary` — видно на странице «ИИ: вход/выход».
+
+**`routes.py`**
+- `GET /llm-providers` — список провайдеров и их доступность (настроен ли ключ
+  в `.env`) для селектора на фронте
+- `POST /accounts/{id}/run-llm-analysis?provider=...` — принимает провайдера
+  query-параметром, по умолчанию `claude`
+
+**`core/config.py`** — новые переменные: `GEMINI_API_KEY` / `GEMINI_MODEL`,
+`GROQ_API_KEY` / `GROQ_MODEL`, `OPENROUTER_API_KEY` / `OPENROUTER_MODEL`
+
+**Фронтенд (`crm-import.js`)** — кликабельный селектор моделей над кнопкой
+запуска. Провайдеры без настроенного ключа — затемнены и заблокированы для
+клика, кнопка запуска показывает выбранного провайдера. Если ни один ключ не
+настроен — предупреждение с подсказкой взять бесплатный у Gemini/Groq/OpenRouter.
+
+**`llm-debug.js`** — в списке анализов и в деталях суммаризации теперь виден
+провайдер, которым был выполнен конкретный запуск.
+
+### Известные ограничения
+
+- Ни один из 4 провайдеров не был вызван с реальным API-ключом в среде разработки
+  (нет исходящего сетевого доступа из песочницы). Запросы собраны по документации
+  каждого провайдера, но не проверены вживую — на реальном ключе возможны нюансы
+  формата ответа (особенно у Gemini structured output и у бесплатных моделей
+  OpenRouter, которые иногда хуже следуют function calling). Смотрите `/llm-debug`
+  после первого запуска — там сырой ответ модели и текст ошибки, если парсинг не удался.
+- requirements.txt не менялся — Gemini/Groq/OpenRouter вызываются через уже
+  использовавшийся `httpx`, отдельные SDK не добавлялись.
+
+---
+
 ## [1.2.0] — 2026-04-21
 
 ### Главное
 
-Реализован движок генерации сигналов на основе PPC Metrics Handbook. Система теперь диагностирует 12 типов проблем по 5 уровням (ставки, показы, трафик, поведение, точки роста) и генерирует обоснованные предложения с гипотезой, расчётом и ожидаемым результатом.
-
-Добавлены новые метрики сбора из API Директа: взвешенные показатели, данные об отказах, обогащение визитами из Метрики.
-
----
+Реализован Уровень 2–3 пайплайна: импорт заявок из CRM, ИИ-анализ через Claude
+API и запись подтверждённых изменений напрямую в Яндекс Директ. До этой версии
+у suggestions был только rule-based источник (`cr_analyzer.py`) и не было способа
+применить одобренное предложение в кабинете — только approve/reject в БД без
+реального эффекта.
 
 ### Добавлено
 
-**БД — новые колонки (требуется миграция `migrate_v1_2.sql`)**
+**`app/analyzers/llm_analyzer.py` — новый модуль**
 
-- `keyword_stats.weighted_impressions` (INTEGER) — взвешенные показы `WeightedImpressions` из Директа, учитывают позицию показа
-- `keyword_stats.weighted_ctr` (NUMERIC 8,4) — взвешенный CTR `WeightedCtr`, корректнее сравнивать CTR при разных позициях
-- `keyword_stats.bounce_rate` (NUMERIC 6,2) — процент отказов `BounceRate` из Директа, поведение по клику
-- `keyword_stats.sessions` (INTEGER) — визиты из Яндекс Метрики, обогащается по `utm_term → keyword.phrase` после каждого сбора
-- `campaigns.epk_collapse_detected` (BOOLEAN DEFAULT FALSE) — флаг обнаружения ЕПК-обвала
-- `hypothesisverdict` enum: добавлено значение `neutral` (требует `ALTER TYPE` отдельной командой)
+Агрегирует `keyword_stats` + `leads` (CRM) в компактный датасет по ключевым
+словам, отправляет в Claude API через `tool_use` со строгой JSON-схемой ответа,
+валидирует полученные изменения по safety-лимитам перед записью в `suggestions`:
+- запрет менять ставку более чем на `MAX_BID_CHANGE_PCT` (50%) за раз
+- потолок ставки `MAX_BID_ABSOLUTE_RUB` (3000₽)
+- дедупликация — повторный сигнал для уже существующего pending-предложения
+  не создаёт дубликат
+- в `analysis.summary` сохраняется и то, что отправили модели, и сырой ответ — видно на
+  фронте для отладки и проверки доверия к результату
 
-**Анализатор (`cr_analyzer.py`) — полная переработка**
+**`app/importers/crm_importer.py` — новый модуль**
 
-Реализовано 12 типов сигналов по дереву диагностики из PPC Metrics Handbook:
+Парсит CSV/XLSX-выгрузку заявок (1С, amoCRM, Bitrix24 и т.п.): автоопределение
+кодировки (utf-8/utf-8-sig/cp1251) и разделителя, сопоставление колонок по
+алиасам на русском и английском (`utm_term`/`ключевое слово`/`keyword` и т.п.),
+матчинг лида с ключевым словом по фразе. Записывает в таблицу `leads`.
 
-| Сигнал | Тип | Слой | Условие |
-|---|---|---|---|
-| S-001 | `low_position` | bid_keyword | avg_position > 3, clicks ≥ 3, ручная стратегия |
-| S-002 | `traffic_drop` | bid_keyword | клики упали > 40%, prev > 5, traffic_vol > 50 |
-| S-003 | `zero_ctr` | bid_keyword | impressions ≥ 100, clicks = 0 |
-| S-004 | `low_ctr` | bid_keyword | CTR < 1%, impressions ≥ 50, позиция ≤ 3 |
-| S-005 | `click_position_gap` | bid_keyword | поз.клика > поз.показа + 1.5, clicks ≥ 5 |
-| S-006 | `spend_no_conversion` | bid_keyword | spend > target_cpl × 3, clicks ≥ 30 |
-| S-010 | `epk_bid_collapse` | impression | ≥ 5 ключей одной кампании с падением ставки > 50% и кликов > 50% за период |
-| S-020 | `cpc_spike` | traffic | CPC вырос > 40% к предыдущему периоду, clicks ≥ 5 |
-| S-040 | `high_bounce_rate` | behavior | bounce_rate > 60% (критично > 75%), visits > 20 |
-| S-041 | `low_page_depth` | behavior | pageDepth < 1.3, visits > 20 |
-| S-042 | `low_visit_duration` | behavior | avgDuration < 30 сек, visits > 20 |
-| S-043 | `mobile_quality_issue` | behavior | мобильный bounce > desktop bounce + 20%, visits > 10 |
+**`app/collectors/direct_writer.py` — новый модуль**
 
-Каждый сигнал содержит: `signal_id`, `severity`, `priority`, `layer`, `description`, `hypothesis`, `action`, `expected_outcome`, `calculation_logic`, `recommended_bid`.
+Write-операции в Яндекс Директ API v5, отдельно от read-only `direct_collector.py`:
+`bids.set` (ставки), `adgroups.update` (минус-слова на уровне группы),
+`keywords.suspend`/`resume` (пауза/возобновление), `ads.update` (заголовки).
+Каждый метод возвращает `(success, detail)` без исключений наружу.
 
-Добавлен скоринг качества трафика `traffic_quality_score` (0–100) по данным Метрики.
+**`routes.py` / `core/tasks.py`**
+- `POST /accounts/{id}/run-llm-analysis` — запуск ИИ-анализа
+- `POST /accounts/{id}/crm-import` — загрузка файла CRM
+- `POST /suggestions/{id}/apply` → `_apply_suggestion_async()` — применяет
+  только предложения в статусе `approved`, с повторной проверкой типа изменения
+  и парсингом значения перед вызовом `direct_writer`
 
-**Генератор предложений (`suggestion_generator.py`) — переработка**
+**БД — новые колонки (авто-применяются при старте через `_run_migrations()`,
+ручной SQL не требуется)**
 
-Логика перенесена с `KeywordMetrics + Rule` на `analysis.problems`. Каждый сигнал из анализатора конвертируется в `Suggestion` со статусом `pending`. Реализована дедупликация — повторные сигналы для уже существующего pending-предложения не создают дубликатов.
+- `keyword_stats.weighted_impressions`, `weighted_ctr` — взвешенные показы/CTR
+  из Директа (`WeightedImpressions`/`WeightedCtr`), корректнее сравнивать при
+  разных позициях показа
+- `keyword_stats.bounce_rate` — отказы по клику из Директа
+- `keyword_stats.sessions` — визиты из Метрики, обогащается по
+  `utm_term → keyword.phrase` после каждого сбора
+- `campaigns.epk_collapse_detected` — флаг ЕПК-обвала
+- `hypothesisverdict` enum: добавлено значение `neutral`
+- таблица `leads` — создаётся автоматически через `Base.metadata.create_all()`
 
-**Коллектор (`direct_collector.py`)**
+**Коллектор (`direct_collector.py`)** — в `CRITERIA_PERFORMANCE_REPORT` добавлены
+поля `WeightedImpressions`, `WeightedCtr`, `BounceRate`.
 
-В запрос `CRITERIA_PERFORMANCE_REPORT` добавлены поля: `WeightedImpressions`, `WeightedCtr`, `BounceRate`. Теперь собираются все метрики для работы анализатора v1.2.
+**Фронтенд** — новые страницы `crm-import.js` (загрузка файла + запуск ИИ-анализа)
+и `llm-debug.js` (просмотр входа/выхода модели), кнопка Apply на `suggestions.js`.
 
-**Задачи (`core/tasks.py`)**
+### Исправление к этой записи (2026-07-18)
 
-- Новая функция `_enrich_sessions()` — после сбора Метрики матчит `utm_term → keyword.phrase → keyword_stats.sessions`. Заполняет визиты из Метрики в разрезе ключей.
-- Поисковые запросы теперь собираются в том же `async with` блоке, что и статистика — убрано лишнее открытие коннекта.
+Предыдущая версия этой записи в CHANGELOG ошибочно описывала переработку
+`cr_analyzer.py` на движок из 12 сигналов (S-001…S-043 и т.д.) — этого кода
+в проекте нет, `cr_analyzer.py` остался без изменений (топологический движок
+ v4.1, тот же, что и раньше). Запись исправлена на то, что реально было
+реализовано в этой версии: LLM-анализатор, CRM-импорт, запись в Директ.
 
-**API (`routes.py`)**
-
-- `GET /accounts/{id}/daily-stats?date_from=&date_to=` — посуточная статистика по кабинету за произвольный диапазон (для спарклайнов и графиков на дашборде)
-- `GET /accounts/{id}/campaigns/{cid}/daily-stats?date_from=&date_to=` — посуточная статистика конкретной кампании (для drill-down)
-- `period_dates()` — поддержка произвольного диапазона через `date_from / date_to / compare_from / compare_to` на всех эндпоинтах
-- Эндпоинт `/campaigns` — добавлены поля `bounce_rate`, `sessions`, `signals_count`, `signals_critical`, `signals_warning`, `has_epk_collapse`, `top_signal`
-- Эндпоинт `/keywords` — добавлены `weighted_ctr`, `weighted_impressions`, `bounce_rate`, `sessions`, `click_position_gap`, `traffic_quality`, `bid_delta`, `position_delta`
-- Эндпоинт `/dashboard` — добавлено `analysis_summary` (сводка сигналов из анализа)
-- Эндпоинт `/metrika-snapshot` — возвращает `prev_date` и `prev_data` (предыдущий снапшот для сравнения)
-
-**Фронтенд (`campaigns.js`)**
-
-- Колонка «Сигналы»: показывает количество критичных и важных сигналов по кампании, метку `⚠ ЕПК` при обнаружении обвала
-- Сортировка по умолчанию — по критичности сигналов, потом по расходу
-- Режим «Ключи» — поле сигнала показывает тип из новой классификации
-
----
-
-### Порядок деплоя v1.2
-
-1. Задеплоить новый код (все изменённые файлы)
-2. Выполнить миграцию в PostgreSQL:
-   ```sql
-   -- Из файла backend/app/db/migrate_v1_2.sql
-   ALTER TABLE keyword_stats
-     ADD COLUMN IF NOT EXISTS weighted_impressions INTEGER,
-     ADD COLUMN IF NOT EXISTS weighted_ctr NUMERIC(8, 4),
-     ADD COLUMN IF NOT EXISTS bounce_rate NUMERIC(6, 2),
-     ADD COLUMN IF NOT EXISTS sessions INTEGER;
-   ALTER TABLE campaigns
-     ADD COLUMN IF NOT EXISTS epk_collapse_detected BOOLEAN DEFAULT FALSE;
-   -- Отдельной командой вне транзакции:
-   ALTER TYPE hypothesisverdict ADD VALUE IF NOT EXISTS 'neutral';
-   ```
-3. Перезапустить бэкенд и воркер
-4. Запустить ретроспективный сбор для заполнения новых полей: `POST /accounts/{id}/sync?days=90`
-
----
-
-### Известные ограничения (без изменений)
+### Известные ограничения
 
 - `oauth_token` хранится в открытом виде в БД — нужно шифрование (запланировано)
-- Сигналы S-040..S-043 (поведение) требуют данных Метрики — при первом запуске до сбора снапшота не генерируются
-- Матчинг `utm_term → sessions` приближённый (точный требует client_id/roistat_id, Уровень 2)
-- Уровень 2 (CRM/лиды) не реализован
+- Сигналы поведенческого анализа в `cr_analyzer.py` требуют данных Метрики —
+  при первом запуске до сбора снапшота часть сигналов не генерируется
+- Матчинг `utm_term → keyword` в CRM-импорте приближённый (по фразе), точный
+  требует client_id/roistat_id
+- Реального OAuth-флоу подключения кабинета нет — токен вставляется вручную
+  в Настройках после того, как получен на oauth.yandex.ru
+- LLM-анализ и запись в Директ не были проверены на реальном кабинете и с
+  реальными ключами — см. RAILWAY_DEPLOY.md, шаг 5.5
 
 ---
 
@@ -133,7 +171,7 @@
   - `getAdGroups(id, campaignId)`
   - `triggerHistoricalSync(id, days)`
 - `api.js` — `getDashboard` и `getCampaigns` теперь принимают параметр `period`. Раньше переключение периода на дашборде и в кампаниях не имело эффекта.
-- `Layout.js` — время последней синхронизации теперь корректно показывает МСК. `last_sync_at` из БД приходит как UTC без суффикса `Z` — браузер трактовал его как локальное время. Добавлено принудительное добавление `Z` перед конвертацией.
+- `Layout.js` — время последней синхронизации теперь корректно показывает МСК. `last_sync_at` из БД приходит как UTC без суффикса `Z` — браузер трактовал это как локальное время. Добавлено принудительное добавление `Z` перед конвертацией.
 - `bids.js` — убран жёсткий фильтр `strategy_type === 'MANUAL_CPC'` на список кампаний. Теперь показываются все кампании, ручные помечаются `✎`, автоматические `⚙`.
 - `bids.js` — добавлен выбор группы объявлений (появляется после выбора кампании, подгружает группы через новый эндпоинт).
 - `bids.js` — добавлены столбцы CTR и CPC в таблицу ключей.
