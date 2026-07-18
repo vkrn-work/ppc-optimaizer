@@ -17,6 +17,10 @@ const NAV = [
     { href: '/suggestions', icon: '◈', label: 'Предложения', ersetKey: 'suggest', badgeColor: 'accent' },
     { href: '/hypotheses', icon: '◇', label: 'Гипотезы' },
   ]},
+  { section: 'ДАННЫЕ', items: [
+    { href: '/crm-import', icon: '⇧', label: 'Загрузка CRM' },
+    { href: '/llm-debug',  icon: '🤖', label: 'ИИ: вход/выход' },
+  ]},
   { section: 'СИСТЕМА', items: [
     { href: '/settings',    icon: '⊙', label: 'Кабинеты' },
     { href: '/rules',       icon: '≋', label: 'Правила' },
