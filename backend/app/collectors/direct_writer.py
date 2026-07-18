@@ -7,6 +7,12 @@
 (Bid, ContextBid и т.д.) в миллионных долях валюты — то же самое соглашение, по которому
 в direct_collector.py AvgEffectiveBid делится на 1_000_000 при чтении. Здесь при
 записи делаем обратное — умножаем рубли на 1_000_000.
+
+v1.5.1 HOTFIX: ключи ответа update/suspend-методов у API v5 именуются по
+МЕТОДУ, а НЕ по сервису: "UpdateResults" для ЛЮБОГО .update (keywords.update,
+adgroups.update, campaigns.update и т.д.) — было ошибочно предположено
+"KeywordsUpdateResults"/"AdGroupsUpdateResults" (с префиксом сущности), из-за чего
+реально успешный ответ API читался как пустой ("пустой ответ AdGroupsUpdateResults").
 """
 import logging
 import asyncio
@@ -83,9 +89,9 @@ class YandexDirectWriter:
             result = await self._post("keywords", "update", {
                 "Keywords": [{"Id": int(keyword_direct_id), "Bid": bid_micros}],
             })
-            results = result.get("KeywordsUpdateResults", [])
+            results = result.get("UpdateResults", [])
             if not results:
-                return False, "пустой ответ KeywordsUpdateResults"
+                return False, "пустой ответ UpdateResults"
             err = self._first_error(results[0])
             if err:
                 return False, err
@@ -119,9 +125,9 @@ class YandexDirectWriter:
                     "NegativeKeywords": {"Items": merged},
                 }],
             })
-            results = result.get("AdGroupsUpdateResults", [])
+            results = result.get("UpdateResults", [])
             if not results:
-                return False, "пустой ответ AdGroupsUpdateResults"
+                return False, "пустой ответ UpdateResults"
             err = self._first_error(results[0])
             if err:
                 return False, err
