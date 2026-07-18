@@ -16,6 +16,12 @@ v1.5.2: negative_keywords от LLM могут прийти с приклеенн
 — Direct API отклоняет такие слова ошибкой 5002 (дефис в начале/конце слова
 недопустим). Чистим каждое слово от ведущих/хвостовых "-"/"+" перед отправкой —
 не полагаемся только на формат ответа модели.
+
+v1.6.0: добавлен add_keywords() — добавление НОВЫХ ключевых слов в существующую
+группу через keywords.add (используется страницей «Задачи ИИ» — пользователь
+свободным текстом описывает товар, ИИ генерит фразы, после одобрения они
+пишутся в кабинет этим методом). Ответ .add-методов, по той же логике что и
+.update, именуется по методу — "AddResults".
 """
 import logging
 import asyncio
@@ -151,6 +157,40 @@ class YandexDirectWriter:
             return False, str(e)
         except Exception as e:
             logger.exception("add_negative_keywords failed")
+            return False, f"неожиданная ошибка: {e}"
+
+    # ── Новые ключевые слова в группу ────────────────────────────────────
+
+    async def add_keywords(self, ad_group_direct_id: str, keywords: list[str]) -> tuple[bool, str]:
+        """Добавляет НОВЫЕ ключевые фразы в существующую группу объявлений через
+        keywords.add. Не трогает ставку (Bid не указывается — группа/кампания
+        назначит её по своей стратегии, как для любого нового ключа вручную
+        через интерфейс). Источник: страница «Задачи ИИ» после одобрения."""
+        try:
+            phrases = [w.strip() for w in keywords if w and w.strip()]
+            if not phrases:
+                return False, "пустой список ключевых слов"
+
+            items = [{"AdGroupId": int(ad_group_direct_id), "Keyword": phrase} for phrase in phrases]
+            result = await self._post("keywords", "add", {"Keywords": items})
+            results = result.get("AddResults", [])
+            if not results:
+                return False, "пустой ответ AddResults"
+
+            errors = [self._first_error(r) for r in results]
+            ok_count = sum(1 for e in errors if not e)
+            if ok_count == 0:
+                return False, "; ".join(e for e in errors if e) or "все ключи отклонены Директом"
+            if ok_count < len(results):
+                return True, (
+                    f"добавлено {ok_count} из {len(results)} ключей "
+                    f"(отклонены: {'; '.join(e for e in errors if e)})"
+                )
+            return True, f"добавлено {ok_count} новых ключевых слов"
+        except DirectWriteError as e:
+            return False, str(e)
+        except Exception as e:
+            logger.exception("add_keywords failed")
             return False, f"неожиданная ошибка: {e}"
 
     # ── Остановка ключа ───────────────────────────────────────────────────
