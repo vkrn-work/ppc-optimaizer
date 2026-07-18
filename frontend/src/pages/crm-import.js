@@ -62,11 +62,13 @@ export default function CrmImport() {
 
       <div className="card" style={{ padding: 20, marginBottom: 16 }}>
         <div style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 14, lineHeight: 1.5 }}>
-          Загрузите CSV или XLSX-файл с заявками из вашей CRM. Файл должен содержать
-          колонку со статусом сделки (lead / sql / proposal / deal / lost) и колонку
-          с ключевым словом (utm_term), по которой заявка будет сопоставлена со
-          статистикой Яндекс.Директа. Порядок колонок не важен, названия могут быть
-          на русском (например, «Статус», «Ключевое слово», «Сумма сделки»).
+          Загрузите CSV или XLSX-файл с заявками из вашей CRM. Нужна колонка со статусом
+          заявки — любой текст, ваши реальные статусы автоматически разбиваются на воронку
+          lead / MQL / SQL. Для сопоставления с ключевыми словами достаточно либо колонки
+          с чистым ключевым словом (utm_term), либо колонки «Источник» с полной цепочкой
+          (кабинет → площадка → кампания → группа → id объявления → фраза) — она разбирается
+          автоматически и даёт более точный матчинг по номеру объявления. Порядок колонок
+          не важен, названия могут быть на русском (например, «Статус», «Источник», «Сумма сделки»).
         </div>
 
         <form onSubmit={handleUpload}>
@@ -87,13 +89,14 @@ export default function CrmImport() {
         )}
 
         {result && (
-          <div style={{ marginTop: 14, fontSize: 13, color: 'var(--text2)', lineHeight: 1.6 }}>
-            <div>✓ Импортировано заявок: <b>{result.imported}</b></div>
-            <div>Пропущено (нет статуса/ключа): <b>{result.skipped}</b></div>
-            <div>Сопоставлено с ключевыми словами: <b>{result.matched_to_keyword}</b></div>
-            <div style={{ color: 'var(--text3)', marginTop: 4 }}>
-              Найденные колонки: {result.columns_found?.join(', ') || '—'}
-            </div>
+          <div style={{ marginTop: 14, fontSize: 13, color: 'var(--text2)', lineHeight: 1.7 }}>
+            <div>✓ Импортировано заявок: <b>{result.imported}</b> из {result.total_rows} строк в файле</div>
+            <div>Воронка: MQL — <b>{result.mql_count}</b>, SQL — <b>{result.sql_count}</b></div>
+            <div style={{ marginTop: 6 }}>Сопоставлено с ключевым словом по номеру объявления: <b>{result.matched_by_ad_id}</b></div>
+            <div>Сопоставлено с ключевым словом по фразе: <b>{result.matched_by_phrase}</b></div>
+            <div>Не удалось сопоставить с ключом: <b>{result.unmatched}</b></div>
+            <div style={{ marginTop: 6 }}>Пропущено (нет статуса): <b>{result.skipped_empty_status}</b></div>
+            <div>Пропущено (дубликат по external_id): <b>{result.skipped_duplicate}</b></div>
           </div>
         )}
       </div>
