@@ -9,6 +9,13 @@ CHANGED v1.3.0 (трекер гипотез):
   - track_all_hypotheses: track_until >= now → <= now (баг инверсии условия)
   - _track_hypothesis_async: поддержка ручных гипотез (suggestion_id=None) по object_id
   - порог значимости 10→5 кликов, динамика позиции в отчёте
+
+CHANGED v1.6.0 (apply_suggestion):
+  - add_negatives теперь работает и для object_type=ad_group (напрямую привязанных
+    к группе предложений со страницы «Задачи ИИ»), а не только через
+    object_type=keyword как раньше.
+  - новый change_type=add_keywords — добавление новых ключевых слов в группу
+    через keywords.add (источник: страница «Задачи ИИ», app.analyzers.agent_command).
 """
 import asyncio
 import logging
@@ -346,7 +353,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                 except Exception as e:
                     logger.warning(f"Search queries collection failed: {e}")
 
-            # ── Метрика ─────────────────────────
+            # ── Метрика ──────────────────
             if account.metrika_counter_id:
                 try:
                     from app.models.models import MetrikaSnapshot
@@ -619,7 +626,7 @@ async def _track_hypothesis_async(hypothesis_id: int):
         await engine.dispose()
 
 
-# ─── LLM-анализ ──────────────────────────────────────────────────
+# ─── LLM-анализ ────────────────────────────────────────────
 
 @celery_app.task(name="app.core.tasks.run_llm_analysis", bind=True, max_retries=1)
 def run_llm_analysis(self, account_id: int, period_days: int = 28, provider: str = "claude"):
@@ -649,7 +656,7 @@ async def _run_llm_analysis_async(account_id: int, period_days: int = 28, provid
         await engine.dispose()
 
 
-# ─── Применение изменений в Яндекс.Директ ──────────────────────────
+# ─── Применение изменений в Яндекс.Директ ──────────────────────
 #
 # Вызывается ПОСЛЕ того, как suggestion.status уже переведён в approved
 # через POST /suggestions/{id}/action. Здесь происходит фактическая запись
@@ -695,6 +702,13 @@ async def _apply_suggestion_async(suggestion_id: int) -> dict:
                 kw_res = await db.execute(select(Keyword).where(Keyword.id == s.object_id))
                 kw = kw_res.scalar_one_or_none()
 
+            # v1.6.0: предложения со страницы «Задачи ИИ» привязаны напрямую к
+            # группе объявлений (object_type=ad_group), а не к ключу.
+            ag_direct = None
+            if s.object_type == "ad_group" and s.object_id:
+                ag_res = await db.execute(select(AdGroup).where(AdGroup.id == s.object_id))
+                ag_direct = ag_res.scalar_one_or_none()
+
             ok, detail = False, "unknown change_type"
             async with YandexDirectWriter(account.oauth_token, account.yandex_login) as writer:
                 if s.change_type in ("bid_raise", "bid_lower"):
@@ -709,30 +723,42 @@ async def _apply_suggestion_async(suggestion_id: int) -> dict:
                             ok, detail = await writer.set_keyword_bid(kw.direct_id, new_bid)
 
                 elif s.change_type == "add_negatives":
-                    if not kw:
-                        ok, detail = False, "keyword not found in DB"
-                    else:
+                    # v1.6.0: минус-слова могут прийти либо от обычного LLM-анализа
+                    # (object_type=keyword — группа определяется через ключ), либо от
+                    # страницы «Задачи ИИ» (object_type=ad_group — группа уже указана
+                    # напрямую).
+                    ag = ag_direct
+                    if not ag and kw:
                         ag_res = await db.execute(select(AdGroup).where(AdGroup.id == kw.ad_group_id))
                         ag = ag_res.scalar_one_or_none()
-                        negatives = [w.strip() for w in (s.value_after or "").split(",") if w.strip()]
-                        # Защита: старый rule-based генератор (cr_analyzer 8A) кладёт в
-                        # value_after текстовую инструкцию ("Добавить минус-слова по мусорным
-                        # запросам"), а не реальный список слов — такие значения нельзя
-                        # отправлять в Direct как NegativeKeywords. Отсекаем по эвристике:
-                        # настоящее минус-слово короткое и не похоже на предложение.
-                        looks_like_sentence = any(
-                            len(w) > 30 or "." in w or w.count(" ") > 4 for w in negatives
+                    negatives = [w.strip() for w in (s.value_after or "").split(",") if w.strip()]
+                    # Защита: старый rule-based генератор (cr_analyzer 8A) кладёт в
+                    # value_after текстовую инструкцию ("Добавить минус-слова по мусорным
+                    # запросам"), а не реальный список слов — такие значения нельзя
+                    # отправлять в Direct как NegativeKeywords. Отсекаем по эвристике:
+                    # настоящее минус-слово короткое и не похоже на предложение.
+                    looks_like_sentence = any(
+                        len(w) > 30 or "." in w or w.count(" ") > 4 for w in negatives
+                    )
+                    if not ag or not negatives:
+                        ok, detail = False, "no ad_group or empty negatives list"
+                    elif looks_like_sentence:
+                        ok, detail = False, (
+                            "value_after похож на текстовое описание, а не список минус-слов "
+                            "(вероятно, предложение создано старым rule-based анализатором без "
+                            "реального списка слов) — применение заблокировано, нужна ручная проверка"
                         )
-                        if not ag or not negatives:
-                            ok, detail = False, "no ad_group or empty negatives list"
-                        elif looks_like_sentence:
-                            ok, detail = False, (
-                                "value_after похож на текстовое описание, а не список минус-слов "
-                                "(вероятно, предложение создано старым rule-based анализатором без "
-                                "реального списка слов) — применение заблокировано, нужна ручная проверка"
-                            )
-                        else:
-                            ok, detail = await writer.add_negative_keywords(ag.direct_id, negatives)
+                    else:
+                        ok, detail = await writer.add_negative_keywords(ag.direct_id, negatives)
+
+                elif s.change_type == "add_keywords":
+                    # v1.6.0: новые ключевые слова со страницы «Задачи ИИ» — привязаны
+                    # напрямую к группе объявлений (object_type=ad_group).
+                    keywords = [w.strip() for w in (s.value_after or "").split(",") if w.strip()]
+                    if not ag_direct or not keywords:
+                        ok, detail = False, "no ad_group or empty keywords list"
+                    else:
+                        ok, detail = await writer.add_keywords(ag_direct.direct_id, keywords)
 
                 elif s.change_type in ("pause", "site_check"):
                     if not kw:
