@@ -38,8 +38,27 @@ export const api = {
   getSuggestions: (id, params = '') => req(`/accounts/${id}/suggestions${params}`),
   actionSuggestion: (id, data) =>
     req(`/suggestions/${id}/action`, { method: 'POST', body: JSON.stringify(data) }),
+  applySuggestion: (id) => req(`/suggestions/${id}/apply`, { method: 'POST' }),
 
-  getAnalyses: (id) => req(`/accounts/${id}/analyses`),
+  getLLMProviders: () => req('/llm-providers'),
+  runLLMAnalysis: (id, periodDays = 28, provider = 'claude') =>
+    req(`/accounts/${id}/run-llm-analysis?period_days=${periodDays}&provider=${provider}`, { method: 'POST' }),
+
+  importCRM: async (id, file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    const res = await fetch(`${BASE}/api/v1/accounts/${id}/crm-import`, {
+      method: 'POST',
+      body: formData,
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}))
+      throw new Error(err.detail || `HTTP ${res.status}`)
+    }
+    return res.json()
+  },
+
+  getAnalyses: (id, limit = 10) => req(`/accounts/${id}/analyses?limit=${limit}`),
   getHypotheses: (id) => req(`/accounts/${id}/hypotheses`),
   createHypothesis: (id, data) =>
     req(`/accounts/${id}/hypotheses`, { method: 'POST', body: JSON.stringify(data) }),
