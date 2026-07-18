@@ -9,11 +9,6 @@
 (Claude, Groq, OpenRouter — OpenAI-совместимый tool_choice), либо через structured output
 (Gemini — response_schema).
 
-ВНИМАНИЕ: ни один из 4 вызовов не выполнялся с реальным ключом (нет доступа
-к api.anthropic.com/generativelanguage.googleapis.com/api.groq.com/openrouter.ai
-из песочницы) — структура запросов написана по документации каждого провайдера,
-но не проверена вживую. Первый реальный вызов может вскрыть нюансы формата ответа.
-
 v1.5.0: в промпте объяснено поле bid_editable из датасета — на реальном apply
 выяснилось, что в этом кабинете нет ни одной кампании на ручных ставках —
 для авто-стратегий/ЕПК Yandex Direct API вообще не принимает Keywords[].Bid.
@@ -26,6 +21,12 @@ v1.5.2: на реальном apply add_negatives модель (Groq) верну
 где минус-слова уже хранятся с дефисом. Direct API такое отклоняет (ошибка
 5002 — дефис в начале/конце слова недопустим). Явно прописано в промпте ниже;
 дополнительно очищается в коде (direct_writer.py) как защита от повторения.
+
+v1.6.0: добавлен call_command_agent() — отдельный режим для страницы «Задачи
+ИИ»: пользователь даёт свободную команду («добавь в рекламу такую-то сталь»),
+модель генерирует список ключевых фраз + минус-слова + целевую группу объявлений
+из числа реально существующих. Отдельная схема/промпт от основного анализа —
+чтобы не трогать уже проверенный пайплайн call_llm()/CHANGES_SCHEMA.
 """
 import json
 import logging
@@ -114,8 +115,8 @@ bid_editable=false предлагай change_type=add_negatives (минус-сл
 Проанализируй данные и предложи конкретные изменения для повышения эффективности.
 Используй только те цифры, что даны в данных — не выдумывай значения. Для
 change_type=bid_raise/bid_lower обязательно укажи recommended_value в рублях,
-рассчитанный от current_value, и делай это ТОЛЬКО когда bid_editable=true.
-Не предлагай изменения там, где данных недостаточно (мало кликов/лидов) — в этом
+рассчитанный от current_value, и делай это ТОЛЬКО когда bid_editable=true. Не
+предлагай изменения там, где данных недостаточно (мало кликов/лидов) — в этом
 случае лучше пропустить ключ. Верни только вызов инструмента propose_changes."""
 
 
@@ -260,5 +261,181 @@ def _call_openai_compatible(provider: str, user_content: str) -> list[dict]:
         args_str = tool_calls[0]["function"]["arguments"]
         parsed = json.loads(args_str)
         return parsed.get("changes", [])
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        raise LLMProviderError(f"{provider}: не удалось распарсить ответ ({e}): {str(data)[:500]}")
+
+
+# ─── v1.6.0: «Задачи ИИ» — свободная команда → план новых ключевых слов ──────────
+
+COMMAND_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "target_ad_group_id": {
+            "type": ["integer", "null"],
+            "description": "id подходящей СУЩЕСТВУЮЩЕЙ группы объявлений из переданного списка, или null",
+        },
+        "needs_new_ad_group": {"type": "boolean"},
+        "suggested_ad_group_name": {
+            "type": "string",
+            "description": "если ни одна группа не подходит — предложенное название новой",
+        },
+        "keywords": {
+            "type": "array", "items": {"type": "string"},
+            "description": "новые ключевые фразы для добавления",
+        },
+        "negative_keywords": {
+            "type": "array", "items": {"type": "string"},
+            "description": "минус-слова без ведущего дефиса, для этой же группы",
+        },
+        "rationale": {"type": "string"},
+    },
+    "required": ["keywords", "rationale"],
+}
+
+COMMAND_SYSTEM_PROMPT = """Ты — опытный PPC-специалист по контекстной рекламе в Яндекс.Директ,
+работаешь с рекламным кабинетом компании, поставляющей импортный металлопрокат
+(трубы, листовой прокат, сортовой прокат и т.п.). Пользователь даёт свободную
+текстовую команду о том, что добавить в рекламу — например, конкретную марку
+стали, типоразмер трубы, ГОСТ/ТУ. Тебе передан список СУЩЕСТВУЮЩИХ групп
+объявлений в этом кабинете (id, название группы, название кампании,
+текущее число ключей в группе).
+
+Твоя задача:
+1. Сгенерировать список релевантных ключевых фраз для описанного в команде
+   товара. Используй профессиональную терминологию отрасли (ГОСТ, диаметр,
+   толщина стенки, марка стали, способ производства — бесшовная/сварная и
+   т.п.), а также разговорные формулировки, которыми реально пользуются покупатели
+   в поиске (например, и "труба 89х3.5 гост 10704", и "труба стальная 89 на 3.5
+   купить"). 8–20 фраз обычно достаточно.
+2. Определи, в какую из переданных существующих групп эти ключи лучше всего
+   добавить — по смысловому совпадению названия группы/кампании с товаром из
+   команды. Верни её id в target_ad_group_id. Используй ТОЛЬКО id из переданного
+   списка — не выдумывай числа. Если ни одна группа не подходит по смыслу,
+   верни target_ad_group_id=null, needs_new_ad_group=true и предложи вменяемое
+   название новой группы в suggested_ad_group_name.
+3. Предложи минус-слова для этой же группы, которые стоит добавить вместе с
+   новыми ключами, чтобы сразу отсечь нерелевантный трафик по новым фразам
+   (например: "бу", "чертёж", "гост скачать", "своими руками", "фото" — в
+   зависимости от специфики товара). Можно вернуть пустой список, если
+   нечего добавить.
+
+Обоснуй свой выбор группы и список ключей коротко в поле rationale."""
+
+
+def call_command_agent(provider: str, command_text: str, context: list[dict]) -> dict:
+    """Единая точка входа для страницы «Задачи ИИ». Возвращает dict с ключами
+    target_ad_group_id/needs_new_ad_group/suggested_ad_group_name/keywords/
+    negative_keywords/rationale (поля могут отсутствовать, если модель их не вернула)."""
+    if provider not in PROVIDERS:
+        raise LLMProviderError(f"Неизвестный провайдер: {provider}. Доступны: {PROVIDERS}")
+    if not provider_configured(provider):
+        raise LLMProviderError(f"API-ключ для '{provider}' не настроен в .env")
+
+    user_content = (
+        f"Команда пользователя: {command_text}\n\n"
+        f"Существующие группы объявлений в кабинете (JSON, {len(context)} шт.):\n\n"
+        + json.dumps(context, ensure_ascii=False)
+    )
+
+    if provider == "claude":
+        return _call_claude_command(user_content)
+    if provider == "gemini":
+        return _call_gemini_command(user_content)
+    if provider in ("groq", "openrouter"):
+        return _call_openai_compatible_command(provider, user_content)
+    return {}
+
+
+def _call_claude_command(user_content: str) -> dict:
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    tool = {
+        "name": "propose_plan",
+        "description": "Вернуть план добавления ключевых слов по команде пользователя.",
+        "input_schema": COMMAND_SCHEMA,
+    }
+    resp = client.messages.create(
+        model=settings.ANTHROPIC_MODEL,
+        max_tokens=2048,
+        system=COMMAND_SYSTEM_PROMPT,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": "propose_plan"},
+        messages=[{"role": "user", "content": user_content}],
+    )
+    for block in resp.content:
+        if block.type == "tool_use" and block.name == "propose_plan":
+            return block.input
+    logger.warning("Claude: ответ agent-command не содержит tool_use propose_plan")
+    return {}
+
+
+def _call_gemini_command(user_content: str) -> dict:
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{settings.GEMINI_MODEL}:generateContent?key={settings.GEMINI_API_KEY}"
+    )
+    payload = {
+        "system_instruction": {"parts": [{"text": COMMAND_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_content}]}],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": COMMAND_SCHEMA,
+            "temperature": 0.3,
+        },
+    }
+    resp = httpx.post(url, json=payload, timeout=90.0)
+    if resp.status_code != 200:
+        raise LLMProviderError(f"Gemini API error {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        raise LLMProviderError(f"Gemini: не удалось распарсить ответ ({e}): {str(data)[:500]}")
+
+
+def _call_openai_compatible_command(provider: str, user_content: str) -> dict:
+    if provider == "groq":
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        api_key = settings.GROQ_API_KEY
+        model = settings.GROQ_MODEL
+        extra_headers = {}
+    else:
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        api_key = settings.OPENROUTER_API_KEY
+        model = settings.OPENROUTER_MODEL
+        extra_headers = {"HTTP-Referer": "https://localhost", "X-Title": "PPC Optimizer"}
+
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "propose_plan",
+            "description": "Вернуть план добавления ключевых слов по команде пользователя.",
+            "parameters": COMMAND_SCHEMA,
+        },
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": COMMAND_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "tools": [tool],
+        "tool_choice": {"type": "function", "function": {"name": "propose_plan"}},
+        "temperature": 0.3,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", **extra_headers}
+    resp = httpx.post(url, json=payload, headers=headers, timeout=90.0)
+    if resp.status_code != 200:
+        raise LLMProviderError(f"{provider} API error {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    try:
+        tool_calls = data["choices"][0]["message"].get("tool_calls") or []
+        if not tool_calls:
+            logger.warning(f"{provider}: agent-command ответ без tool_calls: {str(data)[:500]}")
+            return {}
+        args_str = tool_calls[0]["function"]["arguments"]
+        return json.loads(args_str)
     except (KeyError, IndexError, json.JSONDecodeError) as e:
         raise LLMProviderError(f"{provider}: не удалось распарсить ответ ({e}): {str(data)[:500]}")

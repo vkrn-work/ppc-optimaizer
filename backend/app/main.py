@@ -5,6 +5,7 @@ from app.core.config import settings
 from app.db.database import init_db
 from app.api.routes import router
 from app.api.debug_routes import router as debug_router
+from app.api.agent_routes import router as agent_router
 
 
 @asynccontextmanager
@@ -16,7 +17,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="PPC Optimizer API",
-    version="1.3.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -31,6 +32,7 @@ app.add_middleware(
 # Routes at /api/v1/...
 app.include_router(router, prefix="/api/v1")
 app.include_router(debug_router, prefix="/api/v1")
+app.include_router(agent_router, prefix="/api/v1")
 
 
 @app.get("/health")
@@ -47,7 +49,7 @@ async def health():
     return {
         "status": "ok" if db_status == "ok" else "degraded",
         "db": db_status,
-        "version": "1.3.0",
+        "version": "1.6.0",
     }
 
 
