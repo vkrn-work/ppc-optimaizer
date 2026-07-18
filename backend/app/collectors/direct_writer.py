@@ -8,11 +8,14 @@
 в direct_collector.py AvgEffectiveBid делится на 1_000_000 при чтении. Здесь при
 записи делаем обратное — умножаем рубли на 1_000_000.
 
-v1.5.1 HOTFIX: ключи ответа update/suspend-методов у API v5 именуются по
-МЕТОДУ, а НЕ по сервису: "UpdateResults" для ЛЮБОГО .update (keywords.update,
-adgroups.update, campaigns.update и т.д.) — было ошибочно предположено
-"KeywordsUpdateResults"/"AdGroupsUpdateResults" (с префиксом сущности), из-за чего
-реально успешный ответ API читался как пустой ("пустой ответ AdGroupsUpdateResults").
+v1.5.1: ключи ответа update/suspend-методов именуются по МЕТОДУ ("UpdateResults"
+для ЛЮБОГО .update), а не по сервису.
+
+v1.5.2: negative_keywords от LLM могут прийти с приклеенным "-" (модель
+иногда копирует формат из фраз ключей в датасете, где минус-слова уже с "-")
+— Direct API отклоняет такие слова ошибкой 5002 (дефис в начале/конце слова
+недопустим). Чистим каждое слово от ведущих/хвостовых "-"/"+" перед отправкой —
+не полагаемся только на формат ответа модели.
 """
 import logging
 import asyncio
@@ -27,6 +30,14 @@ MICROS = 1_000_000
 
 class DirectWriteError(Exception):
     pass
+
+
+def _clean_negative_word(word: str) -> str:
+    """Снимает ведущие/хвостовые "-"/"+" и пробелы — Direct API принимает
+    в NegativeKeywords голые слова/фразы, знак минуса добавляет сампри применении."""
+    return " ".join(
+        tok.strip("-+") for tok in word.strip().split()
+    ).strip()
 
 
 class YandexDirectWriter:
@@ -106,6 +117,10 @@ class YandexDirectWriter:
 
     async def add_negative_keywords(self, ad_group_direct_id: str, negatives: list[str]) -> tuple[bool, str]:
         try:
+            negatives = [w for w in (_clean_negative_word(n) for n in negatives) if w]
+            if not negatives:
+                return False, "пустой список минус-слов после очистки"
+
             # NegativeKeywords в adgroups.update ПОЛНОСТЬЮ заменяет список у Яндекса,
             # поэтому сначала читаем текущий список и дописываем новые слова,
             # а не затираем существующие.
