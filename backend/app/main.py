@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.db.database import init_db
 from app.api.routes import router
+from app.api.debug_routes import router as debug_router
 
 
 @asynccontextmanager
@@ -29,6 +30,7 @@ app.add_middleware(
 
 # Routes at /api/v1/...
 app.include_router(router, prefix="/api/v1")
+app.include_router(debug_router, prefix="/api/v1")
 
 
 @app.get("/health")
@@ -94,7 +96,7 @@ async def seed_default_rules():
                     action={"type": "flag_ad_issue"},
                     priority=3,
                     is_active=True,
-                    description="Если CTR = 0 при ≥100 показах → проблема с объявлением",
+                    description="Если CTR = 0 при ≥10а"... Ошибка с объявлением",
                 ),
                 Rule(
                     account_id=None,
