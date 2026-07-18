@@ -76,6 +76,18 @@ async def _run_migrations(conn):
         # это поле попало в models.py. Первый же реальный импорт CRM падал с
         # UndefinedColumnError, т.к. ORM включает все объявленные поля в INSERT.
         "ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_medium VARCHAR(255)",
+        # v1.4.2 HOTFIX — то же самое для всех остальных полей Lead, которые обнаружились
+        # тоже отсутствующими в базе (первый реальный импорт упал на revenue сразу
+        # после фикса utm_medium — таблица очевидно никогда полностью не синхронизировалась с моделью).
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS external_id VARCHAR(255)",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS keyword_id INTEGER",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS client_id VARCHAR(255)",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_source VARCHAR(255)",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_campaign VARCHAR(255)",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS utm_term VARCHAR(500)",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS revenue NUMERIC(14,2)",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS created_at TIMESTAMP",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP",
     ]
     for sql in migrations:
         try:
