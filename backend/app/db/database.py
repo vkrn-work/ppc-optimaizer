@@ -64,6 +64,13 @@ async def _run_migrations(conn):
         "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS analysis_config JSONB DEFAULT '{}'::jsonb",
         # enum hypothesisverdict: добавить значение neutral, если его нет
         "ALTER TYPE hypothesisverdict ADD VALUE IF NOT EXISTS 'neutral'",
+        # v1.4.0: воронка lead/MQL/SQL на leads (см. app/importers/crm_importer.py)
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS raw_status VARCHAR(255)",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS is_mql BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS is_sql BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS source_raw TEXT",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS matched_by VARCHAR(50)",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS matched_ad_id VARCHAR(100)",
     ]
     for sql in migrations:
         try:
