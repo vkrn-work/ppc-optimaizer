@@ -3,35 +3,31 @@ import Layout from '../components/Layout'
 import { useAccount } from '../hooks/useAccount'
 import { api } from '../utils/api'
 
-const PERIODS = [
-  {key:'yesterday',label:'Вчера'},
-  {key:'3d',label:'3 дня'},
-  {key:'week',label:'Неделя'},
-  {key:'month',label:'Месяц'},
+// v2.1: страница переведена на реальную таблицу suggestions (была на
+// analysis.problems/opportunities — старый JSON-формат rule-based анализатора,
+// который LLM-анализатор не заполняет вообще, отсюда "предложения пустые"
+// после LLM-прогона). Действия теперь реальные: accept/reject через
+// /suggestions/{id}/action, применение в кабинет через /suggestions/{id}/apply
+// (было: createHypothesis — ничего не одобряло и не применяло по-настоящему).
+
+const STATUS_TABS = [
+  { key: 'pending',  label: 'Ожидают' },
+  { key: 'approved', label: 'Одобрены' },
+  { key: 'applied',  label: 'Применены' },
+  { key: 'rejected', label: 'Отклонены' },
 ]
 
-const SIGNAL_LABELS = {
-  low_position:        '📍 Низкая позиция',
-  traffic_drop:        '📉 Падение трафика',
-  epk_bid_collapse:    '⚠️ ЕПК-обвал ставок',
-  spend_no_conversion: '💸 Расход без конверсий',
-  cpc_spike:           '💰 Рост CPC',
-  zero_ctr:            '👁 Нулевой CTR',
-  low_ctr:             '📊 Низкий CTR',
-  click_position_gap:  '⬇ Разрыв позиций',
-  high_bounce_rate:    '↩ Высокий bounce rate',
-  low_page_depth:      '📄 Малая глубина',
-  low_visit_duration:  '⏱ Короткие визиты',
-  mobile_quality_issue:'📱 Мобильная проблема',
-  scale_opportunity:   '📈 Точка роста',
-}
-
-const LAYER_LABELS = {
-  bid_keyword: '⚙ Ставки/ключи',
-  impression:  '👁 Показы',
-  traffic:     '🚦 Трафик',
-  behavior:    '🖥 Поведение',
-  opportunity: '🚀 Рост',
+const CHANGE_TYPE_LABELS = {
+  bid_raise:      '📈 Поднять ставку',
+  bid_lower:      '📉 Снизить ставку',
+  add_negatives:  '🚫 Минус-слова',
+  pause:          '⏸ Остановить',
+  ad_rewrite:     '✏️ Переписать объявление',
+  ad_test:        '🧪 A/B тест объявления',
+  flag_ad_issue:  '⚠️ Проблема с объявлением',
+  flag_ctr_issue: '⚠️ Проблема с CTR',
+  suggest_bid_increase: '📈 Поднять ставку',
+  check:          '🔍 Проверить',
 }
 
 const PRI_LABELS = {
@@ -42,60 +38,41 @@ const PRI_LABELS = {
 }
 
 function fR(n) { return n==null?'—':Math.round(n).toLocaleString('ru')+' ₽' }
-function fP(n) { return (!n||n===0)?'—':(Math.round(n*10)/10) }
 
 export default function Suggestions() {
   const { account, accounts, accountId, switchAccount } = useAccount()
-  const [period, setPeriod]   = useState('week')
+  const [status, setStatus]   = useState('pending')
   const [items, setItems]     = useState([])
-  const [campaigns, setCampaigns] = useState([])
   const [loading, setLoading] = useState(false)
-  const [taking, setTaking]   = useState({})
-  const [done, setDone]       = useState(new Set())
+  const [busy, setBusy]       = useState({})
   const [expanded, setExpanded] = useState(new Set())
-  const [filters, setFilters] = useState({
-    sev:'', priority:'', type:'', layer:'', search:'',
-  })
+  const [filters, setFilters] = useState({ priority:'', changeType:'', search:'' })
 
-  useEffect(() => {
+  function load() {
     if (!accountId) return
     setLoading(true)
-    Promise.all([
-      api.getAnalyses(accountId),
-      api.getCampaigns(accountId, period),
-    ]).then(([analyses, camps]) => {
-      const a = analyses?.[0]
-      const problems = (a?.problems || []).map(p => ({...p, _cat:'problem'}))
-      const opps     = (a?.opportunities || []).map(o => ({...o, _cat:'opp', severity:'info'}))
-      setItems([...problems, ...opps])
-      setCampaigns(Array.isArray(camps)?camps:[])
-    }).catch(console.error).finally(() => setLoading(false))
-  }, [accountId, period])
+    api.getSuggestions(accountId, `?status=${status}`)
+      .then(rows => setItems(Array.isArray(rows) ? rows : []))
+      .catch(console.error)
+      .finally(() => setLoading(false))
+  }
+
+  useEffect(() => { load() }, [accountId, status])
 
   const setF = (k,v) => setFilters(f=>({...f,[k]:v}))
 
   const filtered = items.filter(item => {
-    const key = (item.phrase||item.entity_name||'')+'_'+(item.type||'')+'_'+(item.signal_id||'')
-    if (done.has(key)) return false
-    if (filters.sev && item.severity !== filters.sev) return false
     if (filters.priority && item.priority !== filters.priority) return false
-    if (filters.type && item.type !== filters.type) return false
-    if (filters.layer && item.layer !== filters.layer) return false
+    if (filters.changeType && item.change_type !== filters.changeType) return false
     if (filters.search) {
       const q = filters.search.toLowerCase()
-      const txt = (item.phrase||item.entity_name||'')+' '+(item.description||'')+' '+(item.action||'')
+      const txt = (item.phrase||'')+' '+(item.description||'')+' '+(item.action||'')
       if (!txt.toLowerCase().includes(q)) return false
     }
     return true
   })
 
-  const typesInData  = [...new Set(items.map(i=>i.type).filter(Boolean))]
-  const layersInData = [...new Set(items.map(i=>i.layer).filter(Boolean))]
-
-  const urgentCount  = items.filter(i =>
-    i.priority==='today' &&
-    !done.has((i.phrase||i.entity_name||'')+'_'+(i.type||'')+'_'+(i.signal_id||''))
-  ).length
+  const changeTypesInData = [...new Set(items.map(i=>i.change_type).filter(Boolean))]
 
   const byPriority = {
     today:     filtered.filter(i=>i.priority==='today'),
@@ -104,41 +81,61 @@ export default function Suggestions() {
     scale:     filtered.filter(i=>i.priority==='scale' || !i.priority),
   }
 
-  async function takeAction(item) {
-    const key = (item.phrase||item.entity_name||'')+'_'+(item.type||'')+'_'+(item.signal_id||'')
-    setTaking(t=>({...t,[key]:true}))
+  async function approve(item) {
+    setBusy(b=>({...b,[item.id]:true}))
     try {
-      await api.createHypothesis(accountId, {
-        source:             'suggestion',
-        phrase:             item.phrase || item.entity_name || '',
-        change_description: item.action,
-        forecast:           item.expected_outcome || item.description,
-        problem_type:       item.type,
-        keyword_id:         item.keyword_id,
-        severity:           item.severity,
-        priority:           item.priority,
-      })
-      setDone(d => new Set([...d, key]))
+      await api.actionSuggestion(item.id, { action: 'accept' })
+      setItems(prev => prev.filter(x=>x.id!==item.id))
     } catch(e) {
       alert('Ошибка: ' + e.message)
     } finally {
-      setTaking(t=>({...t,[key]:false}))
+      setBusy(b=>({...b,[item.id]:false}))
     }
   }
 
-  function toggleExpanded(key) {
+  async function reject(item) {
+    const reason = window.prompt('Причина отклонения (необязательно):') || undefined
+    setBusy(b=>({...b,[item.id]:true}))
+    try {
+      await api.actionSuggestion(item.id, { action: 'reject', reason })
+      setItems(prev => prev.filter(x=>x.id!==item.id))
+    } catch(e) {
+      alert('Ошибка: ' + e.message)
+    } finally {
+      setBusy(b=>({...b,[item.id]:false}))
+    }
+  }
+
+  async function applyToDirect(item) {
+    if (!window.confirm(`Применить изменение в кабинете Директа?\n\n${item.phrase}\n${item.value_before} → ${item.value_after}`)) return
+    setBusy(b=>({...b,[item.id]:true}))
+    try {
+      const res = await api.applySuggestion(item.id)
+      if (res.status === 'applied') {
+        setItems(prev => prev.map(x=>x.id===item.id ? {...x, status:'applied'} : x))
+        alert('Применено в кабинете Директа: ' + (res.detail || 'OK'))
+      } else {
+        alert('Не применилось: ' + (res.detail || JSON.stringify(res)))
+      }
+    } catch(e) {
+      alert('Ошибка применения: ' + e.message)
+    } finally {
+      setBusy(b=>({...b,[item.id]:false}))
+    }
+  }
+
+  function toggleExpanded(id) {
     setExpanded(prev => {
       const next = new Set(prev)
-      next.has(key) ? next.delete(key) : next.add(key)
+      next.has(id) ? next.delete(id) : next.add(id)
       return next
     })
   }
 
-  function SignalCard({ item }) {
-    const key   = (item.phrase||item.entity_name||'')+'_'+(item.type||'')+'_'+(item.signal_id||'')
-    const isOpen = expanded.has(key)
-    const isTaking = taking[key]
-    const sev   = item.severity || 'warning'
+  function SuggestionCard({ item }) {
+    const isOpen = expanded.has(item.id)
+    const isBusy = busy[item.id]
+    const sev = item.severity || 'warning'
     const borderColor = sev==='critical'?'var(--red)':sev==='warning'?'#e07b00':sev==='info'?'var(--accent)':'var(--green)'
 
     return (
@@ -149,104 +146,88 @@ export default function Suggestions() {
         padding: '12px 14px',
         background: 'var(--bg2)',
         cursor: 'pointer',
-      }} onClick={() => toggleExpanded(key)}>
+      }} onClick={() => toggleExpanded(item.id)}>
 
-        {/* Заголовок */}
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:8}}>
           <div style={{flex:1,minWidth:0}}>
             <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:4,alignItems:'center'}}>
               <span style={{fontSize:11,fontWeight:600,color:borderColor}}>
-                {SIGNAL_LABELS[item.type] || item.type || '—'}
+                {CHANGE_TYPE_LABELS[item.change_type] || item.change_type || '—'}
               </span>
               {item.priority && (
                 <span style={{fontSize:10,color:'var(--text3)'}}>{PRI_LABELS[item.priority]}</span>
               )}
-              {item.layer && (
+              {item.status && item.status !== 'pending' && (
                 <span style={{fontSize:10,background:'var(--bg4)',color:'var(--text3)',
                   padding:'1px 5px',borderRadius:3}}>
-                  {LAYER_LABELS[item.layer] || item.layer}
+                  {item.status}
                 </span>
               )}
             </div>
 
-            {/* Объект */}
             <div style={{fontFamily:'monospace',fontSize:11,fontWeight:500,
               overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',
               maxWidth:'100%',color:'var(--text1)',marginBottom:4}}
-              title={item.phrase||item.entity_name}>
-              {item.phrase || item.entity_name || '—'}
+              title={item.phrase}>
+              {item.phrase || '—'}
             </div>
 
-            {/* Проблема */}
             <div style={{fontSize:12,color:'var(--text2)',marginBottom:2}}>
               {item.description}
             </div>
 
-            {/* Действие */}
-            <div style={{fontSize:12,color:'var(--accent)',fontWeight:500}}>
-              → {item.action}
-            </div>
+            {(item.value_before || item.value_after) && (
+              <div style={{fontSize:12,color:'var(--accent)',fontWeight:500}}>
+                {item.value_before || '—'} → {item.value_after || '—'}
+              </div>
+            )}
           </div>
 
-          {/* Кнопка действия */}
-          <button
-            className={`btn btn-sm${isTaking?'':' btn-primary'}`}
-            style={{flexShrink:0,marginTop:2}}
-            onClick={e=>{e.stopPropagation();takeAction(item)}}
-            disabled={isTaking}
-          >
-            {isTaking?'⏳':'✓ В работу'}
-          </button>
+          <div style={{display:'flex',flexDirection:'column',gap:4,flexShrink:0,marginTop:2}}
+            onClick={e=>e.stopPropagation()}>
+            {item.status === 'pending' && (
+              <>
+                <button className="btn btn-sm btn-primary" onClick={()=>approve(item)} disabled={isBusy}>
+                  {isBusy?'⏳':'✓ Одобрить'}
+                </button>
+                <button className="btn btn-sm" onClick={()=>reject(item)} disabled={isBusy}>
+                  ✕ Отклонить
+                </button>
+              </>
+            )}
+            {item.status === 'approved' && (
+              <button className="btn btn-sm btn-primary" onClick={()=>applyToDirect(item)} disabled={isBusy}>
+                {isBusy?'⏳':'🚀 Применить в Директе'}
+              </button>
+            )}
+            {item.status === 'applied' && (
+              <span style={{fontSize:11,color:'var(--green)'}}>✓ Применено</span>
+            )}
+            {item.status === 'rejected' && (
+              <span style={{fontSize:11,color:'var(--text3)'}}>✕ Отклонено</span>
+            )}
+          </div>
         </div>
 
-        {/* Метрики */}
-        <div style={{display:'flex',gap:12,marginTop:6,fontSize:11,color:'var(--text3)',flexWrap:'wrap'}}>
-          {item.clicks!=null    && <span>Кл: <b style={{color:'var(--text1)'}}>{item.clicks}</b></span>}
-          {item.avg_position!=null && <span>Поз: <b style={{color:'var(--text1)'}}>{fP(item.avg_position)}</b></span>}
-          {item.traffic_volume!=null && <span>Объём: <b style={{color:'var(--text1)'}}>{item.traffic_volume}</b></span>}
-          {item.spend>0         && <span>Расход: <b style={{color:'var(--text1)'}}>{fR(item.spend)}</b></span>}
-          {item.metric_value!=null && item.type==='traffic_drop' &&
-            <span>Падение: <b style={{color:'var(--red)'}}>{item.metric_value}%</b></span>}
-          {item.recommended_bid && <span>Рек.ставка: <b style={{color:'var(--accent)'}}>{fR(item.recommended_bid)}</b></span>}
-          {item.metric_value!=null && item.type==='low_position' &&
-            <span>Позиция: <b style={{color:'var(--red)'}}>{item.metric_value}</b></span>}
-        </div>
-
-        {/* Развёрнутые детали */}
         {isOpen && (
           <div style={{marginTop:10,paddingTop:10,borderTop:'1px solid var(--border)'}}
             onClick={e=>e.stopPropagation()}>
-            {item.hypothesis && (
+            {item.rationale && (
               <div style={{fontSize:12,marginBottom:6}}>
-                <span style={{color:'var(--text3)',fontWeight:500}}>Гипотеза: </span>
-                <span style={{color:'var(--text2)'}}>{item.hypothesis}</span>
+                <span style={{color:'var(--text3)',fontWeight:500}}>Обоснование: </span>
+                <span style={{color:'var(--text2)'}}>{item.rationale}</span>
               </div>
             )}
-            {item.expected_outcome && (
+            {item.expected_effect && (
               <div style={{fontSize:12,marginBottom:6}}>
                 <span style={{color:'var(--text3)',fontWeight:500}}>Ожидаем: </span>
-                <span style={{color:'var(--text2)'}}>{item.expected_outcome}</span>
+                <span style={{color:'var(--text2)'}}>{item.expected_effect}</span>
               </div>
             )}
-            {item.calculation_logic && (
-              <div style={{fontSize:11,fontFamily:'monospace',color:'var(--text3)',
-                background:'var(--bg4)',padding:'6px 8px',borderRadius:4,marginBottom:6}}>
-                {item.calculation_logic}
-              </div>
-            )}
-            {/* ЕПК-обвал: список ключей */}
-            {item.type==='epk_bid_collapse' && item.collapsed_keywords && (
-              <div style={{marginTop:6}}>
-                <div style={{fontSize:11,color:'var(--text3)',marginBottom:4}}>
-                  Примеры просевших ключей:
-                </div>
-                {item.collapsed_keywords.slice(0,5).map((kw,i) => (
-                  <div key={i} style={{fontSize:10,fontFamily:'monospace',
-                    color:'var(--text2)',padding:'2px 0'}}>
-                    {kw.phrase}: {kw.prev_bid}₽ → {kw.curr_bid}₽
-                    (было {kw.prev_clicks} кл., стало {kw.curr_clicks})
-                  </div>
-                ))}
+            {item.recommended_bid != null && (
+              <div style={{fontSize:12,marginBottom:6}}>
+                <span style={{color:'var(--text3)',fontWeight:500}}>Рекомендованная ставка: </span>
+                <span style={{color:'var(--text1)'}}>{fR(item.recommended_bid)}</span>
               </div>
             )}
           </div>
@@ -255,39 +236,23 @@ export default function Suggestions() {
     )
   }
 
-  const anyFilters = Object.values(filters).some(Boolean)
+  const anyFilters = filters.priority || filters.changeType || filters.search
 
   return (
     <Layout account={account} accounts={accounts} onAccountChange={switchAccount}>
       <div className="page-header">
-        <div>
-          <div className="page-title">Предложения</div>
-          {urgentCount > 0 && (
-            <div style={{fontSize:12,color:'var(--red)',marginTop:2}}>
-              {urgentCount} требуют внимания сегодня
-            </div>
-          )}
-        </div>
+        <div className="page-title">Предложения</div>
         <div className="period-tabs">
-          {PERIODS.map(p=>(
-            <div key={p.key} className={`period-tab${period===p.key?' active':''}`}
-              onClick={()=>setPeriod(p.key)}>{p.label}</div>
+          {STATUS_TABS.map(t=>(
+            <div key={t.key} className={`period-tab${status===t.key?' active':''}`}
+              onClick={()=>setStatus(t.key)}>{t.label}</div>
           ))}
         </div>
       </div>
 
-      {/* Фильтры */}
       <div style={{display:'flex',gap:8,marginBottom:14,flexWrap:'wrap',alignItems:'center'}}>
         <input placeholder="Поиск по ключу или описанию..." value={filters.search}
           onChange={e=>setF('search',e.target.value)} style={{width:220}} />
-
-        <select value={filters.sev} onChange={e=>setF('sev',e.target.value)}
-          className="btn" style={{padding:'5px 10px'}}>
-          <option value="">Все критичности</option>
-          <option value="critical">🔴 Критично</option>
-          <option value="warning">🟡 Важно</option>
-          <option value="info">🔵 Инфо</option>
-        </select>
 
         <select value={filters.priority} onChange={e=>setF('priority',e.target.value)}
           className="btn" style={{padding:'5px 10px'}}>
@@ -298,25 +263,17 @@ export default function Suggestions() {
           <option value="scale">🟢 Масштаб</option>
         </select>
 
-        <select value={filters.type} onChange={e=>setF('type',e.target.value)}
+        <select value={filters.changeType} onChange={e=>setF('changeType',e.target.value)}
           className="btn" style={{padding:'5px 10px'}}>
-          <option value="">Все типы</option>
-          {typesInData.map(t=>(
-            <option key={t} value={t}>{SIGNAL_LABELS[t]||t}</option>
-          ))}
-        </select>
-
-        <select value={filters.layer} onChange={e=>setF('layer',e.target.value)}
-          className="btn" style={{padding:'5px 10px'}}>
-          <option value="">Все уровни</option>
-          {layersInData.map(l=>(
-            <option key={l} value={l}>{LAYER_LABELS[l]||l}</option>
+          <option value="">Все типы изменений</option>
+          {changeTypesInData.map(t=>(
+            <option key={t} value={t}>{CHANGE_TYPE_LABELS[t]||t}</option>
           ))}
         </select>
 
         {anyFilters && (
           <button className="btn"
-            onClick={()=>setFilters({sev:'',priority:'',type:'',layer:'',search:''})}>
+            onClick={()=>setFilters({priority:'',changeType:'',search:''})}>
             × Сбросить
           </button>
         )}
@@ -334,8 +291,14 @@ export default function Suggestions() {
         <div className="card">
           <div className="empty-state">
             <div className="empty-icon">◈</div>
-            <div className="empty-title">Предложений нет</div>
-            <div className="empty-desc">Запустите сбор данных для анализа</div>
+            <div className="empty-title">
+              {status==='pending' ? 'Нет предложений, ожидающих решения' : 'Пусто'}
+            </div>
+            <div className="empty-desc">
+              {status==='pending'
+                ? 'Запустите ИИ-анализ или обычный анализ на странице «Загрузка CRM»'
+                : 'В этом статусе пока ничего нет'}
+            </div>
           </div>
         </div>
       ) : filtered.length === 0 ? (
@@ -343,7 +306,6 @@ export default function Suggestions() {
           Нет предложений по выбранным фильтрам
         </div>
       ) : (
-        /* Группировка по приоритету */
         <div style={{display:'flex',flexDirection:'column',gap:20}}>
           {[
             {key:'today',     items:byPriority.today},
@@ -356,8 +318,8 @@ export default function Suggestions() {
                 {PRI_LABELS[group.key]} — {group.items.length} {group.items.length===1?'предложение':'предложений'}
               </div>
               <div style={{display:'flex',flexDirection:'column',gap:6}}>
-                {group.items.map((item,i) => (
-                  <SignalCard key={i} item={item} />
+                {group.items.map(item => (
+                  <SuggestionCard key={item.id} item={item} />
                 ))}
               </div>
             </div>
