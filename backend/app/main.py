@@ -96,7 +96,7 @@ async def seed_default_rules():
                     action={"type": "flag_ad_issue"},
                     priority=3,
                     is_active=True,
-                    description="Если CTR = 0 при ≥10а"... Ошибка с объявлением",
+                    description="Если CTR = 0 при ≥100 показах → проблема с объявлением",
                 ),
                 Rule(
                     account_id=None,
