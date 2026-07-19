@@ -25,8 +25,8 @@ v1.5.2: на реальном apply add_negatives модель (Groq) верну
 v1.6.0: добавлен call_command_agent() — отдельный режим для страницы «Задачи
 ИИ»: пользователь даёт свободную команду («добавь в рекламу такую-то сталь»),
 модель генерирует список ключевых фраз + минус-слова + целевую группу объявлений
-из числа реально существующих. Отдельная схема/промпт от основного анализа —
-чтобы не трогать уже проверенный пайплайн call_llm()/CHANGES_SCHEMA.
+из числа реально существующих. Отдельная схема/промпт от основного анализа
+— чтобы не трогать уже проверенный пайплайн call_llm()/CHANGES_SCHEMA.
 """
 import json
 import logging
@@ -35,6 +35,7 @@ from typing import Optional
 import httpx
 
 from app.core.config import settings
+from app.analyzers.yandex_direct_knowledge import get_llm_knowledge_block
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ CHANGES_SCHEMA = {
                     "priority": {"type": "string", "enum": ["today", "this_week", "month", "scale"]},
                     "negative_keywords": {
                         "type": "array", "items": {"type": "string"},
-                        "description": "для change_type=add_negatives — список минус-слов, БЕЗ ведущего дефиса (просто 'ремонт', а не '-ремонт')",
+                        "description": "для change_type=add_negatives — список минус-слов, БЕЗ ведущего дефиса ('ремонт', а не '-ремонт')",
                     },
                 },
                 "required": ["keyword_id", "phrase", "change_type", "rationale", "priority"],
@@ -118,6 +119,11 @@ change_type=bid_raise/bid_lower обязательно укажи recommended_va
 рассчитанный от current_value, и делай это ТОЛЬКО когда bid_editable=true. Не
 предлагай изменения там, где данных недостаточно (мало кликов/лидов) — в этом
 случае лучше пропустить ключ. Верни только вызов инструмента propose_changes."""
+
+# v1.7.0 (пункт 4 запроса): дописываем справку по механике API + методологию
+# диагностики — чтобы модель не предлагала технически неприменимые
+# изменения и рассуждала по тому же дереву причин, что и ручной аудит.
+SYSTEM_PROMPT = SYSTEM_PROMPT + "\n\n" + get_llm_knowledge_block()
 
 
 class LLMProviderError(Exception):
@@ -295,8 +301,8 @@ COMMAND_SCHEMA = {
 COMMAND_SYSTEM_PROMPT = """Ты — опытный PPC-специалист по контекстной рекламе в Яндекс.Директ,
 работаешь с рекламным кабинетом компании, поставляющей импортный металлопрокат
 (трубы, листовой прокат, сортовой прокат и т.п.). Пользователь даёт свободную
-текстовую команду о том, что добавить в рекламу — например, конкретную марку
-стали, типоразмер трубы, ГОСТ/ТУ. Тебе передан список СУЩЕСТВУЮЩИХ групп
+текстовую команду о том, что добавить в рекламу — например, конкретную
+марку стали, типоразмер трубы, ГОСТ/ТУ. Тебе передан список СУЩЕСТВУЮЩИХ групп
 объявлений в этом кабинете (id, название группы, название кампании,
 текущее число ключей в группе).
 
@@ -307,7 +313,7 @@ COMMAND_SYSTEM_PROMPT = """Ты — опытный PPC-специалист по
    т.п.), а также разговорные формулировки, которыми реально пользуются покупатели
    в поиске (например, и "труба 89х3.5 гост 10704", и "труба стальная 89 на 3.5
    купить"). 8–20 фраз обычно достаточно.
-2. Определи, в какую из переданных существующих групп эти ключи лучше всего
+2. Определи в какую из переданных существующих групп эти ключи лучше всего
    добавить — по смысловому совпадению названия группы/кампании с товаром из
    команды. Верни её id в target_ad_group_id. Используй ТОЛЬКО id из переданного
    списка — не выдумывай числа. Если ни одна группа не подходит по смыслу,
@@ -320,6 +326,8 @@ COMMAND_SYSTEM_PROMPT = """Ты — опытный PPC-специалист по
    нечего добавить.
 
 Обоснуй свой выбор группы и список ключей коротко в поле rationale."""
+
+COMMAND_SYSTEM_PROMPT = COMMAND_SYSTEM_PROMPT + "\n\n" + get_llm_knowledge_block()
 
 
 def call_command_agent(provider: str, command_text: str, context: list[dict]) -> dict:
@@ -434,6 +442,210 @@ def _call_openai_compatible_command(provider: str, user_content: str) -> dict:
         tool_calls = data["choices"][0]["message"].get("tool_calls") or []
         if not tool_calls:
             logger.warning(f"{provider}: agent-command ответ без tool_calls: {str(data)[:500]}")
+            return {}
+        args_str = tool_calls[0]["function"]["arguments"]
+        return json.loads(args_str)
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        raise LLMProviderError(f"{provider}: не удалось распарсить ответ ({e}): {str(data)[:500]}")
+
+
+# ─── v1.7.0 (пункт 6 запроса): создание рекламных кампаний ИИ ────────────
+#
+# Отдельная схема/промпт от CHANGES_SCHEMA/COMMAND_SCHEMA — здесь модель не
+# правит существующие объекты, а проектирует НОВУЮ кампанию с нуля: группы,
+# точные и широкие ключи, минус-слова, тексты объявлений. Результат идёт как
+# один Suggestion(change_type="create_campaign", payload=черновик) — ничего
+# не создаётся в Директе, пока директолог не одобрит (см. campaign_planner.py
+# и app.core.tasks._apply_suggestion_async).
+
+CAMPAIGN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "Название новой кампании, понятное человеку"},
+        "daily_budget_rub": {"type": "number", "description": "Стартовый дневной бюджет в рублях — консервативный, для теста (обычно 300-1000₽)"},
+        "rationale": {"type": "string", "description": "Почему эта кампания имеет смысл — на основе каких данных/спроса"},
+        "ad_groups": {
+            "type": "array",
+            "description": "1-5 групп объявлений, каждая — один товар/марка/стандарт (правило «один интент — одна группа»)",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "keywords": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "8-20 ключевых фраз: и точные коммерческие с размерами/марками, и более широкие",
+                    },
+                    "negative_keywords": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "минус-слова без ведущего дефиса, отсекающие информационный интент",
+                    },
+                    "ads": {
+                        "type": "array",
+                        "description": "1 текстовое объявление на группу",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title":  {"type": "string", "description": "заголовок 1, до 56 символов"},
+                                "title2": {"type": "string", "description": "заголовок 2, до 30 символов, можно пусто"},
+                                "text":   {"type": "string", "description": "текст объявления, до 81 символа"},
+                                "href":   {"type": "string", "description": "ссылка на посадочную страницу"},
+                            },
+                            "required": ["title", "text", "href"],
+                        },
+                    },
+                },
+                "required": ["name", "keywords"],
+            },
+        },
+    },
+    "required": ["name", "daily_budget_rub", "ad_groups"],
+}
+
+CAMPAIGN_SYSTEM_PROMPT = """Ты — опытный PPC-специалист по контекстной рекламе в Яндекс.Директ,
+работаешь с рекламным кабинетом компании, поставляющей импортный металлопрокат
+(трубы, листовой прокат, сортовой прокат и т.п.), B2B-сегмент. Тебе дана
+свободная команда о том, какую новую кампанию нужно создать (например: «создай
+кампанию по маркам стали 1.4310 и S315MC» или «запусти кампанию по трубам
+профильным для нового направления»), а также опционально — данные о спросе
+и конверсиях по смежным ключам/кластерам, если они уже есть в кабинете.
+
+Спроектируй кампанию с нуля:
+1. Название кампании — понятное, отражающее товар/направление.
+2. Стартовый дневной бюджет — консервативный (обычно 300-1000₽), это НОВАЯ
+   кампания без истории, крупный бюджет здесь неуместен.
+3. Группы объявлений — по правилу «один интент — одна группа»: не смешивай
+   коммерческие запросы с размерами/марками и информационные (описание/
+   характеристики стандарта) в одной группе.
+4. Ключевые фразы — используй профессиональную терминологию отрасли (ГОСТ,
+   диаметр, толщина стенки, марка стали, способ производства) и то, как
+   реально ищут снабженцы. Приоритет — точные фразы с конкретными размерами
+   и марками (самый конвертирующий тип по методологии проекта, "золотые
+   фразы"), плюс несколько более широких для охвата.
+5. Минус-слова — отсекай информационный интент («что такое», «характеристики»,
+   «скачать», «гост pdf») и конкурирующие материалы, если применимо.
+6. Одно текстовое объявление на группу — заголовок с маркой/стандартом,
+   текст с конкретным оффером, ссылка на посадочную (если не знаешь точный
+   URL — используй разумную заглушку вида https://example.com/catalog и
+   поясни в rationale, что ссылку нужно проверить и заменить перед подтверждением).
+
+Обоснуй в rationale, почему эта кампания и её бюджет разумны."""
+
+CAMPAIGN_SYSTEM_PROMPT = CAMPAIGN_SYSTEM_PROMPT + "\n\n" + get_llm_knowledge_block()
+
+
+def call_campaign_planner(provider: str, command_text: str, market_context: list[dict]) -> dict:
+    """Точка входа для конструктора кампаний (пункт 6). Возвращает черновик
+    dict с ключами name/daily_budget_rub/ad_groups/rationale — ничего не
+    создаёт в Директе сама, только формирует структуру для payload будущего
+    Suggestion(change_type=create_campaign)."""
+    if provider not in PROVIDERS:
+        raise LLMProviderError(f"Неизвестный провайдер: {provider}. Доступны: {PROVIDERS}")
+    if not provider_configured(provider):
+        raise LLMProviderError(f"API-ключ для '{provider}' не настроен в .env")
+
+    user_content = (
+        f"Команда пользователя: {command_text}\n\n"
+        f"Контекст по смежным ключам/кластерам в кабинете, если есть (JSON):\n\n"
+        + json.dumps(market_context, ensure_ascii=False)
+    )
+
+    if provider == "claude":
+        return _call_claude_campaign(user_content)
+    if provider == "gemini":
+        return _call_gemini_campaign(user_content)
+    if provider in ("groq", "openrouter"):
+        return _call_openai_compatible_campaign(provider, user_content)
+    return {}
+
+
+def _call_claude_campaign(user_content: str) -> dict:
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    tool = {
+        "name": "propose_campaign",
+        "description": "Вернуть черновик новой рекламной кампании.",
+        "input_schema": CAMPAIGN_SCHEMA,
+    }
+    resp = client.messages.create(
+        model=settings.ANTHROPIC_MODEL,
+        max_tokens=4096,
+        system=CAMPAIGN_SYSTEM_PROMPT,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": "propose_campaign"},
+        messages=[{"role": "user", "content": user_content}],
+    )
+    for block in resp.content:
+        if block.type == "tool_use" and block.name == "propose_campaign":
+            return block.input
+    logger.warning("Claude: ответ campaign-planner не содержит tool_use propose_campaign")
+    return {}
+
+
+def _call_gemini_campaign(user_content: str) -> dict:
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{settings.GEMINI_MODEL}:generateContent?key={settings.GEMINI_API_KEY}"
+    )
+    payload = {
+        "system_instruction": {"parts": [{"text": CAMPAIGN_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": user_content}]}],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "response_schema": CAMPAIGN_SCHEMA,
+            "temperature": 0.3,
+        },
+    }
+    resp = httpx.post(url, json=payload, timeout=120.0)
+    if resp.status_code != 200:
+        raise LLMProviderError(f"Gemini API error {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        raise LLMProviderError(f"Gemini: не удалось распарсить ответ ({e}): {str(data)[:500]}")
+
+
+def _call_openai_compatible_campaign(provider: str, user_content: str) -> dict:
+    if provider == "groq":
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        api_key = settings.GROQ_API_KEY
+        model = settings.GROQ_MODEL
+        extra_headers = {}
+    else:
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        api_key = settings.OPENROUTER_API_KEY
+        model = settings.OPENROUTER_MODEL
+        extra_headers = {"HTTP-Referer": "https://localhost", "X-Title": "PPC Optimizer"}
+
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "propose_campaign",
+            "description": "Вернуть черновик новой рекламной кампании.",
+            "parameters": CAMPAIGN_SCHEMA,
+        },
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": CAMPAIGN_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "tools": [tool],
+        "tool_choice": {"type": "function", "function": {"name": "propose_campaign"}},
+        "temperature": 0.3,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", **extra_headers}
+    resp = httpx.post(url, json=payload, headers=headers, timeout=120.0)
+    if resp.status_code != 200:
+        raise LLMProviderError(f"{provider} API error {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    try:
+        tool_calls = data["choices"][0]["message"].get("tool_calls") or []
+        if not tool_calls:
+            logger.warning(f"{provider}: campaign-planner ответ без tool_calls: {str(data)[:500]}")
             return {}
         args_str = tool_calls[0]["function"]["arguments"]
         return json.loads(args_str)
