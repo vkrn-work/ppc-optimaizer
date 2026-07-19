@@ -5,7 +5,7 @@ import { api } from '../utils/api'
 
 // v1.6.0: страница «ИИ-анализ» объединяет три раньше отдельные страницы
 // (suggestions.js, crm-import.js, llm-debug.js) в вкладки одной страницы, чтобы
-// весь цикл «запустить → посмотреть ответ → одобрить» был на одном экране.
+весь цикл «запустить → посмотреть ответ → одобрить» был на одном экране.
 // Старые URL страниц (оставлены в коде, убраны из меню) работают как раньше.
 
 const TABS = [
@@ -501,6 +501,7 @@ function DebugSection({ accountId }) {
   const [analyses, setAnalyses] = useState([])
   const [loading, setLoading] = useState(false)
   const [selected, setSelected] = useState(null)
+  const [showRaw, setShowRaw] = useState(false)
 
   function load() {
     if (!accountId) return
@@ -518,12 +519,16 @@ function DebugSection({ accountId }) {
   useEffect(() => { load() }, [accountId])
 
   const s = selected?.summary || {}
+  const diagnostics = Array.isArray(s.llm_diagnostics) ? s.llm_diagnostics : []
+  const execSummary = s.llm_executive_summary || ''
+  const changesCount = s.llm_raw_output?.length ?? 0
+  const hasChat = diagnostics.length > 0 || execSummary
 
   return (
     <>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
         <div style={{ fontSize: 13, color: 'var(--text2)', maxWidth: 700 }}>
-          Здесь видно, какие данные реально ушли в LLM API и что модель вернула до применения safety-лимитов.
+          Здесь видно ход мыслей ИИ по каждому запуску анализа — что проверял, что нашёл и почему предлагает именно это.
         </div>
         <button className="btn" onClick={load}>↻ Обновить</button>
       </div>
@@ -554,7 +559,7 @@ function DebugSection({ accountId }) {
               <div><b>Провайдер:</b> {s.provider || '—'}</div>
               <div><b>Модель:</b> {s.model || '—'}</div>
               <div><b>Ключей отправлено:</b> {s.llm_input_full_count ?? '—'}</div>
-              <div><b>Изменений от ИИ:</b> {s.llm_raw_output?.length ?? 0}</div>
+              <div><b>Изменений от ИИ:</b> {changesCount}</div>
               <div><b>Прошло в suggestions:</b> {s.suggestions_created ?? '—'}</div>
               <div><b>Отклонено safety-лимитами:</b> {s.rejected_by_safety_limits ?? '—'}</div>
             </div>
@@ -565,31 +570,94 @@ function DebugSection({ accountId }) {
             )}
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
-            <div className="card" style={{ padding: 16 }}>
-              <div style={{ fontWeight: 600, marginBottom: 8 }}>
-                📥 Что отправили в модель (первые 15 из {s.llm_input_full_count ?? 0})
-              </div>
-              <pre style={{
-                fontSize: 11, background: 'var(--bg4)', padding: 10, borderRadius: 6,
-                overflow: 'auto', maxHeight: 500, whiteSpace: 'pre-wrap',
-              }}>
-                {JSON.stringify(s.llm_input_sample || [], null, 2)}
-              </pre>
+          {/* v1.7.1: живой «чат» с ИИ — пошаговый рассказ о ходе анализа человеческим
+              языком вместо голого JSON. diagnostics/summary приходят из того же вызова
+              LLM, что и changes — модель сама объясняет, что проверяла и почему. */}
+          <div className="card" style={{ padding: 18, marginBottom: 14 }}>
+            <div style={{ fontWeight: 600, marginBottom: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
+              🤖 Разбор ИИ-аналитика
             </div>
 
-            <div className="card" style={{ padding: 16 }}>
-              <div style={{ fontWeight: 600, marginBottom: 8 }}>
-                📤 Что вернула модель (сырой ответ, до фильтров)
+            {!hasChat ? (
+              <div style={{ fontSize: 13, color: 'var(--text3)' }}>
+                {s.error
+                  ? 'Анализ завершился ошибкой до получения ответа модели — рассказа нет, см. ошибку выше.'
+                  : 'Этот запуск сделан до обновления с пошаговым разбором — здесь только сырые данные ниже. Запустите анализ заново, чтобы увидеть рассказ ИИ.'}
               </div>
-              <pre style={{
-                fontSize: 11, background: 'var(--bg4)', padding: 10, borderRadius: 6,
-                overflow: 'auto', maxHeight: 500, whiteSpace: 'pre-wrap',
-              }}>
-                {JSON.stringify(s.llm_raw_output || [], null, 2)}
-              </pre>
-            </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{
+                  alignSelf: 'center', fontSize: 12, color: 'var(--text3)', fontStyle: 'italic',
+                  textAlign: 'center', marginBottom: 4,
+                }}>
+                  — Запуск анализа: {s.llm_input_full_count ?? '?'} ключевых слов, провайдер {s.provider} ({s.model}) —
+                </div>
+
+                {diagnostics.map((step, i) => (
+                  <div key={i} style={{
+                    alignSelf: 'flex-start', maxWidth: '85%',
+                    background: 'var(--bg4)', borderRadius: '14px 14px 14px 4px',
+                    padding: '10px 14px', fontSize: 13, lineHeight: 1.6, color: 'var(--text1)',
+                  }}>
+                    {step}
+                  </div>
+                ))}
+
+                {execSummary && (
+                  <div style={{
+                    alignSelf: 'flex-start', maxWidth: '90%',
+                    background: 'var(--accent-bg, rgba(59,130,246,0.1))',
+                    border: '1px solid var(--accent)',
+                    borderRadius: '14px 14px 14px 4px',
+                    padding: '10px 14px', fontSize: 13, lineHeight: 1.6, fontWeight: 500,
+                  }}>
+                    <div style={{ fontSize: 11, color: 'var(--text3)', fontWeight: 400, marginBottom: 4 }}>Итог</div>
+                    {execSummary}
+                  </div>
+                )}
+
+                <div style={{ alignSelf: 'center', fontSize: 12, color: 'var(--text3)', marginTop: 4 }}>
+                  {changesCount} предложений сформировано · {s.suggestions_created ?? 0} прошло проверку лимитов
+                  {(s.rejected_by_safety_limits ?? 0) > 0 && <> · {s.rejected_by_safety_limits} отклонено safety-лимитами</>}
+                  {' '}— см. вкладку «Предложения».
+                </div>
+              </div>
+            )}
           </div>
+
+          <div style={{ marginBottom: 10 }}>
+            <button className="btn" onClick={() => setShowRaw(v => !v)}>
+              {showRaw ? '▾ Скрыть технические данные' : '▸ Показать технические данные (сырой JSON)'}
+            </button>
+          </div>
+
+          {showRaw && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+              <div className="card" style={{ padding: 16 }}>
+                <div style={{ fontWeight: 600, marginBottom: 8 }}>
+                  📥 Что отправили в модель (первые 15 из {s.llm_input_full_count ?? 0})
+                </div>
+                <pre style={{
+                  fontSize: 11, background: 'var(--bg4)', padding: 10, borderRadius: 6,
+                  overflow: 'auto', maxHeight: 500, whiteSpace: 'pre-wrap',
+                }}>
+                  {JSON.stringify(s.llm_input_sample || [], null, 2)}
+                </pre>
+              </div>
+
+              <div className="card" style={{ padding: 16 }}>
+                <div style={{ fontWeight: 600, marginBottom: 8 }}>
+                  📤 Что вернула модель (сырой ответ, до фильтров)
+                </div>
+                <pre style={{
+                  fontSize: 11, background: 'var(--bg4)', padding: 10, borderRadius: 6,
+                  overflow: 'auto', maxHeight: 500, whiteSpace: 'pre-wrap',
+                }}>
+                  {JSON.stringify(s.llm_raw_output || [], null, 2)}
+                </pre>
+              </div>
+            </div>
+          )}
         </>
       )}
     </>
