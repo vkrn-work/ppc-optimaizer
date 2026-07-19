@@ -4,7 +4,7 @@ LLM-анализатор. В отличие от cr_analyzer.py (жёсткие 
 какие проблемы есть и что с ними делать.
 
 v1.5.0: в датасет добавлен bid_editable (см. _build_dataset) — выяснилось на
-реальном apply, что в этом кабинете нет ни одной кампании на MANUAL_CPC — для
+real apply, что в этом кабинете нет ни одной кампании на MANUAL_CPC — для
 авто-стратегий/ЕПК Yandex Direct API не принимает Keywords[].Bid вообще
 ("API error 8000: неизвестный параметр Bid") — это ограничение самого API, не баг.
 _validate_change теперь жёстко отклоняет bid_raise/bid_lower для bid_editable=false даже
@@ -101,7 +101,7 @@ class LLMAnalyzer:
             camp = campaigns.get(ag.campaign_id) if ag else None
             return bool(camp and camp.strategy_type == "MANUAL_CPC")
 
-        # ── CRM: воронка lead → MQL → SQL по ключевому слову ─────────────────
+        # ── CRM: воронка lead → MQL → SQL по ключевому слову ──────────────
         # (заменяет прежнюю агрегацию по deals/revenue — для этого аккаунта
         # интересны не продажи, а количество/стоимость/конверсия в MQL и SQL,
         # см. app/importers/crm_importer.py)
@@ -155,7 +155,7 @@ class LLMAnalyzer:
         dataset.sort(key=lambda r: r["spend_rub"], reverse=True)
         return dataset[: settings.LLM_MAX_KEYWORDS_PER_CALL]
 
-    def _call_llm(self, dataset: list[dict], provider: str) -> list[dict]:
+    def _call_llm(self, dataset: list[dict], provider: str) -> dict:
         return llm_providers.call_llm(provider, dataset)
 
     def _validate_change(self, change: dict, kw: Optional[Keyword], bid_editable: bool = True) -> Optional[str]:
@@ -209,11 +209,19 @@ class LLMAnalyzer:
 
         error_detail = None
         try:
-            changes = self._call_llm(dataset, provider)
+            llm_result = self._call_llm(dataset, provider)
         except Exception as e:
             logger.error(f"LLM call failed (provider={provider}): {e}")
-            changes = []
+            llm_result = {"changes": [], "diagnostics": [], "summary": ""}
             error_detail = str(e)
+
+        changes = llm_result.get("changes", [])
+        # v1.7.1 (живой чат с ИИ на вкладке «История вход/выход» вместо голого JSON):
+        # diagnostics — пошаговый рассказ модели о ходе анализа человеческим языком,
+        # llm_executive_summary — итоговое резюме. Оба поля идут из того же вызова
+        # LLM, что и changes — ничего дополнительно не запрашиваем и не платим.
+        diagnostics = llm_result.get("diagnostics", [])
+        executive_summary = llm_result.get("summary", "")
 
         # Сохраняем ЧТО отправили и ЧТО получили — видно на фронте для отладки/доверия к результату.
         analysis.summary = {
@@ -224,6 +232,8 @@ class LLMAnalyzer:
             "llm_input_sample": dataset[:15],   # первые 15 строк датасета, полностью — в БД
             "llm_input_full_count": len(dataset),
             "llm_raw_output": changes,           # сырой ответ модели, ДО фильтрации safety-лимитами
+            "llm_diagnostics": diagnostics,
+            "llm_executive_summary": executive_summary,
             "error": error_detail,
         }
 
