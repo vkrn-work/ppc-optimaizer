@@ -27,6 +27,14 @@ v1.6.0: добавлен call_command_agent() — отдельный режим 
 модель генерирует список ключевых фраз + минус-слова + целевую группу объявлений
 из числа реально существующих. Отдельная схема/промпт от основного анализа
 — чтобы не трогать уже проверенный пайплайн call_llm()/CHANGES_SCHEMA.
+
+v1.7.1: добавлены поля diagnostics/summary в CHANGES_SCHEMA — модель теперь возвращает
+не только список изменений, но и пошаговый человекочитаемый рассказ о ходе анализа —
+для живого «чата» с ИИ на вкладке «История вход/выход» вместо голого JSON.
+Промпт также теперь явно требует разбор ВСЕГО датасета, а не 1-2 самых
+очевидных кандидатов — типичный ответ теперь должен содержать 5-20+
+изменений, если данные это оправдывают. max_tokens/maxOutputTokens подняты до
+8192 во всех 4 провайдерах под более длинные ответы.
 """
 import json
 import logging
@@ -45,8 +53,31 @@ PROVIDERS = ("claude", "gemini", "groq", "openrouter")
 CHANGES_SCHEMA = {
     "type": "object",
     "properties": {
+        "diagnostics": {
+            "type": "array",
+            "description": (
+                "Пошаговый рассказ о ходе анализа человеческим языком, от первого лица, как "
+                "будто ты объясняешь коллеге вживую что делаешь: что посмотрел, какую закономерность "
+                "нашёл, что она значит. 4-10 отдельных шагов, каждый 1-3 предложения. Пиши так, будто "
+                "печатаешь сообщения в чате по ходу анализа, а не итоговый отчёт постфактум."
+            ),
+            "items": {"type": "string"},
+        },
+        "summary": {
+            "type": "string",
+            "description": (
+                "Итоговое резюме анализа на 2-5 предложений человеческим языком: сколько ключей "
+                "разобрано, сколько проблем/возможностей найдено, что в приоритете и почему."
+            ),
+        },
         "changes": {
             "type": "array",
+            "description": (
+                "Полный список изменений — по КАЖДОМУ ключевому слову из датасета, для которого "
+                "цифры дают основание что-то предложить. Не ограничивайся 1-2 самыми очевидными "
+                "кандидатами — разбери весь датасет и верни все обоснованные изменения, их может "
+                "быть 5, 10, 20 и больше, если данные это поддерживают."
+            ),
             "items": {
                 "type": "object",
                 "properties": {
@@ -58,7 +89,14 @@ CHANGES_SCHEMA = {
                     },
                     "current_value": {"type": "string", "description": "текущее значение (например, ставка в ₽)"},
                     "recommended_value": {"type": "string", "description": "рекомендованное значение"},
-                    "rationale": {"type": "string", "description": "почему, на основе каких цифр"},
+                    "rationale": {
+                        "type": "string",
+                        "description": (
+                            "почему, на основе каких конкретных цифр из датасета этого ключа — "
+                            "пиши в человеческом тоне, как будто объясняешь вслух, а не сухим "
+                            "канцеляритом ('вижу, что...', 'смотрю на...', 'значит...')"
+                        ),
+                    },
                     "expected_effect": {"type": "string", "description": "ожидаемый эффект"},
                     "priority": {"type": "string", "enum": ["today", "this_week", "month", "scale"]},
                     "negative_keywords": {
@@ -70,7 +108,7 @@ CHANGES_SCHEMA = {
             },
         },
     },
-    "required": ["changes"],
+    "required": ["diagnostics", "summary", "changes"],
 }
 
 SYSTEM_PROMPT = """Ты — опытный PPC-специалист по контекстной рекламе (Яндекс.Директ).
@@ -118,7 +156,31 @@ bid_editable=false предлагай change_type=add_negatives (минус-сл
 change_type=bid_raise/bid_lower обязательно укажи recommended_value в рублях,
 рассчитанный от current_value, и делай это ТОЛЬКО когда bid_editable=true. Не
 предлагай изменения там, где данных недостаточно (мало кликов/лидов) — в этом
-случае лучше пропустить ключ. Верни только вызов инструмента propose_changes."""
+случае лучше пропустить ключ.
+
+ГЛУБИНА АНАЛИЗА — это важно: тебе присылают весь датасет не для того, чтобы
+ты выбрал 1-2 самых очевидных ключа и остановился. Пройдись по КАЖДОЙ строке
+датасета и для каждой прими решение: есть основание предложить изменение —
+предлагай, нет оснований — переходи к следующей. Типичный качественный ответ
+на 15-30 ключей должен содержать от 5 до 20+ изменений разных типов (не
+только bid_raise/bid_lower — используй весь набор: add_negatives, pause,
+ad_rewrite, ad_test), если цифры это оправдывают. Не сокращай список
+искусственно и не ленись — редкий, скупой ответ на 1 предложение хуже, чем
+подробный разбор с явным "по этим ключам данных пока недостаточно" в diagnostics.
+
+ФОРМАТ ОТВЕТА — три поля:
+1. diagnostics — пошаговый рассказ о ходе твоего анализа ЖИВЫМ человеческим
+   языком, от первого лица, как будто ты прямо сейчас печатаешь в чате
+   директологу, что делаешь: "Смотрю на ключ X — 40 кликов, 0 заявок за 28
+   дней, это подозрительно...", "Проверяю voronku по ключам с высоким
+   расходом...", "Нашёл 3 ключа, где cost_per_sql в 3 раза выше среднего...".
+   4-10 шагов, каждый 1-3 предложения, разговорный, но профессиональный тон,
+   БЕЗ канцелярита и воды.
+2. summary — итоговое резюме на 2-5 предложений: сколько ключей разобрано,
+   сколько проблем/возможностей нашёл, что в приоритете и почему.
+3. changes — сам список изменений (см. описание поля в схеме).
+
+Верни только вызов инструмента propose_changes."""
 
 # v1.7.0 (пункт 4 запроса): дописываем справку по механике API + методологию
 # диагностики — чтобы модель не предлагала технически неприменимые
@@ -148,8 +210,11 @@ def provider_model_name(provider: str) -> str:
     }.get(provider, "unknown")
 
 
-def call_llm(provider: str, dataset: list[dict]) -> list[dict]:
-    """Единая точка входа. Возвращает список changes (может быть пустым)."""
+def call_llm(provider: str, dataset: list[dict]) -> dict:
+    """Единая точка входа. Возвращает dict {"changes": [...], "diagnostics": [...],
+    "summary": "..."} — diagnostics/summary дают человекочитаемый рассказ о ходе
+    анализа для вкладки «История вход/выход» (v1.7.1, живой чат с ИИ вместо
+    голого JSON)."""
     if provider not in PROVIDERS:
         raise LLMProviderError(f"Неизвестный провайдер: {provider}. Доступны: {PROVIDERS}")
     if not provider_configured(provider):
@@ -157,7 +222,7 @@ def call_llm(provider: str, dataset: list[dict]) -> list[dict]:
 
     user_content = (
         f"Данные по {len(dataset)} ключевым словам за период "
-        f"(JSON, has_crm={any('crm_leads' in r for r in dataset)}):\n\n"
+        f"(JSON, has_crm={{any('crm_leads' in r for r in dataset)}}):\n\n"
         + json.dumps(dataset, ensure_ascii=False)
     )
 
@@ -167,10 +232,10 @@ def call_llm(provider: str, dataset: list[dict]) -> list[dict]:
         return _call_gemini(user_content)
     if provider in ("groq", "openrouter"):
         return _call_openai_compatible(provider, user_content)
-    return []
+    return {"changes": [], "diagnostics": [], "summary": ""}
 
 
-def _call_claude(user_content: str) -> list[dict]:
+def _call_claude(user_content: str) -> dict:
     import anthropic
 
     client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
@@ -181,7 +246,7 @@ def _call_claude(user_content: str) -> list[dict]:
     }
     resp = client.messages.create(
         model=settings.ANTHROPIC_MODEL,
-        max_tokens=4096,
+        max_tokens=8192,  # v1.7.1: было 4096 — мало для развёрнутого разбора + diagnostics по всему датасету
         system=SYSTEM_PROMPT,
         tools=[tool],
         tool_choice={"type": "tool", "name": "propose_changes"},
@@ -189,12 +254,16 @@ def _call_claude(user_content: str) -> list[dict]:
     )
     for block in resp.content:
         if block.type == "tool_use" and block.name == "propose_changes":
-            return block.input.get("changes", [])
+            return {
+                "changes": block.input.get("changes", []),
+                "diagnostics": block.input.get("diagnostics", []),
+                "summary": block.input.get("summary", ""),
+            }
     logger.warning("Claude: ответ не содержит tool_use propose_changes")
-    return []
+    return {"changes": [], "diagnostics": [], "summary": ""}
 
 
-def _call_gemini(user_content: str) -> list[dict]:
+def _call_gemini(user_content: str) -> dict:
     """Gemini — через structured output (response_schema), без function calling:
     так надёжнее получить чистый JSON от бесплатной модели."""
     url = (
@@ -208,21 +277,26 @@ def _call_gemini(user_content: str) -> list[dict]:
             "response_mime_type": "application/json",
             "response_schema": CHANGES_SCHEMA,
             "temperature": 0.2,
+            "maxOutputTokens": 8192,  # v1.7.1: развёрнутый разбор + diagnostics по всему датасету
         },
     }
-    resp = httpx.post(url, json=payload, timeout=90.0)
+    resp = httpx.post(url, json=payload, timeout=120.0)
     if resp.status_code != 200:
         raise LLMProviderError(f"Gemini API error {resp.status_code}: {resp.text[:500]}")
     data = resp.json()
     try:
         text = data["candidates"][0]["content"]["parts"][0]["text"]
         parsed = json.loads(text)
-        return parsed.get("changes", [])
+        return {
+            "changes": parsed.get("changes", []),
+            "diagnostics": parsed.get("diagnostics", []),
+            "summary": parsed.get("summary", ""),
+        }
     except (KeyError, IndexError, json.JSONDecodeError) as e:
         raise LLMProviderError(f"Gemini: не удалось распарсить ответ ({e}): {str(data)[:500]}")
 
 
-def _call_openai_compatible(provider: str, user_content: str) -> list[dict]:
+def _call_openai_compatible(provider: str, user_content: str) -> dict:
     """Groq и OpenRouter реализуют OpenAI Chat Completions API с tool calling —
     общая логика для обоих."""
     if provider == "groq":
@@ -253,9 +327,10 @@ def _call_openai_compatible(provider: str, user_content: str) -> list[dict]:
         "tools": [tool],
         "tool_choice": {"type": "function", "function": {"name": "propose_changes"}},
         "temperature": 0.2,
+        "max_tokens": 8192,  # v1.7.1: было без ограничения/по умолчанию малое — теперь явно достаточно для diagnostics + длинного списка changes
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", **extra_headers}
-    resp = httpx.post(url, json=payload, headers=headers, timeout=90.0)
+    resp = httpx.post(url, json=payload, headers=headers, timeout=120.0)
     if resp.status_code != 200:
         raise LLMProviderError(f"{provider} API error {resp.status_code}: {resp.text[:500]}")
     data = resp.json()
@@ -263,15 +338,19 @@ def _call_openai_compatible(provider: str, user_content: str) -> list[dict]:
         tool_calls = data["choices"][0]["message"].get("tool_calls") or []
         if not tool_calls:
             logger.warning(f"{provider}: ответ без tool_calls: {str(data)[:500]}")
-            return []
+            return {"changes": [], "diagnostics": [], "summary": ""}
         args_str = tool_calls[0]["function"]["arguments"]
         parsed = json.loads(args_str)
-        return parsed.get("changes", [])
+        return {
+            "changes": parsed.get("changes", []),
+            "diagnostics": parsed.get("diagnostics", []),
+            "summary": parsed.get("summary", ""),
+        }
     except (KeyError, IndexError, json.JSONDecodeError) as e:
         raise LLMProviderError(f"{provider}: не удалось распарсить ответ ({e}): {str(data)[:500]}")
 
 
-# ─── v1.6.0: «Задачи ИИ» — свободная команда → план новых ключевых слов ──────────
+# ─── v1.6.0: «Задачи ИИ» — свободная команда → план новых ключевых слов ────────────
 
 COMMAND_SCHEMA = {
     "type": "object",
@@ -318,7 +397,7 @@ COMMAND_SYSTEM_PROMPT = """Ты — опытный PPC-специалист по
    команды. Верни её id в target_ad_group_id. Используй ТОЛЬКО id из переданного
    списка — не выдумывай числа. Если ни одна группа не подходит по смыслу,
    верни target_ad_group_id=null, needs_new_ad_group=true и предложи вменяемое
-   название новой группы в suggested_ad_group_name.
+   название новой в suggested_ad_group_name.
 3. Предложи минус-слова для этой же группы, которые стоит добавить вместе с
    новыми ключами, чтобы сразу отсечь нерелевантный трафик по новым фразам
    (например: "бу", "чертёж", "гост скачать", "своими руками", "фото" — в
@@ -333,7 +412,7 @@ COMMAND_SYSTEM_PROMPT = COMMAND_SYSTEM_PROMPT + "\n\n" + get_llm_knowledge_block
 def call_command_agent(provider: str, command_text: str, context: list[dict]) -> dict:
     """Единая точка входа для страницы «Задачи ИИ». Возвращает dict с ключами
     target_ad_group_id/needs_new_ad_group/suggested_ad_group_name/keywords/
-    negative_keywords/rationale (поля могут отсутствовать, если модель их не вернула)."""
+    negative_keywords/rationale (поля могут отсутствовать, если модель их не вернёт)."""
     if provider not in PROVIDERS:
         raise LLMProviderError(f"Неизвестный провайдер: {provider}. Доступны: {PROVIDERS}")
     if not provider_configured(provider):
@@ -518,7 +597,7 @@ CAMPAIGN_SYSTEM_PROMPT = """Ты — опытный PPC-специалист п�
    характеристики стандарта) в одной группе.
 4. Ключевые фразы — используй профессиональную терминологию отрасли (ГОСТ,
    диаметр, толщина стенки, марка стали, способ производства) и то, как
-   реально ищут снабженцы. Приоритет — точные фразы с конкретными размерами
+   реально ищут снабженцы. Приоритет — точные фразы с кончкретными размерами
    и марками (самый конвертирующий тип по методологии проекта, "золотые
    фразы"), плюс несколько более широких для охвата.
 5. Минус-слова — отсекай информационный интент («что такое», «характеристики»,
