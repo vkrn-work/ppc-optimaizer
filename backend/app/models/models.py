@@ -31,7 +31,7 @@ class Base(DeclarativeBase):
     pass
 
 
-# ─── Справочники ───────────────────────────────────────────────────────
+# ─── Справочники ──────────────────────────────────────────────────
 
 class Account(Base):
     """Рекламный кабинет (один аккаунт Яндекс Директ)"""
@@ -49,7 +49,7 @@ class Account(Base):
     target_cpl: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
     target_cpql: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
     
-    # ── Настройки анализатора v2.0 ──────────────────────────
+    # ── Настройки анализатора v2.0 ─────────────────
     analysis_config: Mapped[Optional[dict]] = mapped_column(JSONB, default={}, server_default='{}')
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -140,7 +140,7 @@ class Keyword(Base):
     stats: Mapped[list["KeywordStat"]] = relationship(back_populates="keyword")
 
 
-# ─── Статистика ─────────────────────────────────────────────────────
+# ─── Статистика ────────────────────────────────────────
 
 class CampaignStat(Base):
     """Статистика кампании по дням"""
@@ -186,27 +186,27 @@ class KeywordStat(Base):
     clicks: Mapped[int] = mapped_column(Integer, default=0)
     spend: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
 
-    # ── Базовые трафиковые метрики ────────────────────────────────
+    # ── Базовые трафиковые метрики ──────────────────────
     ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))           # %
     avg_cpc: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))      # ₽
 
-    # ── Ставка и аукцион ─────────────────────────────────────────────────
+    # ── Ставка и аукцион ──────────────────────────────────────────────────────────────
     avg_bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))      # AvgEffectiveBid в ₽
 
-    # ── Позиционные метрики ──────────────────────────────────────────────
+    # ── Позиционные метрики ────────────────────────────────────────────────────
     avg_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
     avg_click_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
 
-    # ── Объём рынка ────────────────────────────────────────────────────────
+    # ── Объём рынка ───────────────────────────────────────────────────────────────
     traffic_volume: Mapped[Optional[int]] = mapped_column(Integer)           # AvgTrafficVolume 0–150
     weighted_impressions: Mapped[Optional[int]] = mapped_column(Integer)     # v1.2
     weighted_ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))  # v1.2
 
-    # ── Поведенческие (из Директа + Метрики) ────────────────────────────────
+    # ── Поведенческие (из Директа + Метрики) ────────────────────────────
     bounce_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))   # v1.2, %
     sessions: Mapped[Optional[int]] = mapped_column(Integer)                 # v1.2, из Метрики
 
-    # ── Служебные ─────────────────────────────────────────────────────────────
+    # ── Служебные ─────────────────────────────────────────────────────────────────────
     ad_id: Mapped[Optional[str]] = mapped_column(String(100))
 
     __table_args__ = (
@@ -245,7 +245,7 @@ class Lead(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-    # ── Воронка lead / MQL / SQL (v1.4.0) ───────────────────────────
+    # ── Воронка lead / MQL / SQL (v1.4.0) ────────────────────────
     # raw_status — исходный текст статуса из CRM (для прозрачности/отладки,
     #   т.к. в реальных выгрузках статусы не совпадают со старым LeadStatus enum).
     raw_status: Mapped[Optional[str]] = mapped_column(String(255))
@@ -265,7 +265,7 @@ class Lead(Base):
     matched_ad_id: Mapped[Optional[str]] = mapped_column(String(100))
 
 
-# ─── Аналитика ───────────────────────────────────────────────────────
+# ─── Аналитика ────────────────────────────────────────────────────
 
 class AnalysisResult(Base):
     """Результат еженедельного анализа по кабинету"""
@@ -305,7 +305,7 @@ class KeywordMetrics(Base):
     bid_source: Mapped[str] = mapped_column(String(50), default="cluster")
 
 
-# ─── Правила и предложения ──────────────────────────────────────────────
+# ─── Правила и предложения ───────────────────────────────────────
 
 class MetrikaSnapshot(Base):
     """Снапшот данных из Метрики — все срезы за один сбор"""
@@ -404,6 +404,13 @@ class Suggestion(Base):
     approved_by: Mapped[Optional[str]] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # v1.7.0: универсальное хранилище структурированных данных предложения,
+    # которые не влезают в короткие String(500) value_before/value_after —
+    # используется, например, для change_type=create_campaign (полный черновик
+    # кампании: группы, ключи, минус-слова, тексты объявлений) и может
+    # переиспользоваться будущими типами предложений без новых миграций.
+    payload: Mapped[Optional[dict]] = mapped_column(JSON)
 
     analysis: Mapped["AnalysisResult"] = relationship(back_populates="suggestions")
     hypothesis: Mapped[Optional["Hypothesis"]] = relationship(
