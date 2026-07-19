@@ -75,4 +75,10 @@ export const api = {
   // Получить статистику кампании по дням
   getCampaignDailyStats: (id, campaignId, dateFrom, dateTo) =>
     req(`/accounts/${id}/campaigns/${campaignId}/daily-stats?date_from=${dateFrom}&date_to=${dateTo}`),
+
+  // v1.6.0 — страница «Задачи ИИ»: свободная команда → план новых ключевых слов,
+  // создающий pending-предложения (ничего не применяет сразу).
+  runAgentCommand: (id, command, provider = 'claude') =>
+    req(`/accounts/${id}/agent-command`, { method: 'POST', body: JSON.stringify({ command, provider }) }),
+  getAgentCommands: (id, limit = 20) => req(`/accounts/${id}/agent-commands?limit=${limit}`),
 }

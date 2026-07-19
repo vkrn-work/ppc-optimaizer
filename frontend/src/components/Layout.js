@@ -2,28 +2,22 @@ import { useState, useEffect } from 'react'
 import { useRouter } from 'next/router'
 import { api } from '../utils/api'
 
+// v1.6.0: новая структура навигации — 5 разделов вместо 13 разрозненных страниц.
+// Старые страницы (Новые ключи, Минуса, Правила, Гипотезы) оставлены в коде,
+// но убраны из меню по решению пользователя.
 const NAV = [
+  { section: 'ГЛАВНАЯ', items: [
+    { href: '/', icon: '◉', label: 'Главная' },
+  ]},
   { section: 'АНАЛИЗ', items: [
-    { href: '/',            icon: '◉', label: 'Main Board' },
-    { href: '/campaigns',   icon: '≡', label: 'По кампаниям' },
-    { href: '/bids',        icon: '₽', label: 'Ставки' },
-    { href: '/adjustments', icon: '⊕', label: 'Корректировки' },
+    { href: '/analysis', icon: '≡', label: 'Полный анализ' },
   ]},
-  { section: 'ПОИСКОВЫЕ ФРАЗЫ', items: [
-    { href: '/new-keywords', icon: '+', label: 'Новые ключи', badgeKey: 'new_kw', badgeColor: 'green' },
-    { href: '/negatives',    icon: '×', label: 'Минуса',       badgeKey: 'neg' },
-  ]},
-  { section: 'ОПТИМИЗАЦИЯ', items: [
-    { href: '/suggestions', icon: '◈', label: 'Предложения', ersetKey: 'suggest', badgeColor: 'accent' },
-    { href: '/hypotheses', icon: '◇', label: 'Гипотезы' },
-  ]},
-  { section: 'ДАННЫЕ', items: [
-    { href: '/crm-import', icon: '⇧', label: 'Загрузка CRM' },
-    { href: '/llm-debug',  icon: '🤖', label: 'ИИ: вход/выход' },
+  { section: 'ИИ', items: [
+    { href: '/ai-analysis', icon: '🤖', label: 'ИИ-анализ', badgeKey: 'suggest', badgeColor: 'accent' },
+    { href: '/ai-tasks',    icon: '⚡', label: 'Задачи ИИ' },
   ]},
   { section: 'СИСТЕМА', items: [
     { href: '/settings',    icon: '⊙', label: 'Кабинеты' },
-    { href: '/rules',       icon: '≋', label: 'Правила' },
     { href: '/diagnostics', icon: '⚠', label: 'Диагностика', badgeKey: 'errors', danger: true },
   ]},
 ]
@@ -73,12 +67,14 @@ export default function Layout({ children, account, accounts, onAccountChange })
 
   useEffect(() => {
     if (!accountId) return
-    fetch(`https://ppc-optimaizer-production.up.railway.app/api/v1/accounts/${accountId}/analyses`)
+    // CHANGED v1.6.0: badge "suggest" раньше читал analysis.problems (мёртвый
+    // rule-based формат, который LLM-анализатор не заполняет) — теперь берём
+    // реальное число pending-предложений из таблицы suggestions.
+    fetch(`https://ppc-optimaizer-production.up.railway.app/api/v1/accounts/${accountId}/suggestions?status=pending`)
       .then(r => r.json())
-      .then(data => {
-        const a = data?.[0]
-        const urgentProblems = (a?.problems || []).filter(p => p.priority === 'today').length
-        setBadges(prev => ({ ...prev, suggest: urgentProblems || null }))
+      .then(rows => {
+        const n = Array.isArray(rows) ? rows.length : 0
+        setBadges(prev => ({ ...prev, suggest: n || null }))
       }).catch(() => {})
     fetch(`https://ppc-optimaizer-production.up.railway.app/api/v1/health`)
       .then(r => r.json())
