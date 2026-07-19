@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     YANDEX_DIRECT_API_URL: str = "https://api.direct.yandex.com/json/v5"
     YANDEX_METRIKA_API_URL: str = "https://api-metrika.yandex.net"
 
-    # Пороги CR (из воркфлоу и плейбука)
+    # ── Пороги CR (из воркфлоу и плейбука) ──
     CR_HIGH_THRESHOLD: float = 0.15
     CR_MID_THRESHOLD: float = 0.05
     CR_LOW_THRESHOLD: float = 0.03
@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     ANTHROPIC_MODEL: str = "claude-sonnet-4-5"
 
     GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-3.5-flash"
 
     GROQ_API_KEY: Optional[str] = None
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     # ── Безопасные пределы записи в Директ (защита от каскадных ошибок) ──
     MAX_BID_CHANGE_PCT: float = 50.0        # запрет менять ставку более чем на 50% за раз
     MAX_BID_ABSOLUTE_RUB: float = 3000.0    # потолок ставки, которую можно выставить автоматически
-    MAX_APPLY_BATCH_SIZE: int = 20          # максимум изменений за один запуск apply
+    MAX_APPLY_BATCH_SIZE: int = 20          # максимум изменений за один запуск
 
     @property
     def allowed_origins_list(self) -> list[str]:
