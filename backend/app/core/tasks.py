@@ -353,7 +353,7 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                 except Exception as e:
                     logger.warning(f"Search queries collection failed: {e}")
 
-            # ── Метрика ──────────────────
+            # ── Метрика ────────────────
             if account.metrika_counter_id:
                 try:
                     from app.models.models import MetrikaSnapshot
@@ -385,7 +385,20 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
             await db.commit()
             logger.info(f"Data collection complete for account {account_id}")
 
+            # v1.7.0 (пункт 5 запроса): автономный ежедневный ИИ-анализ.
+            # Раньше LLM-анализ запускался только вручную (кнопка на фронте
+            # POST /run-llm-analysis) — CR-анализатор (rule-based) был
+            # единственным, что реально работало по расписанию. Теперь после
+            # каждого ежедневного сбора запускается ещё и LLM-анализ, если он
+            # не отключён явно для этого аккаунта — директолог заходит утром
+            # уже к готовым pending-предложениям, а не сам должен их запросить.
+            cfg = account.analysis_config or {}
+            autonomous_enabled = cfg.get("autonomous_llm_enabled", settings.AUTONOMOUS_LLM_ENABLED)
+            llm_provider = cfg.get("llm_provider", settings.DEFAULT_LLM_PROVIDER)
+
         run_analysis.delay(account_id)
+        if autonomous_enabled:
+            run_llm_analysis.delay(account_id, period_days=28, provider=llm_provider)
     finally:
         await engine.dispose()
 
@@ -626,7 +639,7 @@ async def _track_hypothesis_async(hypothesis_id: int):
         await engine.dispose()
 
 
-# ─── LLM-анализ ────────────────────────────────────────────
+# ─── LLM-анализ ──────────────────────────────────
 
 @celery_app.task(name="app.core.tasks.run_llm_analysis", bind=True, max_retries=1)
 def run_llm_analysis(self, account_id: int, period_days: int = 28, provider: str = "claude"):
@@ -656,7 +669,7 @@ async def _run_llm_analysis_async(account_id: int, period_days: int = 28, provid
         await engine.dispose()
 
 
-# ─── Применение изменений в Яндекс.Директ ──────────────────────
+# ─── Применение изменений в Яндекс.Директ ──────────────
 #
 # Вызывается ПОСЛЕ того, как suggestion.status уже переведён в approved
 # через POST /suggestions/{id}/action. Здесь происходит фактическая запись
@@ -765,6 +778,28 @@ async def _apply_suggestion_async(suggestion_id: int) -> dict:
                         ok, detail = False, "keyword not found in DB"
                     else:
                         ok, detail = await writer.suspend_keyword(kw.direct_id)
+
+                elif s.change_type == "create_campaign":
+                    # v1.7.0 (пункт 6): создание кампании целиком из черновика
+                    # (см. app/generators/campaign_planner.py). Единственный
+                    # путь записи в Директ, ни разу не проверенный на живом
+                    # аккаунте — см. предупреждение в direct_writer.py
+                    # create_campaign(). Best-effort: даже при частичном
+                    # провале (например, одна группа не создалась) кампания и
+                    # успешные группы остаются в кабинете, отчёт по каждому
+                    # шагу сохраняется в payload для разбора вручную.
+                    if not s.payload or not s.payload.get("ad_groups"):
+                        ok, detail = False, "suggestion.payload пустой или без групп — нечего создавать"
+                    else:
+                        report = await writer.create_full_campaign(s.payload)
+                        ok = bool(report.get("campaign_ok"))
+                        groups_ok = sum(1 for g in report.get("groups", []) if g.get("ok"))
+                        groups_total = len(report.get("groups", []))
+                        detail = (
+                            f"campaign_id={report.get('campaign_id')}, групп создано {groups_ok}/{groups_total}"
+                            if ok else report.get("detail", "campaign creation failed")
+                        )
+                        s.payload = {**s.payload, "apply_report": report}
 
                 else:
                     ok, detail = False, f"change_type '{s.change_type}' requires manual action (not auto-applicable)"

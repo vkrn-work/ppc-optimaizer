@@ -53,8 +53,8 @@ async def _run_migrations(conn):
         "CREATE INDEX IF NOT EXISTS ix_ms_account_date ON metrika_snapshots (account_id, date)",
         # Фильтровать только активные кампании в представлении
         "ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS state VARCHAR(50)",
-        # CHANGED: v1.2 колонки — раньше отсутствовали в миграциях, из-за чего
-        # на уже существующей БД сбор статистики падал на INSERT этих полей.
+        # CHANGED: v1.2 колонки — раньше отсутствовали в миграциях, из-за
+        # чего на уже существующей БД сбор статистики падал на INSERT этих полей.
         "ALTER TABLE keyword_stats ADD COLUMN IF NOT EXISTS weighted_impressions INTEGER",
         "ALTER TABLE keyword_stats ADD COLUMN IF NOT EXISTS weighted_ctr NUMERIC(8,4)",
         "ALTER TABLE keyword_stats ADD COLUMN IF NOT EXISTS bounce_rate NUMERIC(6,2)",
@@ -109,6 +109,9 @@ async def _run_migrations(conn):
         # suggestion_id в БД оказался NOT NULL, хотя в модели Optional — ручные
         # гипотезы без suggestion_id (со страницы /hypotheses) упали бы по той же схеме.
         "ALTER TABLE hypotheses ALTER COLUMN suggestion_id DROP NOT NULL",
+        # v1.7.0: универсальный JSON-payload для предложений (create_campaign и
+        # будущие типы, которым нужна структура сложнее короткой строки).
+        "ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS payload JSON",
     ]
     for sql in migrations:
         try:

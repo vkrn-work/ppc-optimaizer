@@ -16,7 +16,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel
-from sqlalchemy import select, func, and_, desc, text
+from sqlalchemy import select, func, and_, desc, text, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
@@ -31,7 +31,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-# ─── Helpers ────────────────────────────────────────────────────
+# ─── Helpers ────────────────────────────────────
 
 def period_dates(period: str, date_from: Optional[str] = None, date_to: Optional[str] = None,
                  compare_from: Optional[str] = None, compare_to: Optional[str] = None):
@@ -134,6 +134,59 @@ def calc_delta(curr, prev, invert=False):
     return round(-d if invert else d, 1)
 
 
+async def agg_leads(db, account_id: int, date_from: datetime, date_to: datetime, spend: float) -> dict:
+    """
+    Агрегация CRM-воронки (Lead) за период — leads/MQL/SQL + CPL/cost_per_mql/cost_per_sql.
+    Данные уже есть в БД через /crm-import (см. app/importers/crm_importer.py), но
+    раньше не попадали на дашборд — там был статичный плейсхолдер "CRM не подключена"
+    независимо от того, загружали ли выгрузку. spend берётся из уже посчитанного
+    agg_kw_stats() того же периода, чтобы не пересчитывать сумму расхода дважды.
+    """
+    q = select(
+        func.count(Lead.id).label("leads"),
+        func.sum(case((Lead.is_mql.is_(True), 1), else_=0)).label("mql"),
+        func.sum(case((Lead.is_sql.is_(True), 1), else_=0)).label("sql"),
+    ).where(and_(
+        Lead.account_id == account_id,
+        Lead.created_at >= date_from,
+        Lead.created_at <= date_to,
+    ))
+    r = await db.execute(q)
+    row = r.one()
+    leads = int(row.leads or 0)
+    mql   = int(row.mql or 0)
+    sql   = int(row.sql or 0)
+    return {
+        "leads": leads,
+        "mql":   mql,
+        "sql":   sql,
+        "cr_lead_mql":   round(mql / leads * 100, 1) if leads else None,
+        "cr_mql_sql":    round(sql / mql * 100, 1) if mql else None,
+        "cpl":           round(spend / leads, 2) if leads else None,
+        "cost_per_mql":  round(spend / mql, 2) if mql else None,
+        "cost_per_sql":  round(spend / sql, 2) if sql else None,
+    }
+
+
+def mk_crm_kpi_block(curr: dict, prev: dict) -> dict:
+    def mk_delta(key, invert=False):
+        d = calc_delta(curr.get(key), prev.get(key))
+        if d is None:
+            return None
+        return {"value": d, "is_good": (d < 0 if invert else d > 0)}
+
+    return {
+        "leads":         {"value": curr["leads"],         "delta": mk_delta("leads"),                 "prev": prev["leads"]},
+        "mql":           {"value": curr["mql"],            "delta": mk_delta("mql"),                   "prev": prev["mql"]},
+        "sql":           {"value": curr["sql"],            "delta": mk_delta("sql"),                   "prev": prev["sql"]},
+        "cr_lead_mql":   {"value": curr["cr_lead_mql"],     "delta": mk_delta("cr_lead_mql"),           "prev": prev["cr_lead_mql"]},
+        "cr_mql_sql":    {"value": curr["cr_mql_sql"],      "delta": mk_delta("cr_mql_sql"),            "prev": prev["cr_mql_sql"]},
+        "cpl":           {"value": curr["cpl"],             "delta": mk_delta("cpl", invert=True),      "prev": prev["cpl"]},
+        "cost_per_mql":  {"value": curr["cost_per_mql"],    "delta": mk_delta("cost_per_mql", invert=True), "prev": prev["cost_per_mql"]},
+        "cost_per_sql":  {"value": curr["cost_per_sql"],    "delta": mk_delta("cost_per_sql", invert=True), "prev": prev["cost_per_sql"]},
+    }
+
+
 def mk_kpi_block(curr_kpi: dict, prev_kpi: dict) -> dict:
     def mk_delta(key, invert=False):
         d = calc_delta(curr_kpi.get(key), prev_kpi.get(key))
@@ -204,7 +257,7 @@ async def get_daily_series(db, account_id: int, date_from: datetime, date_to: da
     return rows
 
 
-# ─── Accounts ──────────────────────────────────────────────────
+# ─── Accounts ──────────────────────────────────
 
 class AccountCreate(BaseModel):
     name: str
@@ -360,7 +413,7 @@ async def trigger_llm_analysis(
     return {"status": "started", "provider": provider, "message": f"ИИ-анализ запущен ({provider})"}
 
 
-# ─── CRM-импорт ───────────────────────────────────────────────
+# ─── CRM-импорт ──────────────────────────────
 
 @router.post("/accounts/{account_id}/crm-import")
 async def import_crm(
@@ -387,7 +440,7 @@ async def import_crm(
     return {"status": "ok", **stats}
 
 
-# ─── Применение изменения в Яндекс.Директ ──────────────────────
+# ─── Применение изменения в Яндекс.Директ ──────────────
 
 @router.post("/suggestions/{suggestion_id}/apply")
 async def apply_suggestion_endpoint(suggestion_id: int, db: AsyncSession = Depends(get_db)):
@@ -406,7 +459,7 @@ async def apply_suggestion_endpoint(suggestion_id: int, db: AsyncSession = Depen
         raise HTTPException(400, result.get("detail", "apply failed"))
     return result
 
-# ─── Daily Stats ──────────────────────────────────────────────
+# ─── Daily Stats ──────────────────────────────
 
 @router.get("/accounts/{account_id}/daily-stats")
 async def get_daily_stats(
@@ -441,7 +494,7 @@ async def get_campaign_daily_stats(
     return {"campaign_id": campaign_id, "date_from": date_from, "date_to": date_to, "rows": rows}
 
 
-# ─── Dashboard ──────────────────────────────────────────────
+# ─── Dashboard ──────────────────────────────
 
 @router.get("/accounts/{account_id}/dashboard")
 async def get_dashboard(
@@ -465,6 +518,16 @@ async def get_dashboard(
     curr_kpi = await agg_kw_stats(db, account_id, curr_start, curr_end)
     prev_kpi = await agg_kw_stats(db, account_id, prev_start, prev_end)
     kpi_with_deltas = mk_kpi_block(curr_kpi, prev_kpi)
+
+    # v1.7.0: CRM-воронка (лиды/MQL/SQL) на дашборде — раньше данные из /crm-import
+    # копились в БД, но на Главную не попадали (был статичный плейсхолдер).
+    curr_leads_kpi = await agg_leads(db, account_id, curr_start, curr_end, curr_kpi["spend"])
+    prev_leads_kpi = await agg_leads(db, account_id, prev_start, prev_end, prev_kpi["spend"])
+    crm_kpi = mk_crm_kpi_block(curr_leads_kpi, prev_leads_kpi)
+    total_leads_check = await db.execute(
+        select(func.count(Lead.id)).where(Lead.account_id == account_id)
+    )
+    has_crm_data = (total_leads_check.scalar() or 0) > 0
 
     camp_count = await db.execute(
         select(func.count(Campaign.id)).where(
@@ -621,6 +684,8 @@ async def get_dashboard(
             "prev_end":   (prev_end - timedelta(days=1)).date().isoformat(),
         },
         "ad_kpi":            kpi_with_deltas,
+        "crm_kpi":           crm_kpi,
+        "has_crm_data":      has_crm_data,
         "active_campaigns":  active_campaigns,
         "total_campaigns":   total_campaigns,
         "behavior":          behavior,
@@ -640,7 +705,7 @@ async def get_dashboard(
     }
 
 
-# ─── Campaigns ──────────────────────────────────────────────
+# ─── Campaigns ──────────────────────────────
 
 @router.get("/accounts/{account_id}/campaigns")
 async def get_campaigns(
@@ -798,7 +863,7 @@ async def get_campaigns(
     return result
 
 
-# ─── Ad Groups ──────────────────────────────────────────────
+# ─── Ad Groups ──────────────────────────────
 
 @router.get("/accounts/{account_id}/ad-groups")
 async def get_ad_groups(
@@ -854,7 +919,7 @@ async def get_ad_groups(
     } for g in groups]
 
 
-# ─── Keywords ───────────────────────────────────────────────
+# ─── Keywords ──────────────────────────────
 
 @router.get("/accounts/{account_id}/keywords")
 async def get_keywords(
@@ -1048,7 +1113,7 @@ async def get_keywords(
     return result
 
 
-# ─── Analysis ───────────────────────────────────────────────
+# ─── Analysis ──────────────────────────────
 
 @router.get("/accounts/{account_id}/analyses")
 async def get_analyses(account_id: int, limit: int = 10, db: AsyncSession = Depends(get_db)):
@@ -1070,7 +1135,7 @@ async def get_analyses(account_id: int, limit: int = 10, db: AsyncSession = Depe
     } for a in analyses]
 
 
-# ─── Suggestions ─────────────────────────────────────────────
+# ─── Suggestions ─────────────────────────────
 
 @router.get("/accounts/{account_id}/suggestions")
 async def get_suggestions(
@@ -1116,6 +1181,7 @@ async def get_suggestions(
         "priority":      s.priority,
         "severity":      prio_sev.get(s.priority, "warning"),
         "status":        s.status.value,
+        "payload":       s.payload,  # v1.7.0: черновик create_campaign (группы/ключи/объявления)
     } for s in rows]
 
 
@@ -1159,7 +1225,7 @@ async def action_suggestion(suggestion_id: int, data: dict, db: AsyncSession = D
     return {"status": "approved", "suggestion_id": s.id, "hypothesis_id": hypothesis.id}
 
 
-# ─── Hypotheses ──────────────────────────────────────────────
+# ─── Hypotheses ────────────────────────────
 
 class HypothesisCreate(BaseModel):
     object_type: str = "keyword"
@@ -1237,7 +1303,7 @@ async def create_hypothesis(account_id: int, data: HypothesisCreate, db: AsyncSe
     return {"id": hypothesis.id, "status": "created"}
 
 
-# ─── Rules ──────────────────────────────────────────────────
+# ─── Rules ──────────────────────────────
 
 @router.get("/accounts/{account_id}/rules")
 async def get_rules(account_id: int, db: AsyncSession = Depends(get_db)):
@@ -1256,7 +1322,7 @@ async def get_rules(account_id: int, db: AsyncSession = Depends(get_db)):
     } for r in rules]
 
 
-# ─── Metrika snapshot ─────────────────────────────────────────
+# ─── Metrika snapshot ────────────────────────
 
 @router.get("/accounts/{account_id}/metrika-snapshot")
 async def get_metrika_snapshot(account_id: int, db: AsyncSession = Depends(get_db)):
@@ -1279,13 +1345,14 @@ async def get_metrika_snapshot(account_id: int, db: AsyncSession = Depends(get_d
     }
 
 
-# ─── Search queries ──────────────────────────────────────────
+# ─── Search queries ────────────────────────
 
 @router.get("/accounts/{account_id}/search-queries")
 async def get_search_queries(
     account_id: int,
     suggest:    str = "",
     campaign_id: Optional[int] = None,
+    ad_group_id: Optional[int] = None,
     search:     Optional[str]  = None,
     limit:      int = 200,
     db: AsyncSession = Depends(get_db),
@@ -1294,6 +1361,12 @@ async def get_search_queries(
     from sqlalchemy import or_
 
     q = select(SearchQuery).where(SearchQuery.account_id == account_id)
+    # CHANGED v1.7.0: campaign_id было объявлено в сигнатуре, но никогда не
+    # применялось к запросу — фильтр по кампании молча игнорировался.
+    if campaign_id:
+        q = q.where(SearchQuery.campaign_id == campaign_id)
+    if ad_group_id:
+        q = q.where(SearchQuery.ad_group_id == ad_group_id)
     if search:
         q = q.where(SearchQuery.query.ilike(f"%{search}%"))
 
@@ -1345,7 +1418,320 @@ async def get_search_queries(
     } for r in rows]
 
 
-# ─── Diagnostics ─────────────────────────────────────────────
+class SearchQueryActionRequest(BaseModel):
+    action: str  # "add_negative" | "add_keyword"
+
+
+@router.post("/accounts/{account_id}/search-queries/{query_id}/action")
+async def action_search_query(
+    account_id: int,
+    query_id: int,
+    data: SearchQueryActionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    v1.7.0 — превращает конкретную поисковую фразу (уже собранную и
+    оцененную commercial_score в GET /search-queries) в pending-предложение
+    по тому же approve/apply-контуру, что и остальные Suggestion:
+      - add_negative → change_type=add_negatives на группу объявлений, где
+        встретилась фраза (SearchQuery.ad_group_id)
+      - add_keyword  → change_type=add_keywords на ту же группу («золотая
+        фраза» по терминологии PPC_Audit_Playbook — реальный поисковый запрос
+        с явным коммерческим сигналом, которого ещё нет в семантике)
+    Если в этой группе уже есть pending-предложение того же типа — новое
+    слово ДОПИСЫВАЕТСЯ в существующее (а не создаёт дубль и не блокируется
+    дедупликацией по (object_id, change_type), как было бы при наивной вставке.
+    """
+    from app.models.models import SearchQuery
+
+    if data.action not in ("add_negative", "add_keyword"):
+        raise HTTPException(400, "action должен быть 'add_negative' или 'add_keyword'")
+
+    sq_res = await db.execute(
+        select(SearchQuery).where(
+            SearchQuery.id == query_id, SearchQuery.account_id == account_id
+        )
+    )
+    sq = sq_res.scalar_one_or_none()
+    if not sq:
+        raise HTTPException(404, "Поисковый запрос не найден")
+    if not sq.ad_group_id:
+        raise HTTPException(400, "У этой фразы не определена группа объявлений — нельзя создать предложение")
+
+    change_type = "add_negatives" if data.action == "add_negative" else "add_keywords"
+    word = sq.query.strip()
+
+    existing_q = await db.execute(
+        select(Suggestion).where(and_(
+            Suggestion.account_id == account_id,
+            Suggestion.object_type == "ad_group",
+            Suggestion.object_id == sq.ad_group_id,
+            Suggestion.change_type == change_type,
+            Suggestion.status == SuggestionStatus.pending,
+        ))
+    )
+    existing = existing_q.scalar_one_or_none()
+
+    ag_res = await db.execute(select(AdGroup).where(AdGroup.id == sq.ad_group_id))
+    ag = ag_res.scalar_one_or_none()
+    camp_name = ""
+    if ag:
+        camp_res = await db.execute(select(Campaign).where(Campaign.id == ag.campaign_id))
+        camp = camp_res.scalar_one_or_none()
+        camp_name = f"{camp.name} → " if camp else ""
+
+    if existing:
+        words = [w.strip() for w in (existing.value_after or "").split(",") if w.strip()]
+        if word not in words:
+            words.append(word)
+        existing.value_after = ", ".join(words)
+        existing.rationale = (existing.rationale or "") + f" | + «{word}» (поисковая фраза, commercial_score учтен на странице Анализ)"
+        await db.commit()
+        return {"status": "merged", "suggestion_id": existing.id, "value_after": existing.value_after}
+
+    analysis = AnalysisResult(
+        account_id=account_id,
+        period_start=datetime.utcnow(),
+        period_end=datetime.utcnow(),
+        summary={"source": "search_query_action", "query": word, "action": data.action},
+        problems=[],
+    )
+    db.add(analysis)
+    await db.flush()
+
+    s = Suggestion(
+        account_id=account_id,
+        analysis_id=analysis.id,
+        object_type="ad_group",
+        object_id=sq.ad_group_id,
+        object_name=f"{camp_name}{ag.name if ag else ''}",
+        change_type=change_type,
+        value_before=None,
+        value_after=word,
+        rationale=(
+            f"Поисковая фраза «{word}» (commercial_score-анализ, раздел «Анализ» → «Поисковые фразы»). "
+            + ("Похоже на нецелевой/информационный трафик — в минус-слова." if data.action == "add_negative"
+               else "Реальный конверсионный запрос без соответствующего ключа — «золотая фраза» по методологии аудита, добавить как точный ключ.")
+        ),
+        expected_effect=("Отсечь нерелевантный трафик по этому запросу" if data.action == "add_negative"
+                        else "Захватить точный трафик по уже подтверждённому спросом запросу"),
+        priority="this_week",
+        status=SuggestionStatus.pending,
+    )
+    db.add(s)
+
+    if data.action == "add_negative":
+        sq.is_irrelevant = True
+    else:
+        sq.is_added_as_keyword = True
+
+    await db.commit()
+    await db.refresh(s)
+    return {"status": "created", "suggestion_id": s.id, "change_type": change_type, "value_after": word}
+
+
+# ─── Конструктор отчётов (мастер отчётов) ────────────
+#
+# v1.7.0 — аналог "Мастера отчётов" Директа / отчётов Roistat: одна и та же
+# статистика (KeywordStat + CRM), группируемая по кампании / группе /
+# ключу / дню, без похода на 4 разные страницы. Столбцы отдаются все
+# сразу единым плоским набором — какие из них показывать и в какой
+# группировке решает фронтенд (settings-модалка на странице /reports), это не
+# требует лишних запросов и держит бэкенд простым.
+
+REPORT_GROUP_DIMENSIONS = {"campaign", "ad_group", "keyword", "date"}
+
+
+@router.get("/accounts/{account_id}/report")
+async def get_report(
+    account_id: int,
+    group_by: str = Query("campaign"),
+    period: str = Query("month"),
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    campaign_id: Optional[int] = None,
+    ad_group_id: Optional[int] = None,
+    active_only: bool = Query(False),
+    limit: int = Query(1000, le=5000),
+    db: AsyncSession = Depends(get_db),
+):
+    if group_by not in REPORT_GROUP_DIMENSIONS:
+        raise HTTPException(400, f"group_by должен быть один из {sorted(REPORT_GROUP_DIMENSIONS)}")
+
+    curr_start, curr_end, _, _ = period_dates(period, date_from, date_to)
+
+    conditions = [
+        KeywordStat.account_id == account_id,
+        KeywordStat.date >= curr_start,
+        KeywordStat.date <= curr_end,
+    ]
+    query = (
+        select(
+            Campaign.id.label("campaign_id"), Campaign.name.label("campaign_name"),
+            Campaign.strategy_type.label("strategy_type"), Campaign.is_active.label("campaign_is_active"),
+            AdGroup.id.label("ad_group_id"), AdGroup.name.label("ad_group_name"),
+            Keyword.id.label("keyword_id"), Keyword.phrase.label("keyword_phrase"),
+            Keyword.current_bid.label("current_bid"),
+            KeywordStat.date, KeywordStat.impressions, KeywordStat.clicks, KeywordStat.spend,
+            KeywordStat.avg_position, KeywordStat.avg_click_position, KeywordStat.traffic_volume,
+            KeywordStat.bounce_rate, KeywordStat.sessions, KeywordStat.weighted_ctr,
+            KeywordStat.weighted_impressions, KeywordStat.avg_bid,
+        )
+        .select_from(KeywordStat)
+        .join(Keyword, Keyword.id == KeywordStat.keyword_id)
+        .join(AdGroup, AdGroup.id == Keyword.ad_group_id)
+        .join(Campaign, Campaign.id == AdGroup.campaign_id)
+        .where(and_(*conditions))
+    )
+    if campaign_id:
+        query = query.where(Campaign.id == campaign_id)
+    if ad_group_id:
+        query = query.where(AdGroup.id == ad_group_id)
+    if active_only:
+        query = query.where(Campaign.is_active == True)
+
+    result = await db.execute(query)
+    raw = result.all()
+
+    # ── Лиды/MQL/SQL по ключу за тот же период — присоединяются в Python,
+    #    чтобы не городить динамический SQL GROUP BY под 4 разных измерения.
+    leads_q = await db.execute(
+        select(
+            Lead.keyword_id,
+            func.count(Lead.id).label("leads"),
+            func.sum(case((Lead.is_mql.is_(True), 1), else_=0)).label("mql"),
+            func.sum(case((Lead.is_sql.is_(True), 1), else_=0)).label("sql"),
+        )
+        .where(and_(
+            Lead.account_id == account_id,
+            Lead.keyword_id.isnot(None),
+            Lead.created_at >= curr_start,
+            Lead.created_at <= curr_end,
+        ))
+        .group_by(Lead.keyword_id)
+    )
+    leads_by_kw = {r.keyword_id: r for r in leads_q.all()}
+
+    def dim_key(row):
+        if group_by == "campaign":
+            return ("campaign", row.campaign_id)
+        if group_by == "ad_group":
+            return ("ad_group", row.ad_group_id)
+        if group_by == "keyword":
+            return ("keyword", row.keyword_id)
+        return ("date", row.date.strftime("%Y-%m-%d"))
+
+    groups: dict = {}
+    for row in raw:
+        key = dim_key(row)
+        g = groups.setdefault(key, {
+            "campaign_id": row.campaign_id, "campaign_name": row.campaign_name,
+            "strategy_type": row.strategy_type, "campaign_is_active": row.campaign_is_active,
+            "ad_group_id": row.ad_group_id, "ad_group_name": row.ad_group_name,
+            "keyword_id": row.keyword_id, "keyword_phrase": row.keyword_phrase,
+            "current_bid": float(row.current_bid) if row.current_bid else None,
+            "date": row.date.strftime("%Y-%m-%d") if group_by == "date" else None,
+            "impressions": 0, "clicks": 0, "spend": 0.0,
+            "_pos_sum": 0.0, "_cpos_sum": 0.0, "_tv_sum": 0.0, "_wctr_sum": 0.0,
+            "_bounce_sum": 0.0, "_bounce_n": 0, "_n": 0,
+            "sessions": 0, "weighted_impressions": 0,
+            "_kw_ids": set(),
+        })
+        g["impressions"] += int(row.impressions or 0)
+        g["clicks"]      += int(row.clicks or 0)
+        g["spend"]       += float(row.spend or 0)
+        g["_pos_sum"]    += float(row.avg_position or 0)
+        g["_cpos_sum"]   += float(row.avg_click_position or 0)
+        g["_tv_sum"]     += float(row.traffic_volume or 0)
+        g["_wctr_sum"]   += float(row.weighted_ctr or 0)
+        g["sessions"]    += int(row.sessions or 0)
+        g["weighted_impressions"] += int(row.weighted_impressions or 0)
+        if row.bounce_rate:
+            g["_bounce_sum"] += float(row.bounce_rate)
+            g["_bounce_n"]   += 1
+        g["_n"] += 1
+        if row.keyword_id:
+            g["_kw_ids"].add(row.keyword_id)
+
+    rows_out = []
+    totals = {"impressions": 0, "clicks": 0, "spend": 0.0, "leads": 0, "mql": 0, "sql": 0}
+    for key, g in groups.items():
+        n = g["_n"] or 1
+        clicks = g["clicks"]
+        impressions = g["impressions"]
+        spend = g["spend"]
+        leads = mql = sql = 0
+        for kw_id in g["_kw_ids"]:
+            r = leads_by_kw.get(kw_id)
+            if r:
+                leads += int(r.leads or 0)
+                mql   += int(r.mql or 0)
+                sql   += int(r.sql or 0)
+
+        row_out = {
+            "group_by":            group_by,
+            "campaign_id":         g["campaign_id"],
+            "campaign_name":       g["campaign_name"],
+            "strategy_type":       g["strategy_type"],
+            "ad_group_id":         g["ad_group_id"] if group_by in ("ad_group", "keyword") else None,
+            "ad_group_name":       g["ad_group_name"] if group_by in ("ad_group", "keyword") else None,
+            "keyword_id":          g["keyword_id"] if group_by == "keyword" else None,
+            "keyword_phrase":      g["keyword_phrase"] if group_by == "keyword" else None,
+            "current_bid":         g["current_bid"] if group_by == "keyword" else None,
+            "date":                g["date"],
+            "impressions":         impressions,
+            "clicks":              clicks,
+            "spend":               round(spend, 2),
+            "ctr":                 round(clicks / impressions * 100, 2) if impressions else None,
+            "avg_cpc":             round(spend / clicks, 2) if clicks else None,
+            "avg_position":        round(g["_pos_sum"] / n, 2) if g["_pos_sum"] else None,
+            "avg_click_position":  round(g["_cpos_sum"] / n, 2) if g["_cpos_sum"] else None,
+            "traffic_volume":      round(g["_tv_sum"] / n, 1) if g["_tv_sum"] else None,
+            "weighted_ctr":        round(g["_wctr_sum"] / n, 2) if g["_wctr_sum"] else None,
+            "weighted_impressions": g["weighted_impressions"] or None,
+            "bounce_rate":         round(g["_bounce_sum"] / g["_bounce_n"], 1) if g["_bounce_n"] else None,
+            "sessions":            g["sessions"] or None,
+            "leads":               leads,
+            "mql":                 mql,
+            "sql":                 sql,
+            "cr_lead_mql":         round(mql / leads * 100, 1) if leads else None,
+            "cr_mql_sql":          round(sql / mql * 100, 1) if mql else None,
+            "cpl":                 round(spend / leads, 2) if leads else None,
+            "cost_per_mql":        round(spend / mql, 2) if mql else None,
+            "cost_per_sql":        round(spend / sql, 2) if sql else None,
+        }
+        rows_out.append(row_out)
+        totals["impressions"] += impressions
+        totals["clicks"]      += clicks
+        totals["spend"]       += spend
+        totals["leads"]       += leads
+        totals["mql"]         += mql
+        totals["sql"]         += sql
+
+    sort_key = "date" if group_by == "date" else "spend"
+    rows_out.sort(key=lambda r: r.get(sort_key) or 0, reverse=(group_by != "date"))
+    rows_out = rows_out[:limit]
+
+    totals["ctr"] = round(totals["clicks"] / totals["impressions"] * 100, 2) if totals["impressions"] else None
+    totals["avg_cpc"] = round(totals["spend"] / totals["clicks"], 2) if totals["clicks"] else None
+    totals["cpl"] = round(totals["spend"] / totals["leads"], 2) if totals["leads"] else None
+    totals["cost_per_sql"] = round(totals["spend"] / totals["sql"], 2) if totals["sql"] else None
+    totals["spend"] = round(totals["spend"], 2)
+
+    return {
+        "group_by": group_by,
+        "period": period,
+        "period_dates": {
+            "from": curr_start.date().isoformat(),
+            "to":   (curr_end - timedelta(days=1)).date().isoformat(),
+        },
+        "rows": rows_out,
+        "totals": totals,
+        "row_count": len(rows_out),
+    }
+
+
+# ─── Diagnostics ─────────────────────────────
 
 @router.get("/accounts/{account_id}/diagnostics")
 async def get_diagnostics(account_id: int, db: AsyncSession = Depends(get_db)):
@@ -1403,7 +1789,7 @@ async def get_diagnostics(account_id: int, db: AsyncSession = Depends(get_db)):
     }
 
 
-# ─── Health ───────────────────────────────────────────────
+# ─── Health ──────────────────────────────
 
 @router.get("/health")
 async def health():

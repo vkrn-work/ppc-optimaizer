@@ -11,6 +11,7 @@ const NAV = [
   ]},
   { section: 'АНАЛИЗ', items: [
     { href: '/analysis', icon: '≡', label: 'Полный анализ' },
+    { href: '/reports',  icon: '▤', label: 'Отчёты' },
   ]},
   { section: 'ИИ', items: [
     { href: '/ai-analysis', icon: '🤖', label: 'ИИ-анализ', badgeKey: 'suggest', badgeColor: 'accent' },

@@ -6,8 +6,8 @@
 чтобы не трогать огромный routes.py ради нового небольшого набора эндпоинтов.
 
 ВАЖНО: этот роутер НИЧЕГО не пишет в Яндекс Директ напрямую. Он только создаёт
-pending Suggestion(s) — запись в кабинет происходит через уже существующий
-approve/apply-пайплайн (POST /suggestions/{id}/action, затем POST
+ pending Suggestion(s) — запись в кабинет происходит через уже существующий
+ approve/apply-пайплайн (POST /suggestions/{id}/action, затем POST
 /suggestions/{id}/apply), тот же самый, которым работает страница «Предложения».
 Это осознанное решение по безопасности: у бота нет права сразу менять живой
 кабинет с реальным бюджетом без подтверждения человека.
@@ -59,6 +59,47 @@ async def run_agent_command(account_id: int, body: AgentCommandRequest, db: Asyn
         raise HTTPException(400, str(e))
     except Exception as e:
         logger.exception("agent_command failed")
+        raise HTTPException(500, f"Неожиданная ошибка: {e}")
+    return outcome
+
+
+@router.post("/accounts/{account_id}/agent-create-campaign")
+async def run_agent_create_campaign(account_id: int, body: AgentCommandRequest, db: AsyncSession = Depends(get_db)):
+    """
+    v1.7.0 (пункт 6 запроса) — свободная команда → ИИ проектирует НОВУЮ
+    кампанию целиком (название/бюджет/группы/ключи/минус-слова/объявления) и
+    создаёт pending Suggestion(change_type="create_campaign") с полной
+    структурой в payload. Ничего не создаётся в Директе сразу — только после
+    одобрения на вкладке «Предложения» (POST /suggestions/{id}/action, затем
+    /suggestions/{id}/apply), где apply_suggestion вызовет
+    YandexDirectWriter.create_full_campaign(). Это САМЫЙ РИСКОВАННЫЙ И НАИМЕНЕЕ
+    ОБКАТАННЫЙ путь записи в этом проекте — см. предупреждение в
+    direct_writer.py create_campaign() — первый реальный прогон стоит сделать
+    на минимальном бюджете и внимательно проверить результат в кабинете.
+    """
+    from app.analyzers import llm_providers
+    from app.generators.campaign_planner import CampaignPlanner, CampaignPlannerError
+
+    result = await db.execute(select(Account).where(Account.id == account_id))
+    account = result.scalar_one_or_none()
+    if not account:
+        raise HTTPException(404, "Account not found")
+
+    command = (body.command or "").strip()
+    if not command:
+        raise HTTPException(400, "Пустая команда")
+    if body.provider not in llm_providers.PROVIDERS:
+        raise HTTPException(400, f"Неизвестный провайдер '{body.provider}'. Доступны: {llm_providers.PROVIDERS}")
+    if not llm_providers.provider_configured(body.provider):
+        raise HTTPException(400, f"API-ключ для '{body.provider}' не настроен на сервере (см. .env)")
+
+    planner = CampaignPlanner(db, account_id)
+    try:
+        outcome = await planner.run_command(command, body.provider)
+    except CampaignPlannerError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.exception("agent_create_campaign failed")
         raise HTTPException(500, f"Неожиданная ошибка: {e}")
     return outcome
 

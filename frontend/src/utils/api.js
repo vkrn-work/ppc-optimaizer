@@ -66,6 +66,8 @@ export const api = {
 
   getMetrikaSnapshot: (id) => req(`/accounts/${id}/metrika-snapshot`),
   getSearchQueries: (id, params = '') => req(`/accounts/${id}/search-queries${params}`),
+  searchQueryAction: (accountId, queryId, action) =>
+    req(`/accounts/${accountId}/search-queries/${queryId}/action`, { method: 'POST', body: JSON.stringify({ action }) }),
   getDiagnostics: (id) => req(`/accounts/${id}/diagnostics`),
 
   // Получить дневную статистику за произвольный диапазон дат
@@ -81,4 +83,12 @@ export const api = {
   runAgentCommand: (id, command, provider = 'claude') =>
     req(`/accounts/${id}/agent-command`, { method: 'POST', body: JSON.stringify({ command, provider }) }),
   getAgentCommands: (id, limit = 20) => req(`/accounts/${id}/agent-commands?limit=${limit}`),
+
+  // v1.7.0 — конструктор кампаний ИИ (пункт 6): свободная команда → черновик
+  // кампании (группы/ключи/минус-слова/объявления) как pending create_campaign.
+  runAgentCreateCampaign: (id, command, provider = 'claude') =>
+    req(`/accounts/${id}/agent-create-campaign`, { method: 'POST', body: JSON.stringify({ command, provider }) }),
+
+  // v1.7.0 — конструктор отчётов (пункт 2)
+  getReport: (id, params = '') => req(`/accounts/${id}/report${params}`),
 }

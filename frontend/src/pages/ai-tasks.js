@@ -6,11 +6,14 @@ import { api } from '../utils/api'
 // v1.6.0: новая страница «Задачи ИИ» — свободная команда типа «добавь в рекламу
 // такую-то сталь» → POST /accounts/{id}/agent-command → ИИ подбирает ключи, находит
 // группу объявлений среди уже существующих и создаёт pending-предложение.
-// Ничего не применяется в Директ автоматически — результат уходит на вкладку
+// Ничего не применяется в Директ автоматически: результат уходит на вкладку
 // «Предложения» страницы «ИИ-анализ», где его нужно одобрить и применить.
 
 export default function AiTasks() {
   const { account, accounts, accountId, switchAccount } = useAccount()
+  // v1.7.0 (пункт 6): режим "campaign" — конструктор кампаний ИИ, соседствует
+  // с уже существующим режимом "keywords" (добавить ключи в существующую группу).
+  const [mode, setMode] = useState('keywords') // 'keywords' | 'campaign'
   const [command, setCommand] = useState('')
   const [providers, setProviders] = useState([])
   const [provider, setProvider] = useState('claude')
@@ -46,7 +49,9 @@ export default function AiTasks() {
     if (!text || !accountId) return
     setRunning(true); setError(''); setResult(null)
     try {
-      const res = await api.runAgentCommand(accountId, text, provider)
+      const res = mode === 'campaign'
+        ? await api.runAgentCreateCampaign(accountId, text, provider)
+        : await api.runAgentCommand(accountId, text, provider)
       setResult(res)
       setCommand('')
       loadHistory()
@@ -63,18 +68,38 @@ export default function AiTasks() {
         <div className="page-title">Задачи ИИ</div>
       </div>
 
+      <div className="period-tabs" style={{ marginBottom: 14, display: 'inline-flex' }}>
+        <div className={`period-tab${mode==='keywords'?' active':''}`} onClick={() => { setMode('keywords'); setResult(null) }}>
+          + Ключи в группу
+        </div>
+        <div className={`period-tab${mode==='campaign'?' active':''}`} onClick={() => { setMode('campaign'); setResult(null) }}>
+          🚀 Создать кампанию
+        </div>
+      </div>
+
       <div className="card" style={{ padding: 20, marginBottom: 16 }}>
         <div style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 14, lineHeight: 1.5 }}>
-          Опишите задачу свободным текстом — например «добавь в рекламу сталь 09Т2С толщиной 10мм» —
-          и ИИ подберёт ключевые фразы, найдёт подходящую группу объявлений среди уже существующих
-          и предложит минус-слова. Ничего не применяется в Директ сразу: результат уходит как
-          pending-предложение на вкладку «Предложения» страницы «ИИ-анализ» — там нужно одобрить и применить.
+          {mode === 'campaign' ? (
+            <>Опишите новое направление свободным текстом — например «создай кампанию по маркам стали
+            1.4310 и S315MC» — и ИИ спроектирует кампанию целиком: группы, ключи, минус-слова, объявления
+            и стартовый бюджет. Ничего не создаётся в Директе сразу: черновик уходит как pending-предложение
+            на вкладку «Предложения» страницы «ИИ-анализ» — там нужно проверить структуру и одобрить.
+            Это самый новый и наименее обкатанный путь записи в проекте — первый реальный запуск стоит
+            сделать осознанно, на минимальном бюджете.</>
+          ) : (
+            <>Опишите задачу свободным текстом — например «добавь в рекламу сталь 09Т2С толщиной 10мм» —
+            и ИИ подберёт ключевые фразы, найдёт подходящую группу объявлений среди уже существующих
+            и предложит минус-слова. Ничего не применяется в Директ сразу: результат уходит как
+            pending-предложение на вкладку «Предложения» страницы «ИИ-анализ» — там нужно одобрить и применить.</>
+          )}
         </div>
 
         <textarea
           value={command}
           onChange={e => setCommand(e.target.value)}
-          placeholder="Например: добавь в рекламу трубу профильную 40х20 толщина стенки 2мм"
+          placeholder={mode === 'campaign'
+            ? 'Например: создай кампанию по нержавеющим маркам 1.4404 и 1.4571'
+            : 'Например: добавь в рекламу трубу профильную 40х20 толщина стенки 2мм'}
           rows={3}
           style={{ width: '100%', resize: 'vertical', marginBottom: 12, fontFamily: 'inherit', fontSize: 13, padding: 10 }}
         />
@@ -107,7 +132,29 @@ export default function AiTasks() {
 
         {result && (
           <div style={{ marginTop: 16, padding: 14, borderRadius: 8, background: 'var(--bg4)', fontSize: 13 }}>
-            {result.status === 'created' ? (
+            {mode === 'campaign' && result.status === 'created' ? (
+              <>
+                <div style={{ color: 'var(--green)', fontWeight: 600, marginBottom: 6 }}>✓ Черновик кампании создан</div>
+                <div style={{ marginBottom: 4 }}>
+                  <b>{result.draft?.name}</b> · бюджет {Math.round(result.draft?.daily_budget_rub || 0)}₽/день
+                </div>
+                {(result.draft?.ad_groups || []).map((g, gi) => (
+                  <div key={gi} style={{ padding: '8px 10px', marginTop: 6, background: 'var(--bg3, var(--bg2))', borderRadius: 6 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 4 }}>{g.name}</div>
+                    <div style={{ color: 'var(--text2)' }}>Ключи: {(g.keywords || []).join(', ')}</div>
+                    {g.negative_keywords?.length > 0 && (
+                      <div style={{ color: 'var(--text2)' }}>Минус-слова: {g.negative_keywords.join(', ')}</div>
+                    )}
+                  </div>
+                ))}
+                {result.draft?.rationale && (
+                  <div style={{ marginTop: 8, color: 'var(--text2)' }}>{result.draft.rationale}</div>
+                )}
+                <div style={{ marginTop: 8, color: 'var(--text3)', fontSize: 12 }}>
+                  {result.message || 'Проверьте вкладку «Предложения» на странице ИИ-анализ.'}
+                </div>
+              </>
+            ) : result.status === 'created' ? (
               <>
                 <div style={{ color: 'var(--green)', fontWeight: 600, marginBottom: 6 }}>✓ Предложение создано</div>
                 {result.target && (
