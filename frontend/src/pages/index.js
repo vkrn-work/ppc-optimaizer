@@ -341,6 +341,7 @@ export default function Dashboard() {
   )
 
   const ad = dash?.ad_kpi || {}
+  const crm = dash?.crm_kpi || {}
   const beh = dash?.behavior || {}
   const problems = dash?.problems || []
   const opps = dash?.opportunities || []
@@ -425,12 +426,25 @@ export default function Dashboard() {
       {/* Таблица по дням */}
       {showDaily && daily.length > 0 && <MiniChart data={daily} />}
 
-      {/* Блок 2: CRM */}
+      {/* Блок 2: CRM — лиды/MQL/SQL из выгрузки (v1.7.0) */}
       <div className="kpi-section">
         <div className="kpi-section-label">◎ Результат (CRM)</div>
-        <div className="crm-placeholder">
-          Данные CRM не подключены — <a href="/ai-analysis">загрузить выгрузку из CRM</a>
-        </div>
+        {dash?.has_crm_data ? (
+          <div className="kpi-grid">
+            <KPICard label="Заявки"        value={fNum(crm.leads?.value)}        delta={crm.leads?.delta}        prev={crm.leads?.prev}        prevLabel={prevLabel} />
+            <KPICard label="MQL"           value={fNum(crm.mql?.value)}          delta={crm.mql?.delta}          prev={crm.mql?.prev}          prevLabel={prevLabel} />
+            <KPICard label="SQL (БП)"      value={fNum(crm.sql?.value)}          delta={crm.sql?.delta}          prev={crm.sql?.prev}          prevLabel={prevLabel} />
+            <KPICard label="CR заявка→MQL" value={fPct(crm.cr_lead_mql?.value)}  delta={crm.cr_lead_mql?.delta}  prevLabel={prevLabel} />
+            <KPICard label="CR MQL→SQL"    value={fPct(crm.cr_mql_sql?.value)}   delta={crm.cr_mql_sql?.delta}   prevLabel={prevLabel} />
+            <KPICard label="CPL"           value={fRub(crm.cpl?.value)}          delta={crm.cpl?.delta}          invert prevLabel={prevLabel} />
+            <KPICard label="Цена MQL"      value={fRub(crm.cost_per_mql?.value)} delta={crm.cost_per_mql?.delta} invert prevLabel={prevLabel} />
+            <KPICard label="Цена SQL (CPQL)" value={fRub(crm.cost_per_sql?.value)} delta={crm.cost_per_sql?.delta} invert prevLabel={prevLabel} />
+          </div>
+        ) : (
+          <div className="crm-placeholder">
+            Данные CRM не подключены — <a href="/ai-analysis">загрузить выгрузку из CRM</a>
+          </div>
+        )}
       </div>
 
       {/* Блок 3: Поведение */}
