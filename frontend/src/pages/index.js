@@ -219,6 +219,71 @@ function MiniChart({ data }) {
   )
 }
 
+// v1.6.0: блок «Последние изменения и ИИ-анализ» — сводка на Главной:
+// последний запуск ИИ-анализа + последние применённые в Директе предложения.
+function RecentActivity({ accountId }) {
+  const [lastRun, setLastRun] = useState(null)
+  const [recentApplied, setRecentApplied] = useState([])
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (!accountId) return
+    setLoading(true)
+    Promise.all([
+      api.getAnalyses(accountId, 5).catch(() => []),
+      api.getSuggestions(accountId, '?status=applied').catch(() => []),
+    ]).then(([analyses, applied]) => {
+      const relevant = (Array.isArray(analyses) ? analyses : [])
+        .filter(a => a.summary?.source === 'llm' || a.summary?.source === 'agent_command')
+      setLastRun(relevant[0] || null)
+      setRecentApplied((Array.isArray(applied) ? applied : []).slice(0, 5))
+    }).finally(() => setLoading(false))
+  }, [accountId])
+
+  if (!accountId || loading) return null
+  if (!lastRun && recentApplied.length === 0) return null
+
+  const s = lastRun?.summary || {}
+  const isAgent = s.source === 'agent_command'
+
+  return (
+    <div className="card" style={{ marginBottom: 14, padding: 16 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <div className="card-title" style={{ marginBottom: 0 }}>🤖 Последние изменения и ИИ-анализ</div>
+        <a href="/ai-analysis" style={{ fontSize: 12, color: 'var(--accent)' }}>Все предложения →</a>
+      </div>
+
+      {lastRun && (
+        <div style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 10 }}>
+          {isAgent ? (
+            <>⚡ Последняя задача ИИ ({new Date(lastRun.created_at).toLocaleString('ru-RU')}): «{s.command}» — {s.status === 'created' ? `создано ${s.keywords?.length || 0} ключей` : s.status}</>
+          ) : (
+            <>🧠 Последний ИИ-анализ ({new Date(lastRun.created_at).toLocaleString('ru-RU')}, {s.provider}): создано предложений — {s.suggestions_created ?? '—'}</>
+          )}
+        </div>
+      )}
+
+      {recentApplied.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          {recentApplied.map(item => (
+            <div key={item.id} style={{ fontSize: 12, color: 'var(--text2)', display: 'flex', gap: 8 }}>
+              <span style={{ color: 'var(--green)' }}>✓</span>
+              <span style={{ fontFamily: 'monospace' }}>{item.phrase || '—'}</span>
+              {(item.value_before || item.value_after) && (
+                <span style={{ color: 'var(--accent)' }}>{item.value_before} → {item.value_after}</span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!lastRun && recentApplied.length === 0 && (
+        <div style={{ fontSize: 13, color: 'var(--text3)' }}>Пока ничего не запускалось — перейдите в «ИИ-анализ» или «Задачи ИИ».</div>
+      )}
+    </div>
+  )
+}
+
 export default function Dashboard() {
   const { account, accounts, accountId, switchAccount, loading } = useAccount()
   const [period, setPeriod] = useState('week')
@@ -267,9 +332,9 @@ export default function Dashboard() {
           <div style={{ fontSize: 36, marginBottom: 14 }}>🚀</div>
           <div style={{ fontWeight: 600, fontSize: 16, marginBottom: 8 }}>Добавьте рекламный кабинет</div>
           <p style={{ color: 'var(--text2)', fontSize: 13, marginBottom: 18 }}>
-            Перейдите в Настройки и подключите кабинет Яндекс Директ
+            Перейдите в Кабинеты и подключите кабинет Яндекс Директ
           </p>
-          <a href="/settings" className="btn btn-primary">Настройки →</a>
+          <a href="/settings" className="btn btn-primary">Кабинеты →</a>
         </div>
       </div>
     </Layout>
@@ -283,10 +348,7 @@ export default function Dashboard() {
   const urgentCount = problems.filter(p => p.priority === 'today').length
   const qs = beh.quality_score
   const qc = !qs ? 'var(--text3)' : qs >= 70 ? 'var(--green)' : qs >= 50 ? 'var(--yellow)' : 'var(--red)'
-  // Сигналы из последнего анализа
   const analysisSummary = dash?.analysis_summary || {}
-  const signalsBySev = analysisSummary.signals_by_severity || {}
-  const trafficQuality = analysisSummary.traffic_quality_score
 
   const pd = dash?.period_dates
   const periodLabel = dash?.period_label || ''
@@ -297,7 +359,7 @@ export default function Dashboard() {
       {/* Header */}
       <div className="page-header">
         <div>
-          <div className="page-title">Main Board</div>
+          <div className="page-title">Главная</div>
           {periodLabel && (
             <div style={{ fontSize: 11, color: 'var(--text3)', marginTop: 2 }}>
               {periodLabel}
@@ -333,9 +395,12 @@ export default function Dashboard() {
           display: 'flex', justifyContent: 'space-between', alignItems: 'center',
         }}>
           <span style={{ fontSize: 13 }}>🔴 <strong>{urgentCount}</strong> предложений требуют внимания сегодня</span>
-          <a href="/suggestions" className="btn btn-sm" style={{ color: 'var(--red)', borderColor: 'rgba(255,79,79,0.3)' }}>Смотреть →</a>
+          <a href="/ai-analysis" className="btn btn-sm" style={{ color: 'var(--red)', borderColor: 'rgba(255,79,79,0.3)' }}>Смотреть →</a>
         </div>
       )}
+
+      {/* Последние изменения и результаты ИИ */}
+      <RecentActivity accountId={accountId} />
 
       {/* Блок 1: Рекламные */}
       <div className="kpi-section">
@@ -364,7 +429,7 @@ export default function Dashboard() {
       <div className="kpi-section">
         <div className="kpi-section-label">◎ Результат (CRM)</div>
         <div className="crm-placeholder">
-          Данные CRM не подключены — <a href="/settings">подключить выгрузку из 1С</a>
+          Данные CRM не подключены — <a href="/ai-analysis">загрузить выгрузку из CRM</a>
         </div>
       </div>
 
@@ -411,7 +476,7 @@ export default function Dashboard() {
             <SignalItem key={i} item={p} onTakeAction={handleTakeAction} />
           ))}
           {problems.length > 6 && (
-            <a href="/suggestions" style={{ fontSize: 12, color: 'var(--accent)', display: 'block', marginTop: 8 }}>
+            <a href="/ai-analysis" style={{ fontSize: 12, color: 'var(--accent)', display: 'block', marginTop: 8 }}>
               Ещё {problems.length - 6} →
             </a>
           )}
