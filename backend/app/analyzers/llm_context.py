@@ -1,48 +1,72 @@
 """
-v1.7.4: сборка агрегированного контекста аккаунта для LLM-анализа.
+v1.7.5: сборка агрегированного контекста аккаунта для LLM-анализа.
 
-Вынесено из llm_analyzer.py: логика разрослась после разбора боевых данных
-gto365, где выяснилось, что модель рассуждает на неполной картине и делает
-уверенные, но неверные выводы (предложила резать кампанию Hardox как нулевую,
-хотя та давала 5 БП из 14 по кабинету).
-
-Контекст отвечает на вопрос "с чем сравнивать" и состоит из пяти блоков:
-  attribution_quality — насколько полны данные (сколько заявок вообще
-                        привязано к ключам). Без него модель принимает
-                        отсутствие crm_* у ключа за отсутствие заявок;
-  account_totals      — итоги аккаунта; заявки берутся из CRM целиком,
-                        а не только сматченные на ключевые слова;
-  benchmarks          — медианы с явным размером выборки (медиана по двум
-                        наблюдениям — шум, а не бенчмарк);
+Контекст отвечает на вопрос «с чем сравнивать» и состоит из блоков:
+  data_freshness      — до какой даты есть данные Директа и CRM (v1.7.5);
+  attribution_quality — насколько полны данные;
+  account_totals      — итоги аккаунта (заявки из CRM целиком);
+  benchmarks          — медианы с явным размером выборки;
   campaigns           — разрез по кампаниям с ФАКТИЧЕСКИМИ заявками;
   long_tail           — сводка по малокликовым ключам;
   top_search_queries  — сырой спрос.
+
+ЧТО ПОЧИНЕНО В v1.7.5 (по итогам разбора «модель видит не ту статистику»):
+
+  1. ПЕРЕСЧЁТ АТРИБУЦИИ ПЕРЕД АНАЛИЗОМ. Раньше разноска замораживалась
+     на момент импорта CRM-файла. Файл почти всегда загружают раньше,
+     чем досинхронизирован Директ → search_queries ещё пусты → keyword_id
+     NULL навсегда. Это и была главная причина «заявки не разносятся».
+
+  2. СМЕШЕНИЕ УРОВНЕЙ В account_totals. crm_leads брался из CRM целиком,
+     а crm_mql/crm_sql оставались только по СМАТЧЕННЫМ на ключи заявкам.
+     Модель делила одно на другое и получала CR lead→MQL вида 25% там,
+     где реально около 100%. Теперь оба уровня отдаются отдельно
+     и подписаны.
+
+  3. cost_per_sql_rub = 0₽ вместо null у кампаний без открутки в периоде
+     (деление 0 на N). Модель читала это как «бесплатные заявки».
+
+  4. Заявки с ключом, но без campaign_id, добираются через джойн
+     keyword → ad_group → campaign.
 """
+import logging
 from datetime import datetime, timedelta
 
 from sqlalchemy import select, and_, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import Keyword, AdGroup, Campaign, Lead, SearchQuery
+from app.models.models import Keyword, AdGroup, Campaign, Lead, SearchQuery, KeywordStat
+from app.importers.lead_attribution import reattribute_account
+
+logger = logging.getLogger(__name__)
 
 
-async def build_context(db: AsyncSession, account_id: int, dataset: list[dict], period_days: int) -> dict:
-    """v1.7.2: агрегированный контекст аккаунта поверх построчного датасета.
-
-    Без него модель видела только плоский список ключей и не могла сказать
-    "этот ключ дороже среднего по аккаунту в 3 раза" — отсюда и брались
-    одиночные осторожные предложения. Теперь в тот же вызов передаются:
-      - средние/медианные показатели аккаунта (бенчмарк для сравнения),
-      - разрез по кампаниям (где горит бюджет и какая стратегия),
-      - сводка по «длинному хвосту» малокликовых ключей,
-      - топ поисковых запросов (сырой спрос — источник гипотез о минус-словах
-        и о новых ключах, которых ещё нет в кабинете).
-    Всё считается из уже загруженных данных, дополнительных вызовов LLM нет.
-    """
+async def build_context(db: AsyncSession, account_id: int, dataset: list[dict],
+                        period_days: int, reattribute: bool = True) -> dict:
+    """Агрегированный контекст аккаунта поверх построчного датасета."""
     period_start = datetime.utcnow() - timedelta(days=period_days)
 
+    # v1.7.5: разноска заявок пересчитывается перед КАЖДЫМ анализом.
+    # Дёшево (читает уже загруженные таблицы, без внешних вызовов), но
+    # гарантирует, что модель видит актуальную атрибуцию, а не замороженную
+    # на момент загрузки CRM-файла. Не валим анализ, если пересчёт упал.
+    reattribution = None
+    if reattribute:
+        try:
+            reattribution = await reattribute_account(db, account_id)
+        except Exception as e:
+            logger.warning(f"reattribute_account failed (account={account_id}): {e}")
+            reattribution = {"error": str(e)}
+
     def _safe_div(a, b):
-        return round(a / b, 2) if b else None
+        """None, если делить не на что ИЛИ делимое нулевое.
+
+        v1.7.5: прежняя версия проверяла только знаменатель и отдавала 0.0
+        для кампаний без открутки — «заявки по 0₽» в глазах модели.
+        """
+        if not b or not a:
+            return None
+        return round(a / b, 2)
 
     def _median(values: list[float]):
         vals = sorted(v for v in values if v is not None)
@@ -51,33 +75,56 @@ async def build_context(db: AsyncSession, account_id: int, dataset: list[dict], 
         mid = len(vals) // 2
         return round(vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2, 2)
 
-    # ── Итоги по аккаунту за период (бенчмарк, с которым модель сравнивает ключи)
+    # ── Итоги по аккаунту за период
     tot_clicks = sum(r["clicks"] for r in dataset)
     tot_spend = round(sum(r["spend_rub"] for r in dataset), 2)
-    tot_leads = sum(r.get("crm_leads", 0) for r in dataset)
-    tot_mql = sum(r.get("crm_mql", 0) for r in dataset)
-    tot_sql = sum(r.get("crm_sql", 0) for r in dataset)
+    kw_leads = sum(r.get("crm_leads", 0) for r in dataset)
+    kw_mql = sum(r.get("crm_mql", 0) for r in dataset)
+    kw_sql = sum(r.get("crm_sql", 0) for r in dataset)
+
+    # ── Фактическая воронка из CRM за период — ВСЕ заявки, независимо от
+    #    того, привязались ли они к ключу. v1.7.5: раньше целиком брался
+    #    только leads, а mql/sql оставались keyword-уровневыми — воронка из
+    #    двух разных источников давала бессмысленные CR.
+    crm_tot_row = (await db.execute(
+        select(
+            func.count(Lead.id).label("leads"),
+            func.sum(case((Lead.is_mql.is_(True), 1), else_=0)).label("mql"),
+            func.sum(case((Lead.is_sql.is_(True), 1), else_=0)).label("sql"),
+        ).where(and_(Lead.account_id == account_id, Lead.created_at >= period_start))
+    )).one()
+    crm_leads = int(crm_tot_row.leads or 0)
+    crm_mql = int(crm_tot_row.mql or 0)
+    crm_sql = int(crm_tot_row.sql or 0)
 
     account_totals = {
         "keywords_with_traffic": len(dataset),
         "clicks": tot_clicks,
         "spend_rub": tot_spend,
-        "crm_leads": tot_leads,
-        "crm_mql": tot_mql,
-        "crm_sql": tot_sql,
+        # ВСЕ заявки из CRM за период
+        "crm_leads": crm_leads,
+        "crm_mql": crm_mql,
+        "crm_sql": crm_sql,
+        # Только те, что привязались к конкретным ключам — НЕ путать
+        "crm_leads_by_keyword": kw_leads,
+        "crm_mql_by_keyword": kw_mql,
+        "crm_sql_by_keyword": kw_sql,
         "avg_cpc_rub": _safe_div(tot_spend, tot_clicks),
-        "cpl_rub": _safe_div(tot_spend, tot_leads),
-        "cost_per_mql_rub": _safe_div(tot_spend, tot_mql),
-        "cost_per_sql_rub": _safe_div(tot_spend, tot_sql),
-        "cr_click_to_lead_pct": round(tot_leads / tot_clicks * 100, 2) if tot_clicks else None,
-        "cr_lead_to_mql_pct": round(tot_mql / tot_leads * 100, 1) if tot_leads else None,
-        "cr_mql_to_sql_pct": round(tot_sql / tot_mql * 100, 1) if tot_mql else None,
+        "cpl_rub": _safe_div(tot_spend, crm_leads),
+        "cost_per_mql_rub": _safe_div(tot_spend, crm_mql),
+        "cost_per_sql_rub": _safe_div(tot_spend, crm_sql),
+        "cr_click_to_lead_pct": round(crm_leads / tot_clicks * 100, 2) if tot_clicks else None,
+        "cr_lead_to_mql_pct": round(crm_mql / crm_leads * 100, 1) if crm_leads else None,
+        "cr_mql_to_sql_pct": round(crm_sql / crm_mql * 100, 1) if crm_mql else None,
+        "note": (
+            "crm_leads / crm_mql / crm_sql — ВСЕ заявки из CRM за период. "
+            "Поля *_by_keyword — только те, что удалось привязать к конкретному "
+            "ключевому слову. НЕ считай CR, деля показатели разных уровней "
+            "друг на друга — все CR выше уже посчитаны корректно."
+        ),
     }
-    # v1.7.4: медиана по двум наблюдениям — это не бенчмарк, а шум. На
-    # реальном прогоне "медиана аккаунта 519 ₽" была посчитана ровно по
-    # двум ключам с SQL, и модель сделала на ней вывод "30 650 критически
-    # дорого". Теперь медиана отдаётся только при достаточной выборке, а
-    # размер выборки сообщается модели явно.
+
+    # ── Бенчмарки: медиана по двум наблюдениям — шум, а не бенчмарк.
     MIN_SAMPLE = 5
 
     def _median_with_n(values):
@@ -100,7 +147,7 @@ async def build_context(db: AsyncSession, account_id: int, dataset: list[dict], 
         ),
     }
 
-    # ── Разрез по кампаниям: где сосредоточен бюджет и какая там стратегия
+    # ── Разрез по кампаниям
     kw_ids = [r["keyword_id"] for r in dataset]
     camp_by_kw: dict[int, Campaign] = {}
     if kw_ids:
@@ -132,33 +179,33 @@ async def build_context(db: AsyncSession, account_id: int, dataset: list[dict], 
         agg["crm_mql"] += r.get("crm_mql", 0)
         agg["crm_sql"] += r.get("crm_sql", 0)
 
-    # ── v1.7.4: ФАКТИЧЕСКИЕ лиды по кампаниям, включая те, что не привязались
-    #    к ключу. Раньше crm_leads кампании складывался только из лидов,
-    #    сматченных на ключевые слова, — а таких доезжает около четверти.
-    #    Из-за этого кампания с реальными заявками выглядела нулевой, и
-    #    модель предлагала её резать. Теперь берём правду из leads по
-    #    campaign_id, а keyword-уровень оставляем отдельным полем.
+    # ── ФАКТИЧЕСКИЕ заявки по кампаниям: campaign_id либо напрямую,
+    #    либо через keyword → ad_group → campaign (v1.7.5: второй путь добавлен
+    #    на случай, если campaign_id у заявки почему-то остался пустым).
+    effective_campaign = func.coalesce(Lead.campaign_id, AdGroup.campaign_id)
     camp_leads_rows = await db.execute(
         select(
-            Lead.campaign_id,
+            effective_campaign.label("campaign_id"),
             func.count(Lead.id).label("leads"),
             func.sum(case((Lead.is_mql.is_(True), 1), else_=0)).label("mql"),
             func.sum(case((Lead.is_sql.is_(True), 1), else_=0)).label("sql"),
         )
+        .select_from(Lead)
+        .outerjoin(Keyword, Lead.keyword_id == Keyword.id)
+        .outerjoin(AdGroup, Keyword.ad_group_id == AdGroup.id)
         .where(and_(
             Lead.account_id == account_id,
-            Lead.campaign_id.isnot(None),
             Lead.created_at >= period_start,
+            effective_campaign.isnot(None),
         ))
-        .group_by(Lead.campaign_id)
+        .group_by(effective_campaign)
     )
     leads_by_campaign = {
         r.campaign_id: {"leads": int(r.leads or 0), "mql": int(r.mql or 0), "sql": int(r.sql or 0)}
         for r in camp_leads_rows.all()
     }
 
-    # Кампании, где есть заявки, но ни один ключ не попал в датасет, иначе
-    # выпали бы из разреза совсем.
+    # Кампании с заявками, но без ключей в датасете — иначе выпали бы.
     missing_camp_ids = [cid for cid in leads_by_campaign if cid not in campaigns_agg]
     if missing_camp_ids:
         extra_q = await db.execute(select(Campaign).where(Campaign.id.in_(missing_camp_ids)))
@@ -170,6 +217,7 @@ async def build_context(db: AsyncSession, account_id: int, dataset: list[dict], 
                 "status": camp.status,
                 "keywords": 0, "clicks": 0, "spend_rub": 0.0,
                 "crm_leads": 0, "crm_mql": 0, "crm_sql": 0,
+                "note": "Заявки есть, но ни один ключ кампании не попал в датасет за период",
             }
 
     campaigns = []
@@ -180,7 +228,6 @@ async def build_context(db: AsyncSession, account_id: int, dataset: list[dict], 
             agg["crm_leads"] = fact["leads"]
             agg["crm_mql"] = fact["mql"]
             agg["crm_sql"] = fact["sql"]
-    for agg in campaigns_agg.values():
         agg["spend_rub"] = round(agg["spend_rub"], 2)
         agg["cost_per_sql_rub"] = _safe_div(agg["spend_rub"], agg["crm_sql"])
         agg["cpl_rub"] = _safe_div(agg["spend_rub"], agg["crm_leads"])
@@ -188,10 +235,7 @@ async def build_context(db: AsyncSession, account_id: int, dataset: list[dict], 
         campaigns.append(agg)
     campaigns.sort(key=lambda c: c["spend_rub"], reverse=True)
 
-    # ── «Длинный хвост»: малокликовые ключи по отдельности ничего не значат,
-    #    но в сумме могут съедать заметную долю бюджета без единой заявки.
-    #    Эта сводка переживает урезание payload в llm_budget.fit_to_budget,
-    #    даже если сами thin_data-строки из датасета вырезаны.
+    # ── «Длинный хвост»
     thin = [r for r in dataset if r.get("thin_data")]
     long_tail = {
         "keywords_count": len(thin),
@@ -206,8 +250,7 @@ async def build_context(db: AsyncSession, account_id: int, dataset: list[dict], 
         ),
     }
 
-    # ── Сырой спрос: что люди реально вводили. Источник гипотез о минус-словах
-    #    и о ключах, которых в кабинете ещё нет.
+    # ── Сырой спрос
     sq_rows = await db.execute(
         select(
             SearchQuery.query,
@@ -235,9 +278,7 @@ async def build_context(db: AsyncSession, account_id: int, dataset: list[dict], 
         for row in sq_rows.all()
     ]
 
-    # ── v1.7.4: качество атрибуции. Модель должна знать, НАСКОЛЬКО полны
-    #    данные, на которых она рассуждает. Раньше несматченные лиды просто
-    #    исчезали, и 2 дошедших SQL подавались как вся правда об аккаунте.
+    # ── Качество атрибуции
     attr_rows = await db.execute(
         select(
             Lead.matched_by,
@@ -249,40 +290,64 @@ async def build_context(db: AsyncSession, account_id: int, dataset: list[dict], 
     )
     by_match = {(r.matched_by or "unmatched"): {"leads": int(r.leads or 0), "sql": int(r.sql or 0)}
                 for r in attr_rows.all()}
-    total_leads_all = sum(v["leads"] for v in by_match.values())
     total_sql_all = sum(v["sql"] for v in by_match.values())
     kw_level_sql = sum(v["sql"] for k, v in by_match.items()
                        if k in ("ad_id", "search_query", "phrase"))
 
     attribution = {
-        "leads_total_in_crm": total_leads_all,
-        "sql_total_in_crm": total_sql_all,
+        "leads_total_in_crm": crm_leads,
+        "sql_total_in_crm": crm_sql,
         "by_match_method": by_match,
         "sql_attributed_to_keyword": kw_level_sql,
         "sql_keyword_coverage_pct": round(kw_level_sql / total_sql_all * 100, 1) if total_sql_all else None,
+        "leads_keyword_coverage_pct": round(kw_leads / crm_leads * 100, 1) if crm_leads else None,
+        "reattribution_run": reattribution,
         "note": (
             "leads_total_in_crm / sql_total_in_crm — ВСЕ заявки за период. "
             "К конкретным ключевым словам привязана только часть (см. "
-            "sql_keyword_coverage_pct). Разрез campaigns содержит фактические "
-            "заявки по кампаниям и полнее построчных данных по ключам. "
-            "Если покрытие низкое, НЕ делай вывод 'ключ/кампания не приносит "
-            "заявок' из отсутствия crm_* в построчных данных — заявка могла "
-            "быть, но не привязаться к ключу. В таких случаях опирайся на "
-            "campaigns и говори об этом прямо в diagnostics."
+            "sql_keyword_coverage_pct / leads_keyword_coverage_pct). Разрез campaigns "
+            "содержит фактические заявки по кампаниям и полнее построчных данных "
+            "по ключам. Если покрытие низкое, НЕ делай вывод 'ключ/кампания не "
+            "приносит заявок' из отсутствия crm_* в построчных данных — заявка могла "
+            "быть, но не привязаться к ключу. В таких случаях опирайся на campaigns "
+            "и говори об этом прямо в diagnostics. Блок reattribution_run показывает "
+            "результат пересчёта разноски, выполненного перед этим анализом; "
+            "matchers внутри него — на чём физически строился матчинг. Если там "
+            "search_queries=0, причина низкого покрытия — несобранные данные "
+            "Директа, а не отсутствие заявок."
         ),
     }
 
-    # Итоги аккаунта по заявкам — из CRM целиком, а не только по сматченным
-    account_totals["crm_leads"] = total_leads_all
-    account_totals["crm_sql"] = total_sql_all
-    account_totals["cpl_rub"] = _safe_div(tot_spend, total_leads_all)
-    account_totals["cost_per_sql_rub"] = _safe_div(tot_spend, total_sql_all)
-    account_totals["cr_click_to_lead_pct"] = (
-        round(total_leads_all / tot_clicks * 100, 2) if tot_clicks else None
-    )
+    # ── v1.7.5: свежесть данных. Если CRM-выгрузка обрывается раньше конца
+    #    периода, последние дни выглядят как «трафик есть, заявок нет», и модель
+    #    делает из этого вывод о падении конверсии. Это артефакт выгрузки.
+    last_stat = (await db.execute(
+        select(func.max(KeywordStat.date)).where(KeywordStat.account_id == account_id)
+    )).scalar()
+    last_lead = (await db.execute(
+        select(func.max(Lead.created_at)).where(Lead.account_id == account_id)
+    )).scalar()
+    gap_days = None
+    if last_stat and last_lead:
+        gap_days = (last_stat.date() - last_lead.date()).days
+
+    data_freshness = {
+        "period_start": period_start.date().isoformat(),
+        "period_end": datetime.utcnow().date().isoformat(),
+        "last_direct_stat_date": last_stat.date().isoformat() if last_stat else None,
+        "last_crm_lead_date": last_lead.date().isoformat() if last_lead else None,
+        "crm_lag_days": gap_days,
+        "note": (
+            "Если crm_lag_days > 2, выгрузка CRM отстаёт от статистики Директа: "
+            "последние дни периода содержат расход без заявок НЕ потому, что "
+            "заявок нет, а потому что их ещё не выгрузили. Обязательно скажи об "
+            "этом в diagnostics и не считай CPL/CR по этим дням как показательные."
+        ),
+    }
 
     return {
         "period_days": period_days,
+        "data_freshness": data_freshness,
         "attribution_quality": attribution,
         "account_totals": account_totals,
         "benchmarks": benchmarks,
