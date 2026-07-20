@@ -13,7 +13,7 @@ _validate_change теперь жёстко отклоняет bid_raise/bid_lowe
 Пайплайн:
   1. _build_dataset()      — джойн keyword_stats + leads по keyword_id/utm_term,
                               агрегация в компактную таблицу (не сырые построчные данные).
-  2. _build_context()      — v1.7.2: агрегаты по аккаунту/кампаниям/спросу поверх
+  2. llm_context.build_context() — агрегаты по аккаунту/кампаниям/спросу поверх
                               построчного датасета — бенчмарк, с которым модель сравнивает ключи.
   3. llm_providers.call_llm() — вызов выбранного провайдера (Claude/Gemini/Groq/OpenRouter),
                               модель обязана вернуть строго типизированный список изменений.
@@ -34,8 +34,15 @@ v1.7.2 (глубина анализа): две причины, почему ра
      удаляются: по одному такому ключу решение принимать рано, но групповая
      закономерность по ним — самостоятельная гипотеза;
   2. модель видела только плоский список ключей без точки отсчёта — добавлен
-     _build_context() с бенчмарками аккаунта, разрезом по кампаниям,
-     сводкой по длинному хвосту и топом поисковых запросов.
+     build_context() с бенчмарками аккаунта, разрезом по кампаниям,
+     сводкой по длинному хвосту и топом поисковых запросов (v1.7.4 вынесен
+     в отдельный модуль llm_context.py).
+
+v1.7.4: атрибуция заявок больше не теряет 73% лидов — см. crm_importer.py
+(каскад ad_id → search_query → phrase → campaign) и llm_context.py
+(фактические заявки по кампаниям + блок attribution_quality). Здесь же
+добавлен фильтр лидов по периоду: раньше расход за 28 дней делился на
+заявки за всё время импорта.
 
 v1.7.3: в summary пишется llm_payload_meta — сколько данных реально доехало до
 модели после ужимания под лимиты провайдера (см. llm_budget.fit_to_budget).
@@ -51,8 +58,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.analyzers import llm_providers
+from app.analyzers.llm_context import build_context
 from app.models.models import (
-    Keyword, KeywordStat, AdGroup, Campaign, Lead, LeadStatus, SearchQuery,
+    Keyword, KeywordStat, AdGroup, Campaign, Lead, LeadStatus,
     AnalysisResult, Suggestion, SuggestionStatus,
 )
 
@@ -129,7 +137,14 @@ class LLMAnalyzer:
                 func.sum(case((Lead.is_mql.is_(True), 1), else_=0)).label("mql_count"),
                 func.sum(case((Lead.is_sql.is_(True), 1), else_=0)).label("sql_count"),
             )
-            .where(and_(Lead.account_id == self.account_id, Lead.keyword_id.isnot(None)))
+            .where(and_(
+                Lead.account_id == self.account_id,
+                Lead.keyword_id.isnot(None),
+                # v1.7.4: раньше фильтра по дате не было вовсе — расход за 28
+                # дней делился на лиды за всё время импорта.
+                Lead.created_at >= period_start,
+                Lead.created_at <= period_end,
+            ))
             .group_by(Lead.keyword_id)
         )
         leads_by_kw = {}
@@ -177,161 +192,12 @@ class LLMAnalyzer:
             dataset.append(row)
 
         dataset.sort(key=lambda r: r["spend_rub"], reverse=True)
-        return dataset[: settings.LLM_MAX_KEYWORDS_PER_CALL]
-
-    async def _build_context(self, dataset: list[dict], period_days: int) -> dict:
-        """v1.7.2: агрегированный контекст аккаунта поверх построчного датасета.
-
-        Без него модель видела только плоский список ключей и не могла сказать
-        "этот ключ дороже среднего по аккаунту в 3 раза" — отсюда и брались
-        одиночные осторожные предложения. Теперь в тот же вызов передаются:
-          - средние/медианные показатели аккаунта (бенчмарк для сравнения),
-          - разрез по кампаниям (где горит бюджет и какая стратегия),
-          - сводка по «длинному хвосту» малокликовых ключей,
-          - топ поисковых запросов (сырой спрос — источник гипотез о минус-словах
-            и о новых ключах, которых ещё нет в кабинете).
-        Всё считается из уже загруженных данных, дополнительных вызовов LLM нет.
-        """
-        def _safe_div(a, b):
-            return round(a / b, 2) if b else None
-
-        def _median(values: list[float]):
-            vals = sorted(v for v in values if v is not None)
-            if not vals:
-                return None
-            mid = len(vals) // 2
-            return round(vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2, 2)
-
-        # ── Итоги по аккаунту за период (бенчмарк, с которым модель сравнивает ключи)
-        tot_clicks = sum(r["clicks"] for r in dataset)
-        tot_spend = round(sum(r["spend_rub"] for r in dataset), 2)
-        tot_leads = sum(r.get("crm_leads", 0) for r in dataset)
-        tot_mql = sum(r.get("crm_mql", 0) for r in dataset)
-        tot_sql = sum(r.get("crm_sql", 0) for r in dataset)
-
-        account_totals = {
-            "keywords_with_traffic": len(dataset),
-            "clicks": tot_clicks,
-            "spend_rub": tot_spend,
-            "crm_leads": tot_leads,
-            "crm_mql": tot_mql,
-            "crm_sql": tot_sql,
-            "avg_cpc_rub": _safe_div(tot_spend, tot_clicks),
-            "cpl_rub": _safe_div(tot_spend, tot_leads),
-            "cost_per_mql_rub": _safe_div(tot_spend, tot_mql),
-            "cost_per_sql_rub": _safe_div(tot_spend, tot_sql),
-            "cr_click_to_lead_pct": round(tot_leads / tot_clicks * 100, 2) if tot_clicks else None,
-            "cr_lead_to_mql_pct": round(tot_mql / tot_leads * 100, 1) if tot_leads else None,
-            "cr_mql_to_sql_pct": round(tot_sql / tot_mql * 100, 1) if tot_mql else None,
-        }
-        benchmarks = {
-            "median_cost_per_sql_rub": _median([r.get("cost_per_sql_rub") for r in dataset]),
-            "median_cost_per_mql_rub": _median([r.get("cost_per_mql_rub") for r in dataset]),
-            "median_cpl_rub": _median([r.get("cpl_rub") for r in dataset]),
-            "median_bounce_rate_pct": _median([r.get("bounce_rate_pct") for r in dataset]),
-            "note": (
-                "Сравнивай показатели каждого ключа с этими средними и медианами по "
-                "аккаунту — отклонение в разы в любую сторону это и есть повод для гипотезы."
-            ),
-        }
-
-        # ── Разрез по кампаниям: где сосредоточен бюджет и какая там стратегия
-        kw_ids = [r["keyword_id"] for r in dataset]
-        camp_by_kw: dict[int, Campaign] = {}
-        if kw_ids:
-            rows = await self.db.execute(
-                select(Keyword.id, Campaign)
-                .join(AdGroup, Keyword.ad_group_id == AdGroup.id)
-                .join(Campaign, AdGroup.campaign_id == Campaign.id)
-                .where(Keyword.id.in_(kw_ids))
-            )
-            camp_by_kw = {kw_id: camp for kw_id, camp in rows.all()}
-
-        campaigns_agg: dict[int, dict] = {}
-        for r in dataset:
-            camp = camp_by_kw.get(r["keyword_id"])
-            if not camp:
-                continue
-            agg = campaigns_agg.setdefault(camp.id, {
-                "campaign": camp.name,
-                "strategy_type": camp.strategy_type,
-                "bid_editable": camp.strategy_type == "MANUAL_CPC",
-                "status": camp.status,
-                "keywords": 0, "clicks": 0, "spend_rub": 0.0,
-                "crm_leads": 0, "crm_mql": 0, "crm_sql": 0,
-            })
-            agg["keywords"] += 1
-            agg["clicks"] += r["clicks"]
-            agg["spend_rub"] += r["spend_rub"]
-            agg["crm_leads"] += r.get("crm_leads", 0)
-            agg["crm_mql"] += r.get("crm_mql", 0)
-            agg["crm_sql"] += r.get("crm_sql", 0)
-
-        campaigns = []
-        for agg in campaigns_agg.values():
-            agg["spend_rub"] = round(agg["spend_rub"], 2)
-            agg["cost_per_sql_rub"] = _safe_div(agg["spend_rub"], agg["crm_sql"])
-            agg["cpl_rub"] = _safe_div(agg["spend_rub"], agg["crm_leads"])
-            agg["share_of_spend_pct"] = round(agg["spend_rub"] / tot_spend * 100, 1) if tot_spend else None
-            campaigns.append(agg)
-        campaigns.sort(key=lambda c: c["spend_rub"], reverse=True)
-
-        # ── «Длинный хвост»: малокликовые ключи по отдельности ничего не значат,
-        #    но в сумме могут съедать заметную долю бюджета без единой заявки.
-        #    Эта сводка переживает урезание payload в llm_budget.fit_to_budget,
-        #    даже если сами thin_data-строки из датасета вырезаны.
-        thin = [r for r in dataset if r.get("thin_data")]
-        long_tail = {
-            "keywords_count": len(thin),
-            "clicks": sum(r["clicks"] for r in thin),
-            "spend_rub": round(sum(r["spend_rub"] for r in thin), 2),
-            "crm_leads": sum(r.get("crm_leads", 0) for r in thin),
-            "crm_sql": sum(r.get("crm_sql", 0) for r in thin),
-            "note": (
-                "Ключи с 1-2 кликами (thin_data=true). По отдельности решение по ним "
-                "принимать рано, но если они в сумме съедают заметную долю бюджета без "
-                "заявок — это отдельная гипотеза уровня аккаунта, сформулируй её."
-            ),
-        }
-
-        # ── Сырой спрос: что люди реально вводили. Источник гипотез о минус-словах
-        #    и о ключах, которых в кабинете ещё нет.
-        period_start = datetime.utcnow() - timedelta(days=period_days)
-        sq_rows = await self.db.execute(
-            select(
-                SearchQuery.query,
-                SearchQuery.keyword_phrase,
-                func.sum(SearchQuery.clicks).label("clicks"),
-                func.sum(SearchQuery.spend).label("spend"),
-                func.sum(SearchQuery.impressions).label("impressions"),
-            )
-            .where(and_(
-                SearchQuery.account_id == self.account_id,
-                SearchQuery.date >= period_start,
-            ))
-            .group_by(SearchQuery.query, SearchQuery.keyword_phrase)
-            .order_by(func.sum(SearchQuery.spend).desc())
-            .limit(60)
-        )
-        top_search_queries = [
-            {
-                "query": row.query,
-                "matched_keyword": row.keyword_phrase,
-                "impressions": int(row.impressions or 0),
-                "clicks": int(row.clicks or 0),
-                "spend_rub": round(float(row.spend or 0), 2),
-            }
-            for row in sq_rows.all()
-        ]
-
-        return {
-            "period_days": period_days,
-            "account_totals": account_totals,
-            "benchmarks": benchmarks,
-            "campaigns": campaigns,
-            "long_tail": long_tail,
-            "top_search_queries": top_search_queries,
-        }
+        # v1.7.4: обрезка до LLM_MAX_KEYWORDS_PER_CALL перенесена в
+        # generate_suggestions. Раньше build_context получал уже урезанный
+        # список, и "картина аккаунта" считалась по топ-150 ключам — модель
+        # уверенно говорила "за 28 дней потратили N", имея в виду часть
+        # кабинета, но подавая это как весь кабинет.
+        return dataset
 
     def _call_llm(self, dataset: list[dict], provider: str, context: dict) -> dict:
         return llm_providers.call_llm(provider, dataset, context)
@@ -368,24 +234,26 @@ class LLMAnalyzer:
         if not llm_providers.provider_configured(provider):
             raise RuntimeError(f"API-ключ для провайдера '{provider}' не настроен в .env")
 
-        dataset = await self._build_dataset(period_days)
-        if not dataset:
+        dataset_full = await self._build_dataset(period_days)
+        if not dataset_full:
             logger.info(f"LLM analyzer: no data for account {self.account_id}")
             return []
 
-        bid_editable_map = {r["keyword_id"]: r.get("bid_editable", True) for r in dataset}
+        bid_editable_map = {r["keyword_id"]: r.get("bid_editable", True) for r in dataset_full}
 
         analysis = AnalysisResult(
             account_id=self.account_id,
             period_start=datetime.utcnow() - timedelta(days=period_days),
             period_end=datetime.utcnow(),
-            summary={"source": "llm", "provider": provider, "keywords_sent": len(dataset), "status": "calling_llm"},
+            summary={"source": "llm", "provider": provider, "keywords_sent": len(dataset_full), "status": "calling_llm"},
             problems=[],
         )
         self.db.add(analysis)
         await self.db.flush()
 
-        context = await self._build_context(dataset, period_days)
+        # Контекст — по ПОЛНОМУ датасету, в модель — обрезанный список строк.
+        context = await build_context(self.db, self.account_id, dataset_full, period_days)
+        dataset = dataset_full[: settings.LLM_MAX_KEYWORDS_PER_CALL]
 
         error_detail = None
         try:
