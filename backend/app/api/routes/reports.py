@@ -1,6 +1,34 @@
-"""Конструктор отчьтов.
+"""Конструктор отчётов.
 
-Выделено из монолитного routes.py без изменения логики.
+v1.7.0 — аналог «Мастера отчётов» Директа / отчётов Roistat: одна и та же
+статистика (KeywordStat + CRM), группируемая по кампании / группе / ключу /
+дню. Столбцы отдаются все сразу плоским набором — что показывать решает фронт.
+
+v1.7.5 — КРИТИЧЕСКИЙ ФИКС ПОДСЧЁТА ЗАЯВОК.
+
+На боевом кабинете отчёт «По кампаниям» за месяц показывал 1 заявку на
+64 269 ₽ расхода при семи активных кампаниях — шесть из семи строк были
+с нулями. Причина была ровно здесь:
+
+    .where(Lead.keyword_id.isnot(None))
+    .group_by(Lead.keyword_id)
+
+Запасной уровень атрибуции (leads.campaign_id, добавленный в v1.7.4 именно
+затем, чтобы заявки не терялись) в отчёте не участвовал ВООБЩЕ. Заявка,
+привязанная к кампании, но не к ключу, показывалась как ноль — а таких
+большинство. При этом dashboard.py считает ВСЕ заявки периода — то есть
+два экрана одного продукта показывали разную воронку и не сходились друг с
+другом ни при каких данных.
+
+Теперь агрегация заявок зависит от разреза:
+    campaign — coalesce(leads.campaign_id, keyword → ad_group → campaign);
+    ad_group — через ключ (у заявки нет своего ad_group_id);
+    keyword  — по keyword_id, как раньше;
+    date     — по дате заявки.
+
+И главное: в ответ добавлен блок attribution с нераспределённым остатком.
+Неразнесённые заявки больше не растворяются в нулях по строкам — видно,
+сколько их и что итог отчёта не равен итогу CRM.
 """
 from datetime import timedelta
 from typing import Optional
@@ -19,17 +47,73 @@ from app.api.routes._common import period_dates
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-
-# ─── Конструктор отчьтов (мастер отчьтов) ────────────
-#
-# v1.7.0 — аналог "Мастера отчьтов" Директа / отчьтов Roistat: одна и та же
-# статистика (KeywordStat + CRM), группируемая по кампании / группе /
-# ключу / дню, без похода на 4 разные страницы. Столбцы отдаются все
-# сразу единым плоским набором — какие из них показывать и в какой
-# группировке решает фронтенд (settings-модалка на странице /reports), это не
-# требует лишних запросов и держит бэкенд простым.
-
 REPORT_GROUP_DIMENSIONS = {"campaign", "ad_group", "keyword", "date"}
+
+_LEAD_AGG = (
+    func.count(Lead.id).label("leads"),
+    func.sum(case((Lead.is_mql.is_(True), 1), else_=0)).label("mql"),
+    func.sum(case((Lead.is_sql.is_(True), 1), else_=0)).label("sql"),
+)
+
+
+async def _leads_by_dimension(db: AsyncSession, account_id: int, group_by: str,
+                              curr_start, curr_end) -> dict:
+    """Заявки за период, сгруппированные по тому же измерению, что и отчёт.
+
+    Возвращает {ключ измерения: {"leads": n, "mql": n, "sql": n}}.
+
+    Ключевой момент для разреза campaign: заявка участвует, если у неё есть
+    ЛИБО свой campaign_id, ЛИБО ключ, через который кампания выводится. До v1.7.5
+    учитывался только второй случай, и отчёт показывал нули.
+    """
+    base_where = [
+        Lead.account_id == account_id,
+        Lead.created_at >= curr_start,
+        Lead.created_at <= curr_end,
+    ]
+
+    if group_by == "campaign":
+        dim = func.coalesce(Lead.campaign_id, AdGroup.campaign_id)
+        q = (
+            select(dim.label("dim"), *_LEAD_AGG)
+            .select_from(Lead)
+            .outerjoin(Keyword, Lead.keyword_id == Keyword.id)
+            .outerjoin(AdGroup, Keyword.ad_group_id == AdGroup.id)
+            .where(and_(*base_where, dim.isnot(None)))
+            .group_by(dim)
+        )
+    elif group_by == "ad_group":
+        # У заявки нет собственного ad_group_id — только через ключ.
+        # Заявки уровня кампании сюда не попадают и честно уйдут в остаток.
+        q = (
+            select(Keyword.ad_group_id.label("dim"), *_LEAD_AGG)
+            .select_from(Lead)
+            .join(Keyword, Lead.keyword_id == Keyword.id)
+            .where(and_(*base_where, Keyword.ad_group_id.isnot(None)))
+            .group_by(Keyword.ad_group_id)
+        )
+    elif group_by == "keyword":
+        q = (
+            select(Lead.keyword_id.label("dim"), *_LEAD_AGG)
+            .where(and_(*base_where, Lead.keyword_id.isnot(None)))
+            .group_by(Lead.keyword_id)
+        )
+    else:  # date
+        dim = func.date(Lead.created_at)
+        q = (
+            select(dim.label("dim"), *_LEAD_AGG)
+            .where(and_(*base_where))
+            .group_by(dim)
+        )
+
+    rows = (await db.execute(q)).all()
+    out = {}
+    for r in rows:
+        key = r.dim
+        if group_by == "date":
+            key = key.isoformat() if hasattr(key, "isoformat") else str(key)[:10]
+        out[key] = {"leads": int(r.leads or 0), "mql": int(r.mql or 0), "sql": int(r.sql or 0)}
+    return out
 
 
 @router.get("/accounts/{account_id}/report")
@@ -78,29 +162,27 @@ async def get_report(
     if ad_group_id:
         query = query.where(AdGroup.id == ad_group_id)
     if active_only:
-        query = query.where(Campaign.is_active == True)
+        query = query.where(Campaign.is_active == True)  # noqa: E712
 
-    result = await db.execute(query)
-    raw = result.all()
+    raw = (await db.execute(query)).all()
 
-    # ── Лиды/MQL/SQL по ключу за тот же период — присоединяются в Python,
-    #    чтобы не городить динамический SQL GROUP BY под 4 разных измерения.
-    leads_q = await db.execute(
-        select(
-            Lead.keyword_id,
-            func.count(Lead.id).label("leads"),
-            func.sum(case((Lead.is_mql.is_(True), 1), else_=0)).label("mql"),
-            func.sum(case((Lead.is_sql.is_(True), 1), else_=0)).label("sql"),
-        )
-        .where(and_(
+    # ── Заявки в том же разрезе, что и отчёт (v1.7.5).
+    leads_by_dim = await _leads_by_dimension(db, account_id, group_by, curr_start, curr_end)
+
+    # Все заявки периода — тот же счётчик, что на дашборде. Нужен, чтобы
+    # показать нераспределённый остаток, а не делать вид, что его нет.
+    crm_row = (await db.execute(
+        select(*_LEAD_AGG).where(and_(
             Lead.account_id == account_id,
-            Lead.keyword_id.isnot(None),
             Lead.created_at >= curr_start,
             Lead.created_at <= curr_end,
         ))
-        .group_by(Lead.keyword_id)
-    )
-    leads_by_kw = {r.keyword_id: r for r in leads_q.all()}
+    )).one()
+    crm_totals = {
+        "leads": int(crm_row.leads or 0),
+        "mql": int(crm_row.mql or 0),
+        "sql": int(crm_row.sql or 0),
+    }
 
     def dim_key(row):
         if group_by == "campaign":
@@ -125,7 +207,6 @@ async def get_report(
             "_pos_sum": 0.0, "_cpos_sum": 0.0, "_tv_sum": 0.0, "_wctr_sum": 0.0,
             "_bounce_sum": 0.0, "_bounce_n": 0, "_n": 0,
             "sessions": 0, "weighted_impressions": 0,
-            "_kw_ids": set(),
         })
         g["impressions"] += int(row.impressions or 0)
         g["clicks"]      += int(row.clicks or 0)
@@ -140,8 +221,6 @@ async def get_report(
             g["_bounce_sum"] += float(row.bounce_rate)
             g["_bounce_n"]   += 1
         g["_n"] += 1
-        if row.keyword_id:
-            g["_kw_ids"].add(row.keyword_id)
 
     rows_out = []
     totals = {"impressions": 0, "clicks": 0, "spend": 0.0, "leads": 0, "mql": 0, "sql": 0}
@@ -150,15 +229,14 @@ async def get_report(
         clicks = g["clicks"]
         impressions = g["impressions"]
         spend = g["spend"]
-        leads = mql = sql = 0
-        for kw_id in g["_kw_ids"]:
-            r = leads_by_kw.get(kw_id)
-            if r:
-                leads += int(r.leads or 0)
-                mql   += int(r.mql or 0)
-                sql   += int(r.sql or 0)
 
-        row_out = {
+        # v1.7.5: берём агрегат по тому же измерению, а не сумму по ключам группы.
+        lead_stat = leads_by_dim.get(key[1], {})
+        leads = lead_stat.get("leads", 0)
+        mql   = lead_stat.get("mql", 0)
+        sql   = lead_stat.get("sql", 0)
+
+        rows_out.append({
             "group_by":            group_by,
             "campaign_id":         g["campaign_id"],
             "campaign_name":       g["campaign_name"],
@@ -189,8 +267,7 @@ async def get_report(
             "cpl":                 round(spend / leads, 2) if leads else None,
             "cost_per_mql":        round(spend / mql, 2) if mql else None,
             "cost_per_sql":        round(spend / sql, 2) if sql else None,
-        }
-        rows_out.append(row_out)
+        })
         totals["impressions"] += impressions
         totals["clicks"]      += clicks
         totals["spend"]       += spend
@@ -208,6 +285,30 @@ async def get_report(
     totals["cost_per_sql"] = round(totals["spend"] / totals["sql"], 2) if totals["sql"] else None
     totals["spend"] = round(totals["spend"], 2)
 
+    # ── Нераспределённый остаток (v1.7.5).
+    #
+    #    При фильтрах остаток не считаем: часть заявок относится к
+    #    отфильтрованным кампаниям, и сравнивать с общим итогом CRM
+    #    некорректно — честнее сказать, что не считали, чем показать число,
+    #    которое выглядит как потерянные заявки.
+    filtered = bool(campaign_id or ad_group_id or active_only)
+    attribution = {
+        "leads_total_crm": crm_totals["leads"],
+        "sql_total_crm": crm_totals["sql"],
+        "leads_in_report": totals["leads"],
+        "sql_in_report": totals["sql"],
+        "filtered": filtered,
+        "leads_unattributed": None if filtered else crm_totals["leads"] - totals["leads"],
+        "sql_unattributed": None if filtered else crm_totals["sql"] - totals["sql"],
+        "note": (
+            "leads_total_crm — все заявки периода (тот же счётчик, что на дашборде). "
+            "leads_unattributed — сколько из них не разнеслось по текущему разрезу. "
+            "Если это число велико — запустите POST /accounts/{id}/leads/reattribute и "
+            "посмотрите GET /accounts/{id}/leads/attribution. При активных фильтрах "
+            "остаток не считается (filtered=true)."
+        ),
+    }
+
     return {
         "group_by": group_by,
         "period": period,
@@ -217,5 +318,6 @@ async def get_report(
         },
         "rows": rows_out,
         "totals": totals,
+        "attribution": attribution,
         "row_count": len(rows_out),
     }
