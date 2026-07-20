@@ -1,0 +1,7 @@
+# Зависимости только для тестов. В продакшен-образ не ставятся.
+# Запуск: cd backend && pip install -r requirements-dev.txt && python -m pytest -q
+-r requirements.txt
+pytest==8.3.3
+pytest-asyncio==0.24.0
+# Интеграционные тесты поднимают схему в SQLite in-memory — боевая БД не нужна.
+aiosqlite==0.20.0
