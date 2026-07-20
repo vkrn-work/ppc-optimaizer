@@ -13,9 +13,11 @@ _validate_change теперь жёстко отклоняет bid_raise/bid_lowe
 Пайплайн:
   1. _build_dataset()      — джойн keyword_stats + leads по keyword_id/utm_term,
                               агрегация в компактную таблицу (не сырые построчные данные).
-  2. llm_providers.call_llm() — вызов выбранного провайдера (Claude/Gemini/Groq/OpenRouter),
+  2. _build_context()      — v1.7.2: агрегаты по аккаунту/кампаниям/спросу поверх
+                              построчного датасета — бенчмарк, с которым модель сравнивает ключи.
+  3. llm_providers.call_llm() — вызов выбранного провайдера (Claude/Gemini/Groq/OpenRouter),
                               модель обязана вернуть строго типизированный список изменений.
-  3. generate_suggestions() — валидация ответа модели (лимиты из config.py) и запись
+  4. generate_suggestions() — валидация ответа модели (лимиты из config.py) и запись
                               в таблицу suggestions (общая с cr_analyzer, status=pending).
 
 Так же, как и для cr_analyzer, safety-валидация лимитов ставки происходит на этапе
@@ -24,6 +26,16 @@ _validate_change теперь жёстко отклоняет bid_raise/bid_lowe
 v1.4.0: CRM-метрики в датасете переведены с "сделки/выручка" на воронку
 MQL/SQL (см. app/importers/crm_importer.py) — для этого аккаунта модель
 "продажа" не в приоритете, важны стоимость и конверсия в MQL/SQL.
+
+v1.7.2 (глубина анализа): две причины, почему раньше модель возвращала
+по одному-два предложения за запуск, устранены:
+  1. в _build_dataset молча выбрасывались все ключи с clicks < 3 — в модель
+     уходило ~19 строк из сотен. Теперь они помечаются thin_data=true, а не
+     удаляются: по одному такому ключу решение принимать рано, но групповая
+     закономерность по ним — самостоятельная гипотеза;
+  2. модель видела только плоский список ключей без точки отсчёта — добавлен
+     _build_context() с бенчмарками аккаунта, разрезом по кампаниям,
+     сводкой по длинному хвосту и топом поисковых запросов.
 """
 import logging
 from datetime import datetime, timedelta
@@ -35,7 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.analyzers import llm_providers
 from app.models.models import (
-    Keyword, KeywordStat, AdGroup, Campaign, Lead, LeadStatus,
+    Keyword, KeywordStat, AdGroup, Campaign, Lead, LeadStatus, SearchQuery,
     AnalysisResult, Suggestion, SuggestionStatus,
 )
 
@@ -101,7 +113,7 @@ class LLMAnalyzer:
             camp = campaigns.get(ag.campaign_id) if ag else None
             return bool(camp and camp.strategy_type == "MANUAL_CPC")
 
-        # ── CRM: воронка lead → MQL → SQL по ключевому слову ──────────────
+        # ── CRM: воронка lead → MQL → SQL по ключевому слову ────────────────
         # (заменяет прежнюю агрегацию по deals/revenue — для этого аккаунта
         # интересны не продажи, а количество/стоимость/конверсия в MQL и SQL,
         # см. app/importers/crm_importer.py)
@@ -122,12 +134,19 @@ class LLMAnalyzer:
         dataset = []
         for kw_id, s in stats_by_kw.items():
             kw = keywords.get(kw_id)
-            if not kw or not s.clicks or s.clicks < 3:
-                continue  # слишком мало данных, чтобы предлагать LLM решать
+            if not kw:
+                continue
+            # v1.7.2: раньше здесь молча выбрасывались все ключи с clicks < 3 —
+            # из-за этого в модель уходило 19 строк из сотен, и гипотез было мало.
+            # Теперь малокликовые ключи не выбрасываются, а помечаются флагом
+            # thin_data: модель видит их, но знает, что решение по ним делать
+            # рано — зато может заметить закономерность по группе таких ключей
+            # (например, 40 ключей по 1-2 клика съели 30к без единой заявки).
             leads = leads_by_kw.get(kw_id)
             row = {
                 "keyword_id": kw_id,
                 "phrase": kw.phrase,
+                "thin_data": int(s.clicks or 0) < 3,
                 "current_bid_rub": float(kw.current_bid) if kw.current_bid else None,
                 "bid_editable": _bid_editable(kw),
                 "impressions": int(s.impressions or 0),
@@ -155,8 +174,160 @@ class LLMAnalyzer:
         dataset.sort(key=lambda r: r["spend_rub"], reverse=True)
         return dataset[: settings.LLM_MAX_KEYWORDS_PER_CALL]
 
-    def _call_llm(self, dataset: list[dict], provider: str) -> dict:
-        return llm_providers.call_llm(provider, dataset)
+    async def _build_context(self, dataset: list[dict], period_days: int) -> dict:
+        """v1.7.2: агрегированный контекст аккаунта поверх построчного датасета.
+
+        Без него модель видела только плоский список ключей и не могла сказать
+        "этот ключ дороже среднего по аккаунту в 3 раза" — отсюда и брались
+        одиночные осторожные предложения. Теперь в тот же вызов передаются:
+          - средние/медианные показатели аккаунта (бенчмарк для сравнения),
+          - разрез по кампаниям (где горит бюджет и какая стратегия),
+          - сводка по «длинному хвосту» малокликовых ключей,
+          - топ поисковых запросов (сырой спрос — источник гипотез о минус-словах
+            и о новых ключах, которых ещё нет в кабинете).
+        Всё считается из уже загруженных данных, дополнительных вызовов LLM нет.
+        """
+        def _safe_div(a, b):
+            return round(a / b, 2) if b else None
+
+        def _median(values: list[float]):
+            vals = sorted(v for v in values if v is not None)
+            if not vals:
+                return None
+            mid = len(vals) // 2
+            return round(vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2, 2)
+
+        # ── Итоги по аккаунту за период (бенчмарк, с которым модель сравнивает ключи)
+        tot_clicks = sum(r["clicks"] for r in dataset)
+        tot_spend = round(sum(r["spend_rub"] for r in dataset), 2)
+        tot_leads = sum(r.get("crm_leads", 0) for r in dataset)
+        tot_mql = sum(r.get("crm_mql", 0) for r in dataset)
+        tot_sql = sum(r.get("crm_sql", 0) for r in dataset)
+
+        account_totals = {
+            "keywords_with_traffic": len(dataset),
+            "clicks": tot_clicks,
+            "spend_rub": tot_spend,
+            "crm_leads": tot_leads,
+            "crm_mql": tot_mql,
+            "crm_sql": tot_sql,
+            "avg_cpc_rub": _safe_div(tot_spend, tot_clicks),
+            "cpl_rub": _safe_div(tot_spend, tot_leads),
+            "cost_per_mql_rub": _safe_div(tot_spend, tot_mql),
+            "cost_per_sql_rub": _safe_div(tot_spend, tot_sql),
+            "cr_click_to_lead_pct": round(tot_leads / tot_clicks * 100, 2) if tot_clicks else None,
+            "cr_lead_to_mql_pct": round(tot_mql / tot_leads * 100, 1) if tot_leads else None,
+            "cr_mql_to_sql_pct": round(tot_sql / tot_mql * 100, 1) if tot_mql else None,
+        }
+        benchmarks = {
+            "median_cost_per_sql_rub": _median([r.get("cost_per_sql_rub") for r in dataset]),
+            "median_cost_per_mql_rub": _median([r.get("cost_per_mql_rub") for r in dataset]),
+            "median_cpl_rub": _median([r.get("cpl_rub") for r in dataset]),
+            "median_bounce_rate_pct": _median([r.get("bounce_rate_pct") for r in dataset]),
+            "note": (
+                "Сравнивай показатели каждого ключа с этими средними и медианами по "
+                "аккаунту — отклонение в разы в любую сторону это и есть повод для гипотезы."
+            ),
+        }
+
+        # ── Разрез по кампаниям: где сосредоточен бюджет и какая там стратегия
+        kw_ids = [r["keyword_id"] for r in dataset]
+        camp_by_kw: dict[int, Campaign] = {}
+        if kw_ids:
+            rows = await self.db.execute(
+                select(Keyword.id, Campaign)
+                .join(AdGroup, Keyword.ad_group_id == AdGroup.id)
+                .join(Campaign, AdGroup.campaign_id == Campaign.id)
+                .where(Keyword.id.in_(kw_ids))
+            )
+            camp_by_kw = {kw_id: camp for kw_id, camp in rows.all()}
+
+        campaigns_agg: dict[int, dict] = {}
+        for r in dataset:
+            camp = camp_by_kw.get(r["keyword_id"])
+            if not camp:
+                continue
+            agg = campaigns_agg.setdefault(camp.id, {
+                "campaign": camp.name,
+                "strategy_type": camp.strategy_type,
+                "bid_editable": camp.strategy_type == "MANUAL_CPC",
+                "status": camp.status,
+                "keywords": 0, "clicks": 0, "spend_rub": 0.0,
+                "crm_leads": 0, "crm_mql": 0, "crm_sql": 0,
+            })
+            agg["keywords"] += 1
+            agg["clicks"] += r["clicks"]
+            agg["spend_rub"] += r["spend_rub"]
+            agg["crm_leads"] += r.get("crm_leads", 0)
+            agg["crm_mql"] += r.get("crm_mql", 0)
+            agg["crm_sql"] += r.get("crm_sql", 0)
+
+        campaigns = []
+        for agg in campaigns_agg.values():
+            agg["spend_rub"] = round(agg["spend_rub"], 2)
+            agg["cost_per_sql_rub"] = _safe_div(agg["spend_rub"], agg["crm_sql"])
+            agg["cpl_rub"] = _safe_div(agg["spend_rub"], agg["crm_leads"])
+            agg["share_of_spend_pct"] = round(agg["spend_rub"] / tot_spend * 100, 1) if tot_spend else None
+            campaigns.append(agg)
+        campaigns.sort(key=lambda c: c["spend_rub"], reverse=True)
+
+        # ── «Длинный хвост»: малокликовые ключи по отдельности ничего не значат,
+        #    но в сумме могут съедать заметную долю бюджета без единой заявки.
+        thin = [r for r in dataset if r.get("thin_data")]
+        long_tail = {
+            "keywords_count": len(thin),
+            "clicks": sum(r["clicks"] for r in thin),
+            "spend_rub": round(sum(r["spend_rub"] for r in thin), 2),
+            "crm_leads": sum(r.get("crm_leads", 0) for r in thin),
+            "crm_sql": sum(r.get("crm_sql", 0) for r in thin),
+            "note": (
+                "Ключи с 1-2 кликами (thin_data=true). По отдельности решение по ним "
+                "принимать рано, но если они в сумме съедают заметную долю бюджета без "
+                "заявок — это отдельная гипотеза уровня аккаунта, сформулируй её."
+            ),
+        }
+
+        # ── Сырой спрос: что люди реально вводили. Источник гипотез о минус-словах
+        #    и о ключах, которых в кабинете ещё нет.
+        period_start = datetime.utcnow() - timedelta(days=period_days)
+        sq_rows = await self.db.execute(
+            select(
+                SearchQuery.query,
+                SearchQuery.keyword_phrase,
+                func.sum(SearchQuery.clicks).label("clicks"),
+                func.sum(SearchQuery.spend).label("spend"),
+                func.sum(SearchQuery.impressions).label("impressions"),
+            )
+            .where(and_(
+                SearchQuery.account_id == self.account_id,
+                SearchQuery.date >= period_start,
+            ))
+            .group_by(SearchQuery.query, SearchQuery.keyword_phrase)
+            .order_by(func.sum(SearchQuery.spend).desc())
+            .limit(60)
+        )
+        top_search_queries = [
+            {
+                "query": row.query,
+                "matched_keyword": row.keyword_phrase,
+                "impressions": int(row.impressions or 0),
+                "clicks": int(row.clicks or 0),
+                "spend_rub": round(float(row.spend or 0), 2),
+            }
+            for row in sq_rows.all()
+        ]
+
+        return {
+            "period_days": period_days,
+            "account_totals": account_totals,
+            "benchmarks": benchmarks,
+            "campaigns": campaigns,
+            "long_tail": long_tail,
+            "top_search_queries": top_search_queries,
+        }
+
+    def _call_llm(self, dataset: list[dict], provider: str, context: dict) -> dict:
+        return llm_providers.call_llm(provider, dataset, context)
 
     def _validate_change(self, change: dict, kw: Optional[Keyword], bid_editable: bool = True) -> Optional[str]:
         """Проверка изменения на безопасные лимиты. Возвращает None если ок,
@@ -207,9 +378,11 @@ class LLMAnalyzer:
         self.db.add(analysis)
         await self.db.flush()
 
+        context = await self._build_context(dataset, period_days)
+
         error_detail = None
         try:
-            llm_result = self._call_llm(dataset, provider)
+            llm_result = self._call_llm(dataset, provider, context)
         except Exception as e:
             logger.error(f"LLM call failed (provider={provider}): {e}")
             llm_result = {"changes": [], "diagnostics": [], "summary": ""}
@@ -231,6 +404,7 @@ class LLMAnalyzer:
             "keywords_sent": len(dataset),
             "llm_input_sample": dataset[:15],   # первые 15 строк датасета, полностью — в БД
             "llm_input_full_count": len(dataset),
+            "llm_input_context": context,        # v1.7.2: агрегаты аккаунта/кампаний/спроса
             "llm_raw_output": changes,           # сырой ответ модели, ДО фильтрации safety-лимитами
             "llm_diagnostics": diagnostics,
             "llm_executive_summary": executive_summary,
