@@ -112,6 +112,11 @@ async def _run_migrations(conn):
         # v1.7.0: универсальный JSON-payload для предложений (create_campaign и
         # будущие типы, которым нужна структура сложнее короткой строки).
         "ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS payload JSON",
+        # v1.7.4: запасной уровень атрибуции лида. Если заявка не привязалась к
+        # ключевому слову, но кампания известна — она всё равно участвует в
+        # анализе. Без этого 73% лидов выпадали, и кампания с реальными
+        # заявками выглядела нулевой (разбор на боевых данных gto365).
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS campaign_id INTEGER",
     ]
     for sql in migrations:
         try:
