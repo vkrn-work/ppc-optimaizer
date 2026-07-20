@@ -13,13 +13,24 @@
            коммерческого предложения (КП / БП), независимо от исхода
            (в т.ч. "Не прошло КП" — это тоже SQL, просто не выигранный).
 
-Матчинг с Директом — два способа, в порядке приоритета:
-  1. По номеру объявления (ad_id), если он есть в цепочке "Источник"
-     (например "... → ! Quard → 17223320102 → квард") — сверяется с
-     KeywordStat.ad_id, накопленным коллектором Директа. Самый точный способ,
-     не зависит от точного совпадения текста фразы.
-  2. По точному совпадению фразы (utm_term / хвост "Источника") с
-     Keyword.phrase.
+Матчинг с Директом — каскад из четырёх уровней, от точного к грубому (v1.7.4).
+Прежняя версия имела только уровни 1 и 3, и на боевых данных теряла 73% заявок:
+
+  1. По номеру объявления (ad_id) из цепочки "Источник" — сверяется с
+     KeywordStat.ad_id. ВНИМАНИЕ: сейчас этот уровень нерабочий, потому что
+     коллектор берёт CRITERIA_PERFORMANCE_REPORT, где поля AdId нет —
+     KeywordStat.ad_id пуст во всех 7838 строках. Код оставлен: заработает
+     сам, как только ad_id начнёт собираться (нужен AD_PERFORMANCE_REPORT).
+  2. По поисковому запросу через таблицу search_queries. Ключевой момент:
+     utm_term из CRM — это то, что ВВЁЛ ПОЛЬЗОВАТЕЛЬ ("цена на хардокс"), а не
+     фраза ключа из Директа ("Износостойкая сталь +Хардокс -Аналоги").
+     search_queries связывает одно с другим, и это основной рабочий уровень.
+  3. По точному совпадению utm_term с Keyword.phrase — исторический уровень,
+     срабатывает редко и только когда запрос случайно совпал с фразой.
+  4. По кампании (utm_campaign → Campaign.name). Ключ не определён, но заявка
+     всё равно участвует в анализе на уровне кампании. Без этого уровня
+     кампания с реальными продажами выглядела нулевой и попадала под
+     сокращение — именно так и произошло с Hardox на боевом прогоне.
 
 ClientID Яндекс.Метрики сохраняется в leads.client_id на будущее — сейчас
 матчинг по нему не выполняется, потому что коллектор Метрики забирает только
@@ -37,7 +48,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import Lead, LeadStatus, Keyword, KeywordStat
+from app.models.models import Lead, LeadStatus, Keyword, KeywordStat, SearchQuery, Campaign
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +57,7 @@ class CRMImportError(Exception):
     pass
 
 
-# ─── Определение колонок ────────────────────────────────────────────────
+# ─── Определение колонок ──────────────────────────────────
 
 COLUMN_ALIASES: dict[str, list[str]] = {
     "external_id": ["external_id", "id", "id сделки", "№ заявки", "номер заявки",
@@ -83,7 +94,7 @@ def _build_column_map(headers: list) -> dict[str, int]:
     return col_map
 
 
-# ─── Классификация статусов: lead / mql / sql ───────────────────────────
+# ─── Классификация статусов: lead / mql / sql ─────────────────────
 
 # Статусы, дошедшие минимум до КП/БП — независимо от исхода.
 SQL_STATUS_SET = {
@@ -111,7 +122,7 @@ def _parse_status_for_enum(is_sql: bool) -> LeadStatus:
     return LeadStatus.sql if is_sql else LeadStatus.lead
 
 
-# ─── Парсинг цепочки "Источник" ─────────────────────────────────────────
+# ─── Парсинг цепочки "Источник" ────────────────────────────
 
 def parse_source_chain(raw: Optional[str]) -> dict:
     """
@@ -157,7 +168,7 @@ def parse_source_chain(raw: Optional[str]) -> dict:
     return result
 
 
-# ─── Парсинг значений ────────────────────────────────────────────────────
+# ─── Парсинг значений ─────────────────────────────────────
 
 def _parse_decimal(val) -> Optional[Decimal]:
     if val is None or val == "":
@@ -190,7 +201,7 @@ def _parse_date(val) -> Optional[datetime]:
     return None
 
 
-# ─── Чтение файла (CSV / XLSX) ───────────────────────────────────────────
+# ─── Чтение файла (CSV / XLSX) ───────────────────────────────
 
 def _read_rows(filename: str, content: bytes) -> tuple[list, list]:
     """Возвращает (headers, rows) как список списков (без заголовка)."""
@@ -229,7 +240,7 @@ def _read_rows(filename: str, content: bytes) -> tuple[list, list]:
     raise CRMImportError(f"Неподдерживаемый формат файла: {filename}")
 
 
-# ─── Основная функция импорта ────────────────────────────────────────────
+# ─── Основная функция импорта ──────────────────────────────
 
 async def import_crm_file(db: AsyncSession, account_id: int, filename: str, content: bytes) -> dict:
     headers, rows = _read_rows(filename, content)
@@ -259,6 +270,29 @@ async def import_crm_file(db: AsyncSession, account_id: int, filename: str, cont
     for ad_id, kw_id in adid_q.all():
         ad_id_to_kw.setdefault(str(ad_id), kw_id)
 
+    # v1.7.4: utm_term из CRM — это ПОИСКОВЫЙ ЗАПРОС пользователя ("цена на
+    # хардокс"), а не фраза ключа из Директа ("Износостойкая сталь +Хардокс
+    # -Аналоги"). Сверять их напрямую бессмысленно: на реальной выгрузке так
+    # совпало лишь 15 строк из 56. Правильный мост — таблица search_queries,
+    # которая связывает запрос с ключом, по которому он был показан.
+    sq_q = await db.execute(
+        select(SearchQuery.query, SearchQuery.keyword_id)
+        .where(SearchQuery.account_id == account_id, SearchQuery.keyword_id.isnot(None))
+        .distinct()
+    )
+    query_to_kw: dict = {}
+    for query_text, kw_id in sq_q.all():
+        query_to_kw.setdefault(_normalize_header(query_text), kw_id)
+
+    # v1.7.4: запасной уровень атрибуции — кампания. utm_campaign заполнен
+    # практически всегда и совпадает с названием кампании в Директе один в
+    # один. Без этого лиды, не привязавшиеся к ключу, пропадали из анализа
+    # целиком — и кампания с реальными заявками выглядела как нулевая.
+    camp_q = await db.execute(
+        select(Campaign.id, Campaign.name).where(Campaign.account_id == account_id)
+    )
+    campaign_name_to_id = {_normalize_header(name): cid for cid, name in camp_q.all()}
+
     existing_q = await db.execute(
         select(Lead.external_id).where(Lead.account_id == account_id, Lead.external_id.isnot(None))
     )
@@ -270,7 +304,9 @@ async def import_crm_file(db: AsyncSession, account_id: int, filename: str, cont
         "skipped_empty_status": 0,
         "skipped_duplicate": 0,
         "matched_by_ad_id": 0,
+        "matched_by_search_query": 0,
         "matched_by_phrase": 0,
+        "matched_by_campaign_only": 0,
         "unmatched": 0,
         "mql_count": 0,
         "sql_count": 0,
@@ -295,25 +331,41 @@ async def import_crm_file(db: AsyncSession, account_id: int, filename: str, cont
         explicit_term = get(row, "utm_term")
         term = (str(explicit_term).strip() if explicit_term not in (None, "") else None) or parsed.get("term")
 
+        # v1.7.4: каскад атрибуции от точного к грубому. Раньше было только два
+        # верхних уровня, и оба почти не работали: ad_id пуст (коллектор берёт
+        # CRITERIA_PERFORMANCE_REPORT, где поля AdId нет), а phrase сверяла
+        # поисковый запрос с фразой ключа. Итог — 73% лидов терялись.
         keyword_id = None
         matched_by = None
+        norm_term = _normalize_header(term) if term else None
+
         if parsed.get("ad_id") and parsed["ad_id"] in ad_id_to_kw:
             keyword_id = ad_id_to_kw[parsed["ad_id"]]
             matched_by = "ad_id"
             stats["matched_by_ad_id"] += 1
-        elif term:
-            norm_term = _normalize_header(term)
-            if norm_term in phrase_to_id:
-                keyword_id = phrase_to_id[norm_term]
-                matched_by = "phrase"
-                stats["matched_by_phrase"] += 1
-        if keyword_id is None:
-            stats["unmatched"] += 1
+        elif norm_term and norm_term in query_to_kw:
+            keyword_id = query_to_kw[norm_term]
+            matched_by = "search_query"
+            stats["matched_by_search_query"] += 1
+        elif norm_term and norm_term in phrase_to_id:
+            keyword_id = phrase_to_id[norm_term]
+            matched_by = "phrase"
+            stats["matched_by_phrase"] += 1
 
         client_id = get(row, "client_id")
         client_id = str(client_id).strip() if client_id not in (None, "") else None
 
         campaign = get(row, "utm_campaign") or parsed.get("campaign")
+        campaign_id = campaign_name_to_id.get(_normalize_header(campaign)) if campaign else None
+
+        # Ключ не определился, но кампания известна — лид всё равно попадёт в
+        # анализ на уровне кампании, а не исчезнет.
+        if keyword_id is None:
+            if campaign_id is not None:
+                matched_by = "campaign"
+                stats["matched_by_campaign_only"] += 1
+            else:
+                stats["unmatched"] += 1
 
         lead = Lead(
             account_id=account_id,
@@ -323,6 +375,7 @@ async def import_crm_file(db: AsyncSession, account_id: int, filename: str, cont
             is_mql=is_mql,
             is_sql=is_sql,
             keyword_id=keyword_id,
+            campaign_id=campaign_id,
             matched_by=matched_by,
             matched_ad_id=parsed.get("ad_id"),
             client_id=client_id,

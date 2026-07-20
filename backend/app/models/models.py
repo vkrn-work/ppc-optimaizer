@@ -14,6 +14,11 @@ v1.4.0 additions:
   - Lead: raw_status, is_mql, is_sql, source_raw, matched_by, matched_ad_id
     (воронка lead/MQL/SQL по реальным статусам CRM + матчинг по цепочке
     "Источник" вместо отсутствовавшего чистого utm_term)
+
+v1.7.4 additions:
+  - Lead: campaign_id — запасной уровень атрибуции. На боевых данных 73% заявок
+    не привязывались к ключевому слову и выпадали из анализа целиком, из-за чего
+    кампания с реальными продажами выглядела нулевой и попадала под сокращение.
 """
 from datetime import datetime
 from decimal import Decimal
@@ -31,7 +36,7 @@ class Base(DeclarativeBase):
     pass
 
 
-# ─── Справочники ──────────────────────────────────────────────────
+# ─── Справочники ──────────────────────────────────
 
 class Account(Base):
     """Рекламный кабинет (один аккаунт Яндекс Директ)"""
@@ -140,7 +145,7 @@ class Keyword(Base):
     stats: Mapped[list["KeywordStat"]] = relationship(back_populates="keyword")
 
 
-# ─── Статистика ────────────────────────────────────────
+# ─── Статистика ────────────────────────────────
 
 class CampaignStat(Base):
     """Статистика кампании по дням"""
@@ -186,27 +191,27 @@ class KeywordStat(Base):
     clicks: Mapped[int] = mapped_column(Integer, default=0)
     spend: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=0)
 
-    # ── Базовые трафиковые метрики ──────────────────────
+    # ── Базовые трафиковые метрики ──────────────────
     ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))           # %
     avg_cpc: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))      # ₽
 
-    # ── Ставка и аукцион ──────────────────────────────────────────────────────────────
+    # ── Ставка и аукцион ─────────────────────────────────────
     avg_bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))      # AvgEffectiveBid в ₽
 
-    # ── Позиционные метрики ────────────────────────────────────────────────────
+    # ── Позиционные метрики ────────────────────────────────
     avg_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
     avg_click_position: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2))
 
-    # ── Объём рынка ───────────────────────────────────────────────────────────────
+    # ── Объём рынка ─────────────────────────────────────────
     traffic_volume: Mapped[Optional[int]] = mapped_column(Integer)           # AvgTrafficVolume 0–150
     weighted_impressions: Mapped[Optional[int]] = mapped_column(Integer)     # v1.2
     weighted_ctr: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4))  # v1.2
 
-    # ── Поведенческие (из Директа + Метрики) ────────────────────────────
+    # ── Поведенческие (из Директа + Метрики) ──────────────────
     bounce_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))   # v1.2, %
     sessions: Mapped[Optional[int]] = mapped_column(Integer)                 # v1.2, из Метрики
 
-    # ── Служебные ─────────────────────────────────────────────────────────────────────
+    # ── Служебные ───────────────────────────────────────────────
     ad_id: Mapped[Optional[str]] = mapped_column(String(100))
 
     __table_args__ = (
@@ -217,7 +222,7 @@ class KeywordStat(Base):
     keyword: Mapped["Keyword"] = relationship(back_populates="stats")
 
 
-# ─── Лиды и воронка ──────────────────────────────────────────────────
+# ─── Лиды и воронка ──────────────────────────────────
 
 class LeadStatus(str, enum.Enum):
     lead     = "lead"
@@ -236,6 +241,11 @@ class Lead(Base):
     external_id: Mapped[Optional[str]] = mapped_column(String(255))
     status: Mapped[LeadStatus] = mapped_column(SAEnum(LeadStatus))
     keyword_id: Mapped[Optional[int]] = mapped_column(ForeignKey("keywords.id"))
+    # v1.7.4: запасной уровень атрибуции. Если лид не привязался к ключу, но
+    # известна кампания (utm_campaign заполнен почти всегда) — он всё равно
+    # участвует в анализе на уровне кампании. Раньше такие лиды выпадали
+    # полностью, из-за чего кампания с реальными заявками выглядела нулевой.
+    campaign_id: Mapped[Optional[int]] = mapped_column(ForeignKey("campaigns.id"), index=True)
     client_id: Mapped[Optional[str]] = mapped_column(String(255))
     utm_source: Mapped[Optional[str]] = mapped_column(String(255))
     utm_medium: Mapped[Optional[str]] = mapped_column(String(255))
@@ -245,7 +255,7 @@ class Lead(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-    # ── Воронка lead / MQL / SQL (v1.4.0) ────────────────────────
+    # ── Воронка lead / MQL / SQL (v1.4.0) ────────────────────
     # raw_status — исходный текст статуса из CRM (для прозрачности/отладки,
     #   т.к. в реальных выгрузках статусы не совпадают со старым LeadStatus enum).
     raw_status: Mapped[Optional[str]] = mapped_column(String(255))
@@ -258,14 +268,20 @@ class Lead(Base):
     # source_raw — полная цепочка "Источник" как есть в CRM (кабинет → площадка
     #   → кампания → группа → id объявления → фраза), для отладки матчинга.
     source_raw: Mapped[Optional[str]] = mapped_column(Text)
-    # matched_by — как определился keyword_id: "ad_id" | "phrase" | None (не найден).
+    # matched_by — как определилась атрибуция (v1.7.4, каскад от точного к грубому):
+    #   "ad_id"        — по номеру объявления из "Источника";
+    #   "search_query" — utm_term найден в search_queries (это поисковый ЗАПРОС,
+    #                    а не фраза ключа — прямое сравнение с phrase почти не работало);
+    #   "phrase"       — точное совпадение с Keyword.phrase;
+    #   "campaign"     — ключ не определился, но кампания известна (campaign_id);
+    #   None           — не привязался никуда.
     matched_by: Mapped[Optional[str]] = mapped_column(String(50))
     # matched_ad_id — номер объявления, распаршенный из "Источника" (даже если
     #   матчинг по нему не удался — видно, что было в исходных данных).
     matched_ad_id: Mapped[Optional[str]] = mapped_column(String(100))
 
 
-# ─── Аналитика ────────────────────────────────────────────────────
+# ─── Аналитика ──────────────────────────────────────
 
 class AnalysisResult(Base):
     """Результат еженедельного анализа по кабинету"""
@@ -305,7 +321,7 @@ class KeywordMetrics(Base):
     bid_source: Mapped[str] = mapped_column(String(50), default="cluster")
 
 
-# ─── Правила и предложения ───────────────────────────────────────
+# ─── Правила и предложения ─────────────────────────────
 
 class MetrikaSnapshot(Base):
     """Снапшот данных из Метрики — все срезы за один сбор"""
