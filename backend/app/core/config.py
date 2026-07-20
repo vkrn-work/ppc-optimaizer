@@ -65,7 +65,15 @@ class Settings(BaseSettings):
     # Провайдер и включение/выключение можно переопределить на уровне
     # аккаунта через Account.analysis_config (llm_provider, autonomous_llm_enabled).
     AUTONOMOUS_LLM_ENABLED: bool = True
-    DEFAULT_LLM_PROVIDER: str = "groq"  # единственный провайдер, подтверждённый на реальном apply (см. CHANGELOG v1.6.0)
+    # v1.7.3: дефолт переведён с groq на gemini. Причина: у Groq на free-тарифе
+    # лимит 12000 TPM считает input + зарезервированный output, и после вычета
+    # системного промпта на данные остаётся ~3200 токенов — это ~15 ключевых слов
+    # из полутора сотен. Ночной автономный анализ на таком объёме теряет смысл.
+    # У Gemini контекст на порядки больше; его 503 "high demand" гасятся ретраями
+    # с backoff в llm_budget.post_with_retry.
+    # Вернуть groq: поменять значение здесь или переопределить на уровне аккаунта
+    # через Account.analysis_config.llm_provider — код обоих путей не менялся.
+    DEFAULT_LLM_PROVIDER: str = "gemini"
 
     # ── Безопасные пределы записи в Директ (защита от каскадных ошибок) ──
     MAX_BID_CHANGE_PCT: float = 50.0        # запрет менять ставку более чем на 50% за раз
