@@ -16,7 +16,7 @@ v1.7.5 — КРИТИЧЕСКИЙ ФИКС ПОДСЧЁТА ЗАЯВОК.
 Запасной уровень атрибуции (leads.campaign_id, добавленный в v1.7.4 именно
 затем, чтобы заявки не терялись) в отчёте не участвовал ВООБЩЕ. Заявка,
 привязанная к кампании, но не к ключу, показывалась как ноль — а таких
-большинство. При этом dashboard.py считает ВСЕ заявки периода — то есть
+большинство. При этом dashboard.py считает ВСЕ заявки периода, то есть
 два экрана одного продукта показывали разную воронку и не сходились друг с
 другом ни при каких данных.
 
@@ -25,6 +25,11 @@ v1.7.5 — КРИТИЧЕСКИЙ ФИКС ПОДСЧЁТА ЗАЯВОК.
     ad_group — через ключ (у заявки нет своего ad_group_id);
     keyword  — по keyword_id, как раньше;
     date     — по дате заявки.
+
+Второй фикс той же природы: отчёт строился ОТ KeywordStat, поэтому всё, у
+чего нет открутки в периоде, не попадало в выборку вместе со своими
+заявками (заявка в день без показов, остановленная кампания). Такие строки
+теперь достраиваются с нулевым расходом и флагом no_spend_in_period.
 
 И главное: в ответ добавлен блок attribution с нераспределённым остатком.
 Неразнесённые заявки больше не растворяются в нулях по строкам — видно,
@@ -63,8 +68,8 @@ async def _leads_by_dimension(db: AsyncSession, account_id: int, group_by: str,
     Возвращает {ключ измерения: {"leads": n, "mql": n, "sql": n}}.
 
     Ключевой момент для разреза campaign: заявка участвует, если у неё есть
-    ЛИБО свой campaign_id, ЛИБО ключ, через который кампания выводится. До v1.7.5
-    учитывался только второй случай, и отчёт показывал нули.
+    ЛИБО свой campaign_id, ЛИБО ключ, через который кампания выводится. До
+    v1.7.5 учитывался только второй случай, и отчёт показывал нули.
     """
     base_where = [
         Lead.account_id == account_id,
@@ -184,6 +189,27 @@ async def get_report(
         "sql": int(crm_row.sql or 0),
     }
 
+    filtered_dims = bool(campaign_id or ad_group_id or active_only)
+
+    # Имена для строк, которых нет в статистике периода (см. ниже).
+    campaign_names: dict = {}
+    ad_group_names: dict = {}
+    keyword_phrases: dict = {}
+    if not filtered_dims and leads_by_dim:
+        ids = [k for k in leads_by_dim if isinstance(k, int)]
+        if ids and group_by == "campaign":
+            campaign_names = dict((await db.execute(
+                select(Campaign.id, Campaign.name).where(Campaign.id.in_(ids))
+            )).all())
+        elif ids and group_by == "ad_group":
+            ad_group_names = dict((await db.execute(
+                select(AdGroup.id, AdGroup.name).where(AdGroup.id.in_(ids))
+            )).all())
+        elif ids and group_by == "keyword":
+            keyword_phrases = dict((await db.execute(
+                select(Keyword.id, Keyword.phrase).where(Keyword.id.in_(ids))
+            )).all())
+
     def dim_key(row):
         if group_by == "campaign":
             return ("campaign", row.campaign_id)
@@ -222,6 +248,32 @@ async def get_report(
             g["_bounce_n"]   += 1
         g["_n"] += 1
 
+    # ── v1.7.5: строки, где есть ЗАЯВКИ, но нет открутки в периоде.
+    #    Без этого заявка, пришедшая в день без показов (или по остановленной
+    #    кампании), просто исчезала из отчёта — тот же класс ошибки, что и
+    #    счёт только по keyword_id, только по другой оси.
+    if not filtered_dims:
+        known = {k[1] for k in groups}
+        for dim_value, stat in leads_by_dim.items():
+            if dim_value in known or not stat.get("leads"):
+                continue
+            groups[(group_by, dim_value)] = {
+                "campaign_id": dim_value if group_by == "campaign" else None,
+                "campaign_name": campaign_names.get(dim_value) if group_by == "campaign" else None,
+                "strategy_type": None, "campaign_is_active": None,
+                "ad_group_id": dim_value if group_by == "ad_group" else None,
+                "ad_group_name": ad_group_names.get(dim_value) if group_by == "ad_group" else None,
+                "keyword_id": dim_value if group_by == "keyword" else None,
+                "keyword_phrase": keyword_phrases.get(dim_value) if group_by == "keyword" else None,
+                "current_bid": None,
+                "date": dim_value if group_by == "date" else None,
+                "impressions": 0, "clicks": 0, "spend": 0.0,
+                "_pos_sum": 0.0, "_cpos_sum": 0.0, "_tv_sum": 0.0, "_wctr_sum": 0.0,
+                "_bounce_sum": 0.0, "_bounce_n": 0, "_n": 0,
+                "sessions": 0, "weighted_impressions": 0,
+                "no_spend_in_period": True,
+            }
+
     rows_out = []
     totals = {"impressions": 0, "clicks": 0, "spend": 0.0, "leads": 0, "mql": 0, "sql": 0}
     for key, g in groups.items():
@@ -259,6 +311,7 @@ async def get_report(
             "weighted_impressions": g["weighted_impressions"] or None,
             "bounce_rate":         round(g["_bounce_sum"] / g["_bounce_n"], 1) if g["_bounce_n"] else None,
             "sessions":            g["sessions"] or None,
+            "no_spend_in_period":  g.get("no_spend_in_period", False),
             "leads":               leads,
             "mql":                 mql,
             "sql":                 sql,
@@ -291,7 +344,7 @@ async def get_report(
     #    отфильтрованным кампаниям, и сравнивать с общим итогом CRM
     #    некорректно — честнее сказать, что не считали, чем показать число,
     #    которое выглядит как потерянные заявки.
-    filtered = bool(campaign_id or ad_group_id or active_only)
+    filtered = filtered_dims
     attribution = {
         "leads_total_crm": crm_totals["leads"],
         "sql_total_crm": crm_totals["sql"],
