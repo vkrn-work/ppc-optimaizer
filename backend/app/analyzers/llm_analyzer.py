@@ -36,6 +36,11 @@ v1.7.2 (глубина анализа): две причины, почему ра
   2. модель видела только плоский список ключей без точки отсчёта — добавлен
      _build_context() с бенчмарками аккаунта, разрезом по кампаниям,
      сводкой по длинному хвосту и топом поисковых запросов.
+
+v1.7.3: в summary пишется llm_payload_meta — сколько данных реально доехало до
+модели после ужимания под лимиты провайдера (см. llm_budget.fit_to_budget).
+Без этого урезание было бы молчаливым и неотличимым от "ИИ почему-то мало
+нашёл" — а это разные диагнозы с разным лечением.
 """
 import logging
 from datetime import datetime, timedelta
@@ -273,6 +278,8 @@ class LLMAnalyzer:
 
         # ── «Длинный хвост»: малокликовые ключи по отдельности ничего не значат,
         #    но в сумме могут съедать заметную долю бюджета без единой заявки.
+        #    Эта сводка переживает урезание payload в llm_budget.fit_to_budget,
+        #    даже если сами thin_data-строки из датасета вырезаны.
         thin = [r for r in dataset if r.get("thin_data")]
         long_tail = {
             "keywords_count": len(thin),
@@ -395,6 +402,11 @@ class LLMAnalyzer:
         # LLM, что и changes — ничего дополнительно не запрашиваем и не платим.
         diagnostics = llm_result.get("diagnostics", [])
         executive_summary = llm_result.get("summary", "")
+        # v1.7.3: сколько данных реально доехало до модели после ужимания под
+        # лимиты провайдера. Пишем в БД и показываем на фронте — если Groq
+        # съел 150 ключей до 15, директолог должен видеть это, а не гадать,
+        # почему предложений мало.
+        payload_meta = llm_result.get("payload_meta") or {}
 
         # Сохраняем ЧТО отправили и ЧТО получили — видно на фронте для отладки/доверия к результату.
         analysis.summary = {
@@ -405,6 +417,7 @@ class LLMAnalyzer:
             "llm_input_sample": dataset[:15],   # первые 15 строк датасета, полностью — в БД
             "llm_input_full_count": len(dataset),
             "llm_input_context": context,        # v1.7.2: агрегаты аккаунта/кампаний/спроса
+            "llm_payload_meta": payload_meta,    # v1.7.3: что урезано под лимит провайдера
             "llm_raw_output": changes,           # сырой ответ модели, ДО фильтрации safety-лимитами
             "llm_diagnostics": diagnostics,
             "llm_executive_summary": executive_summary,

@@ -9,6 +9,9 @@
 (Claude, Groq, OpenRouter — OpenAI-совместимый tool_choice), либо через structured output
 (Gemini — response_schema).
 
+Схемы и тексты промптов живут в llm_prompts.py, бюджет запроса и ретраи — в
+llm_budget.py. Здесь остаётся только логика вызова провайдеров.
+
 v1.5.0: в промпте объяснено поле bid_editable из датасета — на реальном apply
 выяснилось, что в этом кабинете нет ни одной кампании на ручных ставках —
 для авто-стратегий/ЕПК Yandex Direct API вообще не принимает Keywords[].Bid.
@@ -19,7 +22,7 @@ v1.5.0: в промпте объяснено поле bid_editable из дата
 v1.5.2: на реальном apply add_negatives модель (Groq) вернула минус-слова с
 приклеенным "-" ("-hard", "-ru") — скопировала формат фраз ключей из датасета,
 где минус-слова уже хранятся с дефисом. Direct API такое отклоняет (ошибка
-5002 — дефис в начале/конце слова недопустим). Явно прописано в промпте ниже;
+5002 — дефис в начале/конце слова недопустим). Явно прописано в промпте;
 дополнительно очищается в коде (direct_writer.py) как защита от повторения.
 
 v1.6.0: добавлен call_command_agent() — отдельный режим для страницы «Задачи
@@ -28,192 +31,36 @@ v1.6.0: добавлен call_command_agent() — отдельный режим 
 из числа реально существующих. Отдельная схема/промпт от основного анализа
 — чтобы не трогать уже проверенный пайплайн call_llm()/CHANGES_SCHEMA.
 
+v1.7.3: payload теперь ужимается под лимиты провайдера перед отправкой
+(см. llm_budget.fit_to_budget), а временные ошибки провайдера (503/429)
+ретраятся с backoff (llm_budget.post_with_retry) — во ВСЕХ трёх режимах,
+не только в основном анализе. Поводом стали две ошибки на реальном прогоне
+v1.7.2: groq 413 "Limit 12000 TPM, Requested 37516" и gemini 503 "high demand".
+Важное открытие по Groq: TPM считает input + зарезервированный output, поэтому
+max_tokens тоже стал зависеть от провайдера.
+
 v1.7.2: call_llm() принимает второй аргумент context — агрегаты по аккаунту,
 кампаниям, длинному хвосту и сырому поисковому спросу (см. llm_analyzer._build_context).
 Раньше модель видела только плоский список ключей, не могла сравнить ключ со средним
-по аккаунту и возвращала одиночные осторожные предложения. Промпт ниже объясняет,
-как этим контекстом пользоваться и требует гипотез на всех четырёх уровнях.
+по аккаунту и возвращала одиночные осторожные предложения.
 
 v1.7.1: добавлены поля diagnostics/summary в CHANGES_SCHEMA — модель теперь возвращает
 не только список изменений, но и пошаговый человекочитаемый рассказ о ходе анализа —
 для живого «чата» с ИИ на вкладке «История вход/выход» вместо голого JSON.
-Промпт также теперь явно требует разбор ВСЕГО датасета, а не 1-2 самых
-очевидных кандидатов — типичный ответ теперь должен содержать 5-20+
-изменений, если данные это оправдывают. max_tokens/maxOutputTokens подняты до
-8192 во всех 4 провайдерах под более длинные ответы.
 """
 import json
 import logging
 from typing import Optional
 
-import httpx
-
 from app.core.config import settings
-from app.analyzers.yandex_direct_knowledge import get_llm_knowledge_block
+from app.analyzers.llm_budget import provider_limits, fit_to_budget, post_with_retry
+from app.analyzers.llm_prompts import (
+    PROVIDERS, CHANGES_SCHEMA, SYSTEM_PROMPT,
+    COMMAND_SCHEMA, COMMAND_SYSTEM_PROMPT,
+    CAMPAIGN_SCHEMA, CAMPAIGN_SYSTEM_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
-
-PROVIDERS = ("claude", "gemini", "groq", "openrouter")
-
-# JSON Schema для {"changes": [...]} — общий для всех провайдеров.
-CHANGES_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "diagnostics": {
-            "type": "array",
-            "description": (
-                "Пошаговый рассказ о ходе анализа человеческим языком, от первого лица, как "
-                "будто ты объясняешь коллеге вживую что делаешь: что посмотрел, какую закономерность "
-                "нашёл, что она значит. 4-10 отдельных шагов, каждый 1-3 предложения. Пиши так, будто "
-                "печатаешь сообщения в чате по ходу анализа, а не итоговый отчёт постфактум."
-            ),
-            "items": {"type": "string"},
-        },
-        "summary": {
-            "type": "string",
-            "description": (
-                "Итоговое резюме анализа на 2-5 предложений человеческим языком: сколько ключей "
-                "разобрано, сколько проблем/возможностей найдено, что в приоритете и почему."
-            ),
-        },
-        "changes": {
-            "type": "array",
-            "description": (
-                "Полный список изменений — по КАЖДОМУ ключевому слову из датасета, для которого "
-                "цифры дают основание что-то предложить. Не ограничивайся 1-2 самыми очевидными "
-                "кандидатами — разбери весь датасет и верни все обоснованные изменения, их может "
-                "быть 5, 10, 20 и больше, если данные это поддерживают."
-            ),
-            "items": {
-                "type": "object",
-                "properties": {
-                    "keyword_id": {"type": "integer", "description": "id ключевого слова из данных"},
-                    "phrase": {"type": "string"},
-                    "change_type": {
-                        "type": "string",
-                        "enum": ["bid_raise", "bid_lower", "add_negatives", "pause", "ad_rewrite", "ad_test"],
-                    },
-                    "current_value": {"type": "string", "description": "текущее значение (например, ставка в ₽)"},
-                    "recommended_value": {"type": "string", "description": "рекомендованное значение"},
-                    "rationale": {
-                        "type": "string",
-                        "description": (
-                            "почему, на основе каких конкретных цифр из датасета этого ключа — "
-                            "пиши в человеческом тоне, как будто объясняешь вслух, а не сухим "
-                            "канцеляритом ('вижу, что...', 'смотрю на...', 'значит...')"
-                        ),
-                    },
-                    "expected_effect": {"type": "string", "description": "ожидаемый эффект"},
-                    "priority": {"type": "string", "enum": ["today", "this_week", "month", "scale"]},
-                    "negative_keywords": {
-                        "type": "array", "items": {"type": "string"},
-                        "description": "для change_type=add_negatives — список минус-слов, БЕЗ ведущего дефиса ('ремонт', а не '-ремонт')",
-                    },
-                },
-                "required": ["keyword_id", "phrase", "change_type", "rationale", "priority"],
-            },
-        },
-    },
-    "required": ["diagnostics", "summary", "changes"],
-}
-
-SYSTEM_PROMPT = """Ты — опытный PPC-специалист по контекстной рекламе (Яндекс.Директ).
-Тебе даны агрегированные данные по ключевым словам за период: показы, клики, расход,
-CTR, позиция, ставка, объём трафика, а также данные CRM там, где они есть:
-  - crm_leads — все заявки, дошедшие до CRM по этому ключу
-  - crm_mql   — заявки, прошедшие первичный отсев (не спам/тест/явный мусор)
-  - crm_sql   — заявки, дошедшие минимум до коммерческого предложения (КП/БП),
-                независимо от исхода сделки
-  - cr_lead_to_mql_pct, cr_mql_to_sql_pct — конверсии между стадиями воронки, %
-  - cost_per_mql_rub, cost_per_sql_rub — стоимость привлечения одного MQL/SQL, ₽
-  - bid_editable — можно ли вообще менять ставку этого ключа через API:
-      true  — кампания на ручной стратегии (MANUAL_CPC), Bid можно записать;
-      false — кампания на автоматической стратегии/ЕПК, ставкой управляет
-              алгоритм Яндекса, и Yandex Direct API отклонит любую попытку
-              записать Keywords[].Bid для этого ключа с ошибкой API.
-
-ВАЖНО про bid_editable=false: для таких ключей НИКОГДА не предлагай
-change_type=bid_raise или bid_lower — такое предложение физически нельзя
-применить, оно будет отклонено. Вместо этого для проблемных ключей с
-bid_editable=false предлагай change_type=add_negatives (минус-слова на
-уровне группы объявлений), pause (остановка ключа) или ad_rewrite/ad_test
-(правки текста объявления) — эти рычаги работают на уровне ключа/группы
-и не зависят от стратегии назначения ставок кампании.
-
-ВАЖНО про negative_keywords: указывай ГОЛЫЕ слова/фразы без дефиса
-("ремонт", а не "-ремонт"). В данных фразы ключей могут содержать уже
-встроенные минус-слова с дефисом (например, "-Купить -Листы") — это только
-для твоего контекста о том, что уже исключено, копировать дефис в свой
-ответ НЕ НАДО. Дефис в начале/конце слова Direct API отклонит как ошибку.
-
-Для этого бизнеса важны НЕ продажи и выручка, а количество, конверсия и
-стоимость привлечения именно SQL: чем больше SQL при разумной cost_per_sql_rub,
-тем лучше. Приоритизируй так:
-  - высокий cost_per_sql_rub при низкой cr_mql_to_sql_pct → кандидат на понижение
-    ставки (если bid_editable=true) или на паузу/минус-слова (если bid_editable=false) —
-    дорогой трафик, который не доходит до КП;
-  - низкий cost_per_sql_rub при стабильном потоке SQL → кандидат на повышение
-    ставки (только если bid_editable=true) либо на масштабирование другими средствами;
-  - есть клики и расход, но crm_leads=0 или мало → возможно, объявление/страница
-    не подходят под спрос — рассмотри add_negatives или ad_rewrite, а не только ставку.
-
-Проанализируй данные и предложи конкретные изменения для повышения эффективности.
-Используй только те цифры, что даны в данных — не выдумывай значения. Для
-change_type=bid_raise/bid_lower обязательно укажи recommended_value в рублях,
-рассчитанный от current_value, и делай это ТОЛЬКО когда bid_editable=true. Не
-предлагай изменения там, где данных недостаточно (мало кликов/лидов) — в этом
-случае лучше пропустить ключ.
-
-КАК ПОЛЬЗОВАТЬСЯ КОНТЕКСТОМ АККАУНТА (блок КОНТЕКСТ АККАУНТА перед построчными данными):
-  - account_totals и benchmarks — средние и медианы по всему аккаунту. Это твоя
-    точка отсчёта: ключ с cost_per_sql_rub втрое выше медианы — это не "дорого
-    вообще", а "дорого относительно того, что этот же аккаунт умеет". Всегда
-    формулируй обоснование через сравнение с бенчмарком, а не абстрактно.
-  - campaigns — разрез по кампаниям: доля расхода, стратегия, стоимость SQL.
-    Ищи кампании, которые съедают большую долю бюджета при худшей стоимости SQL,
-    и говори об этом отдельной гипотезой, даже если конкретный ключ там не виден.
-  - long_tail — сводка по малокликовым ключам (thin_data=true в построчных данных).
-    По одному такому ключу решение принимать рано, но если их 40 и вместе они
-    съели заметный бюджет без заявок — это самостоятельная гипотеза уровня аккаунта.
-  - top_search_queries — что люди реально вводили. Отсюда берутся два типа гипотез:
-    (1) нерелевантные запросы, съедающие бюджет → минус-слова; (2) релевантные
-    запросы, по которым нет своего ключа → кандидаты на добавление.
-
-thin_data=true у строки означает "меньше 3 кликов, статистики мало". Не предлагай
-по таким ключам изменение ставки или паузу как по надёжным данным — но и не
-игнорируй их: упомяни в diagnostics, если видишь по ним закономерность.
-
-ГЛУБИНА АНАЛИЗА — это важно: тебе присылают весь датасет не для того, чтобы
-ты выбрал 1-2 самых очевидных ключа и остановился. Пройдись по КАЖДОЙ строке
-датасета и для каждой прими решение: есть основание предложить изменение —
-предлагай, нет основания — переходи к следующей. Типичный качественный ответ
-на 15-30 ключей должен содержать от 5 до 20+ изменений разных типов (не
-только bid_raise/bid_lower — используй весь набор: add_negatives, pause,
-ad_rewrite, ad_test), если цифры это оправдывают. Разбирай на ВСЕХ уровнях:
-уровень ключа (построчные данные), уровень кампании (campaigns), уровень
-аккаунта (account_totals, long_tail) и уровень спроса (top_search_queries) —
-гипотезы с каждого из этих уровней имеют право быть в ответе. Не сокращай список
-искусственно и не ленись — редкий, скупой ответ на 1 предложение хуже, чем
-подробный разбор с явным "по этим ключам данных пока недостаточно" в diagnostics.
-
-ФОРМАТ ОТВЕТА — три поля:
-1. diagnostics — пошаговый рассказ о ходе твоего анализа ЖИВЫМ человеческим
-   языком, от первого лица, как будто ты прямо сейчас печатаешь в чате
-   директологу, что делаешь: "Смотрю на ключ X — 40 кликов, 0 заявок за 28
-   дней, это подозрительно...", "Проверяю voronku по ключам с высоким
-   расходом...", "Нашёл 3 ключа, где cost_per_sql в 3 раза выше среднего...".
-   4-10 шагов, каждый 1-3 предложения, разговорный, но профессиональный тон,
-   БЕЗ канцелярита и воды.
-2. summary — итоговое резюме на 2-5 предложений: сколько ключей разобрано,
-   сколько проблем/возможностей нашёл, что в приоритете и почему.
-3. changes — сам список изменений (см. описание поля в схеме).
-
-Верни только вызов инструмента propose_changes."""
-
-# v1.7.0 (пункт 4 запроса): дописываем справку по механике API + методологию
-# диагностики — чтобы модель не предлагала технически неприменимые
-# изменения и рассуждала по тому же дереву причин, что и ручной аудит.
-SYSTEM_PROMPT = SYSTEM_PROMPT + "\n\n" + get_llm_knowledge_block()
 
 
 class LLMProviderError(Exception):
@@ -240,9 +87,9 @@ def provider_model_name(provider: str) -> str:
 
 def call_llm(provider: str, dataset: list[dict], context: Optional[dict] = None) -> dict:
     """Единая точка входа. Возвращает dict {"changes": [...], "diagnostics": [...],
-    "summary": "..."} — diagnostics/summary дают человекочитаемый рассказ о ходе
-    анализа для вкладки «История вход/выход» (v1.7.1, живой чат с ИИ вместо
-    голого JSON)."""
+    "summary": "...", "payload_meta": {...}} — diagnostics/summary дают
+    человекочитаемый рассказ о ходе анализа для вкладки «История вход/выход»,
+    payload_meta говорит, что из данных пришлось урезать под лимит провайдера."""
     if provider not in PROVIDERS:
         raise LLMProviderError(f"Неизвестный провайдер: {provider}. Доступны: {PROVIDERS}")
     if not provider_configured(provider):
@@ -252,6 +99,11 @@ def call_llm(provider: str, dataset: list[dict], context: Optional[dict] = None)
     # средние/медианы для сравнения, разрез по кампаниям, длинный хвост и сырой
     # поисковый спрос. Без него модель не могла сказать "дороже среднего втрое"
     # и возвращала одиночные осторожные предложения.
+    # v1.7.3: ужимаем payload под лимиты конкретного провайдера ДО отправки —
+    # иначе Groq на free-тарифе отвечает 413 и прогон теряется целиком.
+    limits = provider_limits(provider)
+    dataset, context, payload_meta = fit_to_budget(dataset, context, limits["input_budget"])
+
     parts = []
     if context:
         parts.append(
@@ -264,18 +116,30 @@ def call_llm(provider: str, dataset: list[dict], context: Optional[dict] = None)
         f"(JSON, has_crm={any('crm_leads' in r for r in dataset)}):\n"
         + json.dumps(dataset, ensure_ascii=False)
     )
+    if payload_meta.get("trimmed"):
+        parts.append(
+            "ПРИМЕЧАНИЕ: датасет урезан под лимит запроса провайдера "
+            f"({payload_meta['original_keywords']} ключей → {payload_meta['sent_keywords']}). "
+            "Работай с тем, что прислано, и не делай выводов об объёме аккаунта "
+            "по числу строк — агрегаты в КОНТЕКСТ АККАУНТА посчитаны по полным данным."
+        )
     user_content = "\n\n".join(parts)
 
+    max_output = limits["max_output"]
     if provider == "claude":
-        return _call_claude(user_content)
-    if provider == "gemini":
-        return _call_gemini(user_content)
-    if provider in ("groq", "openrouter"):
-        return _call_openai_compatible(provider, user_content)
-    return {"changes": [], "diagnostics": [], "summary": ""}
+        result = _call_claude(user_content, max_output)
+    elif provider == "gemini":
+        result = _call_gemini(user_content, max_output)
+    elif provider in ("groq", "openrouter"):
+        result = _call_openai_compatible(provider, user_content, max_output)
+    else:
+        result = {"changes": [], "diagnostics": [], "summary": ""}
+
+    result["payload_meta"] = payload_meta
+    return result
 
 
-def _call_claude(user_content: str) -> dict:
+def _call_claude(user_content: str, max_output: int = 8192) -> dict:
     import anthropic
 
     client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
@@ -286,7 +150,7 @@ def _call_claude(user_content: str) -> dict:
     }
     resp = client.messages.create(
         model=settings.ANTHROPIC_MODEL,
-        max_tokens=8192,  # v1.7.1: было 4096 — мало для развёрнутого разбора + diagnostics по всему датасету
+        max_tokens=max_output,  # v1.7.3: зависит от провайдера, см. llm_budget.PROVIDER_LIMITS
         system=SYSTEM_PROMPT,
         tools=[tool],
         tool_choice={"type": "tool", "name": "propose_changes"},
@@ -303,7 +167,7 @@ def _call_claude(user_content: str) -> dict:
     return {"changes": [], "diagnostics": [], "summary": ""}
 
 
-def _call_gemini(user_content: str) -> dict:
+def _call_gemini(user_content: str, max_output: int = 8192) -> dict:
     """Gemini — через structured output (response_schema), без function calling:
     так надёжнее получить чистый JSON от бесплатной модели."""
     url = (
@@ -317,10 +181,12 @@ def _call_gemini(user_content: str) -> dict:
             "response_mime_type": "application/json",
             "response_schema": CHANGES_SCHEMA,
             "temperature": 0.2,
-            "maxOutputTokens": 8192,  # v1.7.1: развёрнутый разбор + diagnostics по всему датасету
+            "maxOutputTokens": max_output,  # v1.7.3: см. llm_budget.PROVIDER_LIMITS
         },
     }
-    resp = httpx.post(url, json=payload, timeout=120.0)
+    # v1.7.3: Gemini регулярно отдаёт 503 "high demand" — ретраим с backoff,
+    # чтобы не терять весь прогон анализа из-за временной недоступности.
+    resp = post_with_retry(url, json_payload=payload, timeout=120.0, provider="gemini")
     if resp.status_code != 200:
         raise LLMProviderError(f"Gemini API error {resp.status_code}: {resp.text[:500]}")
     data = resp.json()
@@ -336,7 +202,7 @@ def _call_gemini(user_content: str) -> dict:
         raise LLMProviderError(f"Gemini: не удалось распарсить ответ ({e}): {str(data)[:500]}")
 
 
-def _call_openai_compatible(provider: str, user_content: str) -> dict:
+def _call_openai_compatible(provider: str, user_content: str, max_output: int = 4096) -> dict:
     """Groq и OpenRouter реализуют OpenAI Chat Completions API с tool calling —
     общая логика для обоих."""
     if provider == "groq":
@@ -367,10 +233,13 @@ def _call_openai_compatible(provider: str, user_content: str) -> dict:
         "tools": [tool],
         "tool_choice": {"type": "function", "function": {"name": "propose_changes"}},
         "temperature": 0.2,
-        "max_tokens": 8192,  # v1.7.1: было без ограничения/по умолчанию малое — теперь явно достаточно для diagnostics + длинного списка changes
+        # v1.7.3: КРИТИЧНО для Groq — TPM-лимит считает и зарезервированный
+        # output тоже, поэтому max_tokens=8192 съедал весь лимит 12000 ещё до
+        # данных. Теперь берётся из llm_budget.PROVIDER_LIMITS (для groq — 4000).
+        "max_tokens": max_output,
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", **extra_headers}
-    resp = httpx.post(url, json=payload, headers=headers, timeout=120.0)
+    resp = post_with_retry(url, json_payload=payload, headers=headers, timeout=120.0, provider=provider)
     if resp.status_code != 200:
         raise LLMProviderError(f"{provider} API error {resp.status_code}: {resp.text[:500]}")
     data = resp.json()
@@ -391,63 +260,6 @@ def _call_openai_compatible(provider: str, user_content: str) -> dict:
 
 
 # ─── v1.6.0: «Задачи ИИ» — свободная команда → план новых ключевых слов ────────
-
-COMMAND_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "target_ad_group_id": {
-            "type": ["integer", "null"],
-            "description": "id подходящей СУЩЕСТВУЮЩЕЙ группы объявлений из переданного списка, или null",
-        },
-        "needs_new_ad_group": {"type": "boolean"},
-        "suggested_ad_group_name": {
-            "type": "string",
-            "description": "если ни одна группа не подходит — предложенное название новой",
-        },
-        "keywords": {
-            "type": "array", "items": {"type": "string"},
-            "description": "новые ключевые фразы для добавления",
-        },
-        "negative_keywords": {
-            "type": "array", "items": {"type": "string"},
-            "description": "минус-слова без ведущего дефиса, для этой же группы",
-        },
-        "rationale": {"type": "string"},
-    },
-    "required": ["keywords", "rationale"],
-}
-
-COMMAND_SYSTEM_PROMPT = """Ты — опытный PPC-специалист по контекстной рекламе в Яндекс.Директ,
-работаешь с рекламным кабинетом компании, поставляющей импортный металлопрокат
-(трубы, листовой прокат, сортовой прокат и т.п.). Пользователь даёт свободную
-текстовую команду о том, что добавить в рекламу — например, конкретную
-марку стали, типоразмер трубы, ГОСТ/ТУ. Тебе передан список СУЩЕСТВУЮЩИХ групп
-объявлений в этом кабинете (id, название группы, название кампании,
-текущее число ключей в группе).
-
-Твоя задача:
-1. Сгенерировать список релевантных ключевых фраз для описанного в команде
-   товара. Используй профессиональную терминологию отрасли (ГОСТ, диаметр,
-   толщина стенки, марка стали, способ производства — бесшовная/сварная и
-   т.п.), а также разговорные формулировки, которыми реально пользуются покупатели
-   в поиске (например, и "труба 89х3.5 гост 10704", и "труба стальная 89 на 3.5
-   купить"). 8–20 фраз обычно достаточно.
-2. Определи в какую из переданных существующих групп эти ключи лучше всего
-   добавить — по смысловому совпадению названия группы/кампании с товаром из
-   команды. Верни её id в target_ad_group_id. Используй ТОЛЬКО id из переданного
-   списка — не выдумывай числа. Если ни одна группа не подходит по смыслу,
-   верни target_ad_group_id=null, needs_new_ad_group=true и предложи вменяемое
-   название новой в suggested_ad_group_name.
-3. Предложи минус-слова для этой же группы, которые стоит добавить вместе с
-   новыми ключами, чтобы сразу отсечь нерелевантный трафик по новым фразам
-   (например: "бу", "чертёж", "гост скачать", "своими руками", "фото" — в
-   зависимости от специфики товара). Можно вернуть пустой список, если
-   нечего добавить.
-
-Обоснуй свой выбор группы и список ключей коротко в поле rationale."""
-
-COMMAND_SYSTEM_PROMPT = COMMAND_SYSTEM_PROMPT + "\n\n" + get_llm_knowledge_block()
-
 
 def call_command_agent(provider: str, command_text: str, context: list[dict]) -> dict:
     """Единая точка входа для страницы «Задачи ИИ». Возвращает dict с ключами
@@ -511,7 +323,7 @@ def _call_gemini_command(user_content: str) -> dict:
             "temperature": 0.3,
         },
     }
-    resp = httpx.post(url, json=payload, timeout=90.0)
+    resp = post_with_retry(url, json_payload=payload, timeout=90.0, provider="gemini")
     if resp.status_code != 200:
         raise LLMProviderError(f"Gemini API error {resp.status_code}: {resp.text[:500]}")
     data = resp.json()
@@ -553,7 +365,7 @@ def _call_openai_compatible_command(provider: str, user_content: str) -> dict:
         "temperature": 0.3,
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", **extra_headers}
-    resp = httpx.post(url, json=payload, headers=headers, timeout=90.0)
+    resp = post_with_retry(url, json_payload=payload, headers=headers, timeout=90.0, provider=provider)
     if resp.status_code != 200:
         raise LLMProviderError(f"{provider} API error {resp.status_code}: {resp.text[:500]}")
     data = resp.json()
@@ -576,81 +388,6 @@ def _call_openai_compatible_command(provider: str, user_content: str) -> dict:
 # один Suggestion(change_type="create_campaign", payload=черновик) — ничего
 # не создаётся в Директе, пока директолог не одобрит (см. campaign_planner.py
 # и app.core.tasks._apply_suggestion_async).
-
-CAMPAIGN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "name": {"type": "string", "description": "Название новой кампании, понятное человеку"},
-        "daily_budget_rub": {"type": "number", "description": "Стартовый дневной бюджет в рублях — консервативный, для теста (обычно 300-1000₽)"},
-        "rationale": {"type": "string", "description": "Почему эта кампания имеет смысл — на основе каких данных/спроса"},
-        "ad_groups": {
-            "type": "array",
-            "description": "1-5 групп объявлений, каждая — один товар/марка/стандарт (правило «один интент — одна группа»)",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "keywords": {
-                        "type": "array", "items": {"type": "string"},
-                        "description": "8-20 ключевых фраз: и точные коммерческие с размерами/марками, и более широкие",
-                    },
-                    "negative_keywords": {
-                        "type": "array", "items": {"type": "string"},
-                        "description": "минус-слова без ведущего дефиса, отсекающие информационный интент",
-                    },
-                    "ads": {
-                        "type": "array",
-                        "description": "1 текстовое объявление на группу",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "title":  {"type": "string", "description": "заголовок 1, до 56 символов"},
-                                "title2": {"type": "string", "description": "заголовок 2, до 30 символов, можно пусто"},
-                                "text":   {"type": "string", "description": "текст объявления, до 81 символа"},
-                                "href":   {"type": "string", "description": "ссылка на посадочную страницу"},
-                            },
-                            "required": ["title", "text", "href"],
-                        },
-                    },
-                },
-                "required": ["name", "keywords"],
-            },
-        },
-    },
-    "required": ["name", "daily_budget_rub", "ad_groups"],
-}
-
-CAMPAIGN_SYSTEM_PROMPT = """Ты — опытный PPC-специалист по контекстной рекламе в Яндекс.Директ,
-работаешь с рекламным кабинетом компании, поставляющей импортный металлопрокат
-(трубы, листовой прокат, сортовой прокат и т.п.), B2B-сегмент. Тебе дана
-свободная команда о том, какую новую кампанию нужно создать (например: «создай
-кампанию по маркам стали 1.4310 и S315MC» или «запусти кампанию по трубам
-профильным для нового направления»), а также опционально — данные о спросе
-и конверсиях по смежным ключам/кластерам, если они уже есть в кабинете.
-
-Спроектируй кампанию с нуля:
-1. Название кампании — понятное, отражающее товар/направление.
-2. Стартовый дневной бюджет — консервативный (обычно 300-1000₽), это НОВАЯ
-   кампания без истории, крупный бюджет здесь неуместен.
-3. Группы объявлений — по правилу «один интент — одна группа»: не смешивай
-   коммерческие запросы с размерами/марками и информационные (описание/
-   характеристики стандарта) в одной группе.
-4. Ключевые фразы — используй профессиональную терминологию отрасли (ГОСТ,
-   диаметр, толщина стенки, марка стали, способ производства) и то, как
-   реально ищут снабженцы. Приоритет — точные фразы с конкретными размерами
-   и марками (самый конвертирующий тип по методологии проекта, "золотые
-   фразы"), плюс несколько более широких для охвата.
-5. Минус-слова — отсекай информационный интент («что такое», «характеристики»,
-   «скачать», «гост pdf») и конкурирующие материалы, если применимо.
-6. Одно текстовое объявление на группу — заголовок с маркой/стандартом,
-   текст с конкретным оффером, ссылка на посадочную (если не знаешь точный
-   URL — используй разумную заглушку вида https://example.com/catalog и
-   поясни в rationale, что ссылку нужно проверить и заменить перед подтверждением).
-
-Обоснуй в rationale, почему эта кампания и её бюджет разумны."""
-
-CAMPAIGN_SYSTEM_PROMPT = CAMPAIGN_SYSTEM_PROMPT + "\n\n" + get_llm_knowledge_block()
-
 
 def call_campaign_planner(provider: str, command_text: str, market_context: list[dict]) -> dict:
     """Точка входа для конструктора кампаний (пункт 6). Возвращает черновик
@@ -715,7 +452,7 @@ def _call_gemini_campaign(user_content: str) -> dict:
             "temperature": 0.3,
         },
     }
-    resp = httpx.post(url, json=payload, timeout=120.0)
+    resp = post_with_retry(url, json_payload=payload, timeout=120.0, provider="gemini")
     if resp.status_code != 200:
         raise LLMProviderError(f"Gemini API error {resp.status_code}: {resp.text[:500]}")
     data = resp.json()
@@ -757,7 +494,7 @@ def _call_openai_compatible_campaign(provider: str, user_content: str) -> dict:
         "temperature": 0.3,
     }
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", **extra_headers}
-    resp = httpx.post(url, json=payload, headers=headers, timeout=120.0)
+    resp = post_with_retry(url, json_payload=payload, headers=headers, timeout=120.0, provider=provider)
     if resp.status_code != 200:
         raise LLMProviderError(f"{provider} API error {resp.status_code}: {resp.text[:500]}")
     data = resp.json()
