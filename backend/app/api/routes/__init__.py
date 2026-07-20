@@ -5,7 +5,10 @@
 """
 from fastapi import APIRouter
 
-from app.api.routes import accounts, dashboard, campaigns, keywords, suggestions, hypotheses, search_queries, reports, system
+from app.api.routes import (
+    accounts, dashboard, campaigns, keywords, suggestions, hypotheses,
+    search_queries, reports, system, leads,
+)
 
 router = APIRouter()
 
@@ -18,5 +21,6 @@ router.include_router(hypotheses.router)
 router.include_router(search_queries.router)
 router.include_router(reports.router)
 router.include_router(system.router)
+router.include_router(leads.router)
 
 __all__ = ["router"]
