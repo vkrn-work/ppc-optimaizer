@@ -5,7 +5,7 @@ import { api } from '../utils/api'
 
 // v1.6.0: страница «ИИ-анализ» объединяет три раньше отдельные страницы
 // (suggestions.js, crm-import.js, llm-debug.js) в вкладки одной страницы, чтобы
-весь цикл «запустить → посмотреть ответ → одобрить» был на одном экране.
+// весь цикл «запустить → посмотреть ответ → одобрить» был на одном экране.
 // Старые URL страниц (оставлены в коде, убраны из меню) работают как раньше.
 
 const TABS = [
@@ -644,6 +644,23 @@ function DebugSection({ accountId }) {
                   {JSON.stringify(s.llm_input_sample || [], null, 2)}
                 </pre>
               </div>
+
+              {/* v1.7.2: агрегированный контекст аккаунта, который уходит в модель
+                  вместе с построчными данными — бенчмарки, разрез по кампаниям,
+                  длинный хвост, сырой поисковый спрос. */}
+              {s.llm_input_context && (
+                <div className="card" style={{ padding: 16, gridColumn: '1 / -1' }}>
+                  <div style={{ fontWeight: 600, marginBottom: 8 }}>
+                    📊 Контекст аккаунта, отправленный в модель (бенчмарки, кампании, спрос)
+                  </div>
+                  <pre style={{
+                    fontSize: 11, background: 'var(--bg4)', padding: 10, borderRadius: 6,
+                    overflow: 'auto', maxHeight: 400, whiteSpace: 'pre-wrap',
+                  }}>
+                    {JSON.stringify(s.llm_input_context, null, 2)}
+                  </pre>
+                </div>
+              )}
 
               <div className="card" style={{ padding: 16 }}>
                 <div style={{ fontWeight: 600, marginBottom: 8 }}>
