@@ -24,6 +24,8 @@ v1.7.6 additions:
   - Lead: ad_group_id — уровень группы объявлений из цепочки «Источник».
     Нужен для вложенного отчёта кампания→группа→ключ и чтобы РСЯ-заявки
     (без ключа) доезжали до уровня группы.
+  - Suggestion: approved_at — дата одобрения (created_at/applied_at уже были),
+    для анализа «как отразилось применение».
 """
 from datetime import datetime
 from decimal import Decimal
@@ -430,6 +432,11 @@ class Suggestion(Base):
     reject_reason: Mapped[Optional[str]] = mapped_column(Text)
     approved_by: Mapped[Optional[str]] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # v1.7.6: три вехи жизненного цикла предложения для анализа «как отразилось»:
+    #   created_at  — когда ИИ сгенерировал предложение;
+    #   approved_at — когда директолог одобрил;
+    #   applied_at  — когда изменение реально ушло в кабинет Директа.
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     applied_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     # v1.7.0: универсальное хранилище структурированных данных предложения,
