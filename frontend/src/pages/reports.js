@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from 'react'
 import Layout from '../components/Layout'
 import { useAccount } from '../hooks/useAccount'
 import { api } from '../utils/api'
+import DateRangePicker from '../components/DateRangePicker'
 
 // v1.7.0 — «Конструктор отчётов» (пункт 2): аналог Мастера отчётов Директа /
 // отчётов Roistat. Данные приходят одним плоским набором из GET /report
@@ -14,14 +15,6 @@ const GROUPS = [
   { key: 'ad_group', label: 'По группам' },
   { key: 'keyword',  label: 'По ключам' },
   { key: 'date',     label: 'По дням' },
-]
-
-const PERIODS = [
-  { key: 'yesterday', label: 'Вчера' },
-  { key: '3d',        label: '3 дня' },
-  { key: 'week',      label: 'Неделя' },
-  { key: 'month',     label: 'Месяц' },
-  { key: 'custom',    label: 'Период…' },   // v1.7.6: произвольный диапазон дат
 ]
 
 // Полный каталог доступных столбцов. `groups: null` — показывать при любой
@@ -104,10 +97,18 @@ function ColumnSettingsModal({ visible, onClose, groupBy, checked, onToggle }) {
   )
 }
 
+// v1.7.6: единый выбор периода (пункт 3). По умолчанию — последние 30 дней.
+function _defaultRange() {
+  const z = n => String(n).padStart(2, '0')
+  const fmt = d => `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`
+  const to = new Date(); const from = new Date(); from.setDate(from.getDate() - 29)
+  return { from: fmt(from), to: fmt(to) }
+}
+
 export default function Reports() {
   const { account, accounts, accountId, switchAccount } = useAccount()
   const [groupBy, setGroupBy]     = useState('campaign')
-  const [period, setPeriod]       = useState('month')
+  const [range, setRange]         = useState(_defaultRange)
   const [campaigns, setCampaigns] = useState([])
   const [selCampaign, setSelCampaign] = useState('')
   const [activeOnly, setActiveOnly]   = useState(true)
@@ -133,18 +134,13 @@ export default function Reports() {
     api.getCampaigns(accountId, 'month', false).then(list => setCampaigns(Array.isArray(list) ? list : [])).catch(() => {})
   }, [accountId])
 
-  const [customFrom, setCustomFrom] = useState('')
-  const [customTo, setCustomTo] = useState('')
-
   function load() {
     if (!accountId) return
     setLoading(true)
-    const params = new URLSearchParams({ group_by: groupBy, period, active_only: activeOnly ? 'true' : 'false' })
-    // v1.7.6: произвольный период — бэкенд приоритезирует явные даты над preset
-    if (period === 'custom') {
-      if (!customFrom || !customTo) { setLoading(false); return }
-      params.set('date_from', customFrom)
-      params.set('date_to', customTo)
+    const params = new URLSearchParams({ group_by: groupBy, active_only: activeOnly ? 'true' : 'false' })
+    if (range?.from && range?.to) {
+      params.set('date_from', range.from)
+      params.set('date_to', range.to)
     }
     if (selCampaign) params.set('campaign_id', selCampaign)
     api.getReport(accountId, `?${params.toString()}`)
@@ -153,7 +149,7 @@ export default function Reports() {
       .finally(() => setLoading(false))
   }
 
-  useEffect(() => { load() }, [accountId, groupBy, period, selCampaign, activeOnly, customFrom, customTo])
+  useEffect(() => { load() }, [accountId, groupBy, range, selCampaign, activeOnly])
 
   function toggleColumn(key) {
     setVisibleCols(prev => ({ ...prev, [key]: !prev[key] }))
@@ -176,7 +172,7 @@ export default function Reports() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `report_${groupBy}_${period}.csv`
+    a.download = `report_${groupBy}_${range.from}_${range.to}.csv`
     a.click()
     URL.revokeObjectURL(url)
   }
@@ -198,20 +194,7 @@ export default function Reports() {
             <div key={g.key} className={`period-tab${groupBy===g.key?' active':''}`} onClick={()=>setGroupBy(g.key)}>{g.label}</div>
           ))}
         </div>
-        <div className="period-tabs" style={{ display: 'inline-flex' }}>
-          {PERIODS.map(p => (
-            <div key={p.key} className={`period-tab${period===p.key?' active':''}`} onClick={()=>setPeriod(p.key)}>{p.label}</div>
-          ))}
-        </div>
-        {period === 'custom' && (
-          <div style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
-            <input type="date" value={customFrom} onChange={e => setCustomFrom(e.target.value)}
-              style={{ padding: '5px 8px', fontSize: 12 }} />
-            <span style={{ color: 'var(--text3)' }}>—</span>
-            <input type="date" value={customTo} onChange={e => setCustomTo(e.target.value)}
-              style={{ padding: '5px 8px', fontSize: 12 }} />
-          </div>
-        )}
+        <DateRangePicker value={range} onChange={setRange} />
         <select value={selCampaign} onChange={e => setSelCampaign(e.target.value)} style={{ padding: '6px 10px', fontSize: 12 }}>
           <option value="">Все кампании</option>
           {campaigns.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
