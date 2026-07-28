@@ -1,48 +1,34 @@
 """
-v1.7.5: единый модуль атрибуции заявок. Вынесен из crm_importer.py.
+v1.7.6: единый модуль атрибуции заявок с ВЛОЖЕННОСТЬЮ кампания→группа→ключ.
 
-Зачем отдельным модулем: атрибуция должна выполняться НЕ ТОЛЬКО в момент
-импорта CRM-файла. На боевых данных главная причина «заявки не разносятся
-по кампаниям/ключам» — не сам каскад матчинга, а порядок событий:
+Ключевая идея версии: цепочка «Источник» из Роистата содержит всю иерархию
+ЯВНО, и она — источник истины, а не косвенные джойны:
 
-    выгрузку из CRM загружают раньше, чем досинхронизирован Директ
-    (search_queries собираются отдельной задачей и приезжают позже)
-    → в момент импорта query_to_kw пустой → keyword_id = NULL
-    → и он остаётся NULL НАВСЕГДА, потому что пересчёта не было.
+    ГТО 4 → Поиск → Спецстали_Quard_все /gto365.ru /РФ3 → ! Quard → 17223320102 → квард
+    кабинет  канал   КАМПАНИЯ                             ГРУППА    ОБЪЯВЛЕНИЕ    фраза
 
-Теперь тот же самый код вызывается тремя путями:
-  1. из crm_importer при импорте файла;
-  2. из llm_context.build_context() перед каждым ИИ-анализом (дёшево, читает
-     уже загруженные таблицы) — «мозг» гарантированно видит свежую разноску;
-  3. вручную/по расписанию через POST /accounts/{id}/leads/reattribute.
+Поэтому матчинг идёт сверху вниз:
+  1. campaign — по ИМЕНИ кампании из цепочки (то, что было на момент клика).
+     Если имя не совпало (кампанию переименовали) — берём кампанию найденного
+     ключа как запасной вариант.
+  2. ad_group — по имени группы ВНУТРИ найденной кампании. Это и есть
+     вложенность: заявка получает ad_group_id, даже если ключ не определился
+     (важно для РСЯ/ретаргетинга — там ключей нет вообще).
+  3. keyword — ad_id → search_query → phrase, как и раньше, но выбор ключа
+     ограничен найденной группой, если она известна.
 
-Каскад (от точного к грубому):
-  1. ad_id        — номер объявления из цепочки «Источник».
-  2. search_query — utm_term (то, что ВВЁЛ пользователь) → search_queries → ключ.
-  3. phrase       — точное совпадение utm_term с Keyword.phrase.
-  4. campaign     — ключ не определён, но кампания известна.
+Что это чинит по сравнению с v1.7.5:
+  A. РСЯ/ретаргетинг больше не теряется. У таких кампаний нет ключевых слов,
+     поэтому keyword_id всегда NULL — но campaign_id и ad_group_id теперь
+     проставляются из цепочки, и заявка доезжает до отчёта и до ИИ.
+  B. Кампания больше НЕ переезжает вслед за ключом. Раньше «bisplate» из
+     кампании Quard мог сматчиться на ключ в другой кампании и уехать туда.
+     Теперь кампания фиксируется по цепочке, а ключ лишь уточняет внутри неё.
+  C. Появляется ad_group_id — уровень, которого не было. Без него отчёт
+     «По группам» по заявкам был пустой, и ИИ не видел срез групп.
 
-ЧТО ИМЕННО ЧИНИТСЯ ОТНОСИТЕЛЬНО v1.7.4:
-
-  A. campaign_id ВСЕГДА выводится из ключа, если ключ найден.
-     Раньше campaign_id брался ТОЛЬКО из совпадения utm_campaign с именем
-     кампании. Не совпало имя (лишний пробел, переименование кампании,
-     колонка называется «Рекламная кампания» и не распозналась) — лид с
-     найденным keyword_id получал campaign_id=NULL и ВЫПАДАЛ из разреза
-     campaigns в llm_context. Отсюда кампании с реальными заявками,
-     выглядящие нулевыми.
-
-  B. Ключ по поисковому запросу выбирается по МАКСИМУМУ кликов, а не
-     setdefault'ом. Один запрос обычно показывается по нескольким ключам;
-     раньше побеждал произвольный (первый пришедший из БД) — заявка
-     приписывалась случайному ключу. Ровно это и видно в отчётах как
-     «заявки разнесены не по тем ключам».
-
-  C. Матчинг имени кампании — двухуровневый: точный, затем «мягкий»
-     (без домена/региона/номеров). При коллизии мягкого ключа не матчим
-     вообще — лучше NULL, чем приписать не той кампании.
-
-  D. Статусы SQL определяются по вхождению, а не по точному равенству.
+Каскад matched_by (от точного к грубому): ad_id → search_query → phrase →
+ad_group → campaign → None.
 """
 import logging
 import re
@@ -70,36 +56,36 @@ def normalize(s: object) -> str:
 
 
 def normalize_campaign(s: object) -> str:
-    """Агрессивная нормализация ИМЕНИ КАМПАНИИ для запасного матчинга.
+    """Агрессивная нормализация имени кампании/группы для запасного матчинга.
 
-    Директологи кодируют в имени служебные хвосты:
-        "Спецстали_Quard_все /gto365.ru /РФ3"
-    а CRM отдаёт то же самое с другим разделителем, без домена или без
-    региона. Отрезаем всё после первого '/', разделители → пробел,
-    выкидываем голые числа.
+    Директологи кодируют служебные хвосты: «Спецстали_Quard_все /gto365.ru /РФ3».
+    CRM отдаёт то же с другим разделителем, без домена или региона. Отрезаем
+    всё после первого '/', разделители → пробел, выкидываем голые числа.
     """
     t = normalize(s)
     if not t:
         return ""
     t = t.split("/")[0]
-    t = re.sub(r"[_\-|.,()\[\]]+", " ", t)
+    t = re.sub(r"[_\-|.,()\[\]!#]+", " ", t)
     t = re.sub(r"\b\d+\b", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
 
 # ─── Классификация статусов воронки ────────────────────────
 
-# Статус считается SQL, если ЛЮБОЙ маркер входит в текст. Именно вхождение,
-# а не равенство: в реальных выгрузках статусы приходят с хвостами
-# («КП отправлено», «Запущен БП №7», «Не прошло КП» — всё это SQL).
-# Короткие маркеры (<=2 символа) ищутся как отдельные токены, чтобы не
-# ловить случайные вхождения внутри слов.
+# SQL — дошло минимум до КП/БП, независимо от исхода. Вхождение, а не равенство:
+# «КП отправлено», «Запущен БП №7», «Не прошло КП» — всё это SQL.
 SQL_MARKERS = (
     "кп", "бп", "заказ запущен", "сделка", "продажа", "выигран",
     "won", "deal", "proposal", "предложение", "счет", "договор",
 )
 
-JUNK_MARKERS = ("спам", "spam", "тест", "test", "фрод", "fraud", "дубл", "duplicate")
+# Явный мусор — не MQL. Из реальной выгрузки gto365: «Дубль», «Перекуп»,
+# «Не наша номенклатура» — это не квалифицированные заявки.
+JUNK_MARKERS = (
+    "спам", "spam", "тест", "test", "фрод", "fraud", "дубл", "duplicate",
+    "перекуп", "не наша", "не целев", "нецелев", "не по адресу",
+)
 
 
 def classify_status(raw_status: Optional[str]) -> tuple[bool, bool]:
@@ -116,15 +102,16 @@ def classify_status(raw_status: Optional[str]) -> tuple[bool, bool]:
 
 # ─── Парсинг цепочки «Источник» ────────────────────────────
 
-# Разные CRM/Роистат экспортируют цепочку с разными разделителями. Раньше
-# сплит был только по '→' — выгрузка с другим разделителем давала
-# campaign=None по ВСЕМ строкам, молча отключая запасной уровень атрибуции.
 CHAIN_SEPARATORS = ("→", "->", "»", "|", " / ", " — ", " – ")
 
 
 def parse_source_chain(raw: Optional[str]) -> dict:
-    """кабинет → площадка → кампания → группа → id объявления → фраза."""
-    result = {"cabinet": None, "platform": None, "campaign": None,
+    """кабинет → площадка → кампания → группа → id объявления → фраза.
+
+    channel — «Поиск» / «РСЯ» / ... (вторая позиция). Нужен, чтобы отличать
+    поисковые кампании от сетевых даже до матчинга.
+    """
+    result = {"cabinet": None, "platform": None, "channel": None, "campaign": None,
               "ad_group": None, "ad_id": None, "term": None}
     if not raw:
         return result
@@ -137,19 +124,26 @@ def parse_source_chain(raw: Optional[str]) -> dict:
     if not parts:
         return result
 
-    for idx, key in enumerate(("cabinet", "platform", "campaign", "ad_group")):
-        if len(parts) > idx:
-            result[key] = parts[idx]
+    if len(parts) > 0:
+        result["cabinet"] = parts[0]
+    if len(parts) > 1:
+        result["platform"] = parts[1]
+        result["channel"] = parts[1]
+    if len(parts) > 2:
+        result["campaign"] = parts[2]
+    if len(parts) > 3:
+        result["ad_group"] = parts[3]
 
     if len(parts) >= 5:
         if parts[-1].isdigit():
-            # РСЯ: цепочка заканчивается номером объявления, фразы нет
+            # РСЯ: цепочка заканчивается id объявления, фразы нет
             result["ad_id"] = parts[-1]
         elif parts[-2].isdigit():
             # Поиск: ... → id объявления → фраза
             result["ad_id"] = parts[-2]
             result["term"] = parts[-1]
         else:
+            # последний сегмент — фраза (или заголовок объявления)
             result["term"] = parts[-1]
     return result
 
@@ -165,16 +159,19 @@ class Matchers:
     campaign_exact: dict = field(default_factory=dict)
     campaign_loose: dict = field(default_factory=dict)
     kw_to_campaign: dict = field(default_factory=dict)
+    kw_to_adgroup: dict = field(default_factory=dict)
+    # (campaign_id, normalized_group_name) → ad_group_id
+    adgroup_exact: dict = field(default_factory=dict)
+    adgroup_loose: dict = field(default_factory=dict)
+    adgroup_campaign: dict = field(default_factory=dict)  # ad_group_id → campaign_id
 
     def stats(self) -> dict:
-        """Диагностика: если здесь нули, матчинг физически не на чем построить.
-        Показывается в ответе импорта и пересчёта — чтобы «0 сматченных» не
-        путали с «данных в Директе ещё нет»."""
         return {
             "ad_ids": len(self.ad_id_to_kw),
             "search_queries": len(self.query_to_kw),
             "phrases": len(self.phrase_to_kw),
             "campaigns": len(self.campaign_exact),
+            "ad_groups": len(self.adgroup_campaign),
             "keywords_with_campaign": len(self.kw_to_campaign),
         }
 
@@ -182,32 +179,42 @@ class Matchers:
 async def build_matchers(db: AsyncSession, account_id: int) -> Matchers:
     m = Matchers()
 
-    # ── keyword → campaign. Это и есть фикс (A): campaign_id больше не
-    #    зависит от совпадения текстового имени кампании.
-    kw_camp_rows = await db.execute(
-        select(Keyword.id, Keyword.phrase, Campaign.id.label("campaign_id"))
+    # keyword → campaign / ad_group (+ фраза)
+    kw_rows = await db.execute(
+        select(Keyword.id, Keyword.phrase, Keyword.ad_group_id,
+               AdGroup.campaign_id)
         .join(AdGroup, Keyword.ad_group_id == AdGroup.id)
-        .join(Campaign, AdGroup.campaign_id == Campaign.id)
         .where(Keyword.account_id == account_id)
     )
-    for kw_id, phrase, camp_id in kw_camp_rows.all():
+    for kw_id, phrase, ag_id, camp_id in kw_rows.all():
         m.kw_to_campaign[kw_id] = camp_id
+        m.kw_to_adgroup[kw_id] = ag_id
         m.phrase_to_kw.setdefault(normalize(phrase), kw_id)
 
-    # Ключи без группы/кампании тоже должны матчиться по фразе.
     orphan_rows = await db.execute(
         select(Keyword.id, Keyword.phrase).where(Keyword.account_id == account_id)
     )
     for kw_id, phrase in orphan_rows.all():
         m.phrase_to_kw.setdefault(normalize(phrase), kw_id)
 
-    # ── ad_id → keyword: побеждает объявление с наибольшим числом кликов.
+    # ad_group → campaign, и (campaign, имя группы) → ad_group_id
+    ag_rows = await db.execute(
+        select(AdGroup.id, AdGroup.name, AdGroup.campaign_id)
+        .where(AdGroup.account_id == account_id)
+    )
+    for ag_id, name, camp_id in ag_rows.all():
+        m.adgroup_campaign[ag_id] = camp_id
+        m.adgroup_exact.setdefault((camp_id, normalize(name)), ag_id)
+        loose = normalize_campaign(name)
+        if loose:
+            key = (camp_id, loose)
+            # коллизия loose-имени внутри кампании → не матчим, чтобы не соврать
+            m.adgroup_loose[key] = None if key in m.adgroup_loose else ag_id
+
+    # ad_id → keyword: побеждает объявление с наибольшим числом кликов
     ad_rows = await db.execute(
-        select(
-            KeywordStat.ad_id,
-            KeywordStat.keyword_id,
-            func.sum(KeywordStat.clicks).label("clicks"),
-        )
+        select(KeywordStat.ad_id, KeywordStat.keyword_id,
+               func.sum(KeywordStat.clicks).label("clicks"))
         .where(KeywordStat.account_id == account_id, KeywordStat.ad_id.isnot(None))
         .group_by(KeywordStat.ad_id, KeywordStat.keyword_id)
     )
@@ -219,15 +226,11 @@ async def build_matchers(db: AsyncSession, account_id: int) -> Matchers:
             ad_best[key] = (kw_id, c)
     m.ad_id_to_kw = {k: v[0] for k, v in ad_best.items()}
 
-    # ── поисковый запрос → keyword (фикс B): ключ с максимумом кликов по
-    #    этому запросу, при равенстве — с максимумом показов.
+    # поисковый запрос → keyword: ключ с максимумом кликов по этому запросу
     sq_rows = await db.execute(
-        select(
-            SearchQuery.query,
-            SearchQuery.keyword_id,
-            func.sum(SearchQuery.clicks).label("clicks"),
-            func.sum(SearchQuery.impressions).label("impressions"),
-        )
+        select(SearchQuery.query, SearchQuery.keyword_id,
+               func.sum(SearchQuery.clicks).label("clicks"),
+               func.sum(SearchQuery.impressions).label("impressions"))
         .where(SearchQuery.account_id == account_id, SearchQuery.keyword_id.isnot(None))
         .group_by(SearchQuery.query, SearchQuery.keyword_id)
     )
@@ -241,7 +244,7 @@ async def build_matchers(db: AsyncSession, account_id: int) -> Matchers:
             sq_best[key] = (kw_id, weight)
     m.query_to_kw = {k: v[0] for k, v in sq_best.items()}
 
-    # ── имя кампании → id, два уровня строгости (фикс C).
+    # имя кампании → id, два уровня строгости
     camp_rows = await db.execute(
         select(Campaign.id, Campaign.name).where(Campaign.account_id == account_id)
     )
@@ -249,15 +252,12 @@ async def build_matchers(db: AsyncSession, account_id: int) -> Matchers:
         m.campaign_exact.setdefault(normalize(name), cid)
         loose = normalize_campaign(name)
         if loose:
-            # коллизия мягкого ключа → не матчим вообще: лучше NULL, чем
-            # приписать заявку не той кампании
             m.campaign_loose[loose] = None if loose in m.campaign_loose else cid
 
     return m
 
 
 def resolve_campaign_id(m: Matchers, *candidates) -> Optional[int]:
-    """Кампания по нескольким текстовым кандидатам: сначала точно, потом мягко."""
     names = [c for c in candidates if c]
     for name in names:
         cid = m.campaign_exact.get(normalize(name))
@@ -270,6 +270,18 @@ def resolve_campaign_id(m: Matchers, *candidates) -> Optional[int]:
     return None
 
 
+def resolve_ad_group_id(m: Matchers, campaign_id: Optional[int],
+                        group_name: Optional[str]) -> Optional[int]:
+    """Группа ищется ТОЛЬКО внутри известной кампании — имя группы уникально
+    лишь в пределах кампании."""
+    if campaign_id is None or not group_name:
+        return None
+    ag = m.adgroup_exact.get((campaign_id, normalize(group_name)))
+    if ag:
+        return ag
+    return m.adgroup_loose.get((campaign_id, normalize_campaign(group_name)))
+
+
 def attribute(
     m: Matchers,
     *,
@@ -277,9 +289,20 @@ def attribute(
     term: Optional[str] = None,
     campaign_name: Optional[str] = None,
     chain_campaign: Optional[str] = None,
-) -> tuple[Optional[int], Optional[int], Optional[str]]:
-    """(keyword_id, campaign_id, matched_by). Каскад ad_id → search_query →
-    phrase → campaign. campaign_id ВСЕГДА заполняется, если ключ найден."""
+    chain_ad_group: Optional[str] = None,
+) -> tuple[Optional[int], Optional[int], Optional[int], Optional[str]]:
+    """Возвращает (keyword_id, ad_group_id, campaign_id, matched_by).
+
+    Иерархия из цепочки: кампания (по имени, авторитетно) → группа (внутри
+    кампании) → ключ (ad_id/запрос/фраза, внутри группы если известна).
+    """
+    # 1) КАМПАНИЯ — из цепочки/utm, имя приоритетно
+    campaign_id = resolve_campaign_id(m, chain_campaign, campaign_name)
+
+    # 2) ГРУППА — по имени внутри кампании
+    ad_group_id = resolve_ad_group_id(m, campaign_id, chain_ad_group)
+
+    # 3) КЛЮЧ — ad_id → запрос → фраза
     keyword_id = None
     matched_by = None
     norm_term = normalize(term) if term else None
@@ -294,19 +317,28 @@ def attribute(
         keyword_id = m.phrase_to_kw[norm_term]
         matched_by = "phrase"
 
-    campaign_id = resolve_campaign_id(m, campaign_name, chain_campaign)
-
     if keyword_id is not None:
-        # Кампания ключа — источник истины. Имя из CRM может не совпасть
-        # (переименование, лишние пробелы, нераспознанная колонка), но если
-        # ключ найден, его кампания известна точно.
+        # Кампания из цепочки не нашлась (переименовали) — берём из ключа.
+        if campaign_id is None:
+            campaign_id = m.kw_to_campaign.get(keyword_id)
         kw_campaign = m.kw_to_campaign.get(keyword_id)
-        if kw_campaign is not None:
-            campaign_id = kw_campaign
-    elif campaign_id is not None:
-        matched_by = "campaign"
+        # Ключ уточняет группу, но только если он из ТОЙ ЖЕ кампании, что и
+        # цепочка. Иначе доверяем цепочке (ключ мог сматчиться в другую
+        # кампанию по одинаковому запросу).
+        if ad_group_id is None and (campaign_id is None or kw_campaign == campaign_id):
+            ad_group_id = m.kw_to_adgroup.get(keyword_id)
+    else:
+        # Ключа нет (типично для РСЯ) — уровень определяется группой/кампанией.
+        if ad_group_id is not None:
+            matched_by = "ad_group"
+        elif campaign_id is not None:
+            matched_by = "campaign"
 
-    return keyword_id, campaign_id, matched_by
+    # Группа известна, а кампания нет — восстановим кампанию из группы.
+    if campaign_id is None and ad_group_id is not None:
+        campaign_id = m.adgroup_campaign.get(ad_group_id)
+
+    return keyword_id, ad_group_id, campaign_id, matched_by
 
 
 # ─── Пересчёт атрибуции для уже импортированных заявок ─────
@@ -314,16 +346,8 @@ def attribute(
 async def reattribute_account(db: AsyncSession, account_id: int,
                               only_unmatched: bool = False,
                               commit: bool = True) -> dict:
-    """Прогоняет каскад заново по всем заявкам аккаунта.
-
-    Вызывать после каждой синхронизации Директа и перед ИИ-анализом: заявки,
-    импортированные до того, как приехали search_queries, иначе так и
-    остаются с keyword_id=NULL. Это и есть основная причина «в отчётах
-    заявки не разнесены».
-
-    only_unmatched=True — трогать только те, у кого нет ни ключа, ни кампании
-    (безопасный режим, ничего уже сматченного не перезапишет).
-    """
+    """Прогоняет каскад заново по всем заявкам аккаунта по актуальным данным
+    Директа. Вызывать после синхронизации и перед ИИ-анализом."""
     m = await build_matchers(db, account_id)
 
     q = select(Lead).where(Lead.account_id == account_id)
@@ -335,6 +359,7 @@ async def reattribute_account(db: AsyncSession, account_id: int,
         "total": len(leads),
         "changed": 0,
         "gained_keyword": 0,
+        "gained_ad_group": 0,
         "gained_campaign": 0,
         "lost_keyword": 0,
         "still_unmatched": 0,
@@ -347,22 +372,28 @@ async def reattribute_account(db: AsyncSession, account_id: int,
         ad_id = lead.matched_ad_id or parsed.get("ad_id")
         term = lead.utm_term or parsed.get("term")
 
-        kw_id, camp_id, matched_by = attribute(
+        kw_id, ag_id, camp_id, matched_by = attribute(
             m,
             ad_id=ad_id,
             term=term,
             campaign_name=lead.utm_campaign,
             chain_campaign=parsed.get("campaign"),
+            chain_ad_group=parsed.get("ad_group"),
         )
 
-        if kw_id != lead.keyword_id or camp_id != lead.campaign_id or matched_by != lead.matched_by:
+        changed = (kw_id != lead.keyword_id or ag_id != lead.ad_group_id
+                   or camp_id != lead.campaign_id or matched_by != lead.matched_by)
+        if changed:
             if kw_id is not None and lead.keyword_id is None:
                 stats["gained_keyword"] += 1
             if kw_id is None and lead.keyword_id is not None:
                 stats["lost_keyword"] += 1
+            if ag_id is not None and lead.ad_group_id is None:
+                stats["gained_ad_group"] += 1
             if camp_id is not None and lead.campaign_id is None:
                 stats["gained_campaign"] += 1
             lead.keyword_id = kw_id
+            lead.ad_group_id = ag_id
             lead.campaign_id = camp_id
             lead.matched_by = matched_by
             if ad_id and not lead.matched_ad_id:
@@ -371,7 +402,7 @@ async def reattribute_account(db: AsyncSession, account_id: int,
 
         key = matched_by or "unmatched"
         stats["by_match_method"][key] = stats["by_match_method"].get(key, 0) + 1
-        if kw_id is None and camp_id is None:
+        if kw_id is None and ag_id is None and camp_id is None:
             stats["still_unmatched"] += 1
 
     if commit:
