@@ -71,6 +71,8 @@ async def _run_migrations(conn):
         "ALTER TABLE leads ADD COLUMN IF NOT EXISTS source_raw TEXT",
         "ALTER TABLE leads ADD COLUMN IF NOT EXISTS matched_by VARCHAR(50)",
         "ALTER TABLE leads ADD COLUMN IF NOT EXISTS matched_ad_id VARCHAR(100)",
+        # v1.7.6: уровень группы объявлений у заявки — для вложенного отчёта
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS ad_group_id INTEGER",
         # v1.4.1 HOTFIX: utm_medium давно объявлена в модели Lead, но никогда не
         # была в миграциях — таблица leads создавалась create_all() до того, как
         # это поле попало в models.py. Первый же реальный импорт CRM падал с
