@@ -5,6 +5,10 @@
 Добавлено в v1.2:
   - WeightedImpressions, WeightedCtr, BounceRate в keyword stats
   - Sessions обогащается из Метрики через utm_term (в tasks.py)
+
+Добавлено в v1.7.6:
+  - get_campaign_stats (CAMPAIGN_PERFORMANCE_REPORT) — расход на уровне
+    кампаний, покрывает РСЯ/ретаргетинг, у которых нет ключевых слов.
 """
 import asyncio
 import logging
@@ -199,6 +203,45 @@ class YandexDirectCollector:
                 ],
                 "ReportName": f"kw_stats_{date_from}_{date_to}",
                 "ReportType": "CRITERIA_PERFORMANCE_REPORT",
+                "DateRangeType": "CUSTOM_DATE",
+                "Format": "TSV",
+                "IncludeVAT": "NO",
+                "IncludeDiscount": "NO",
+            }
+        }
+        return await self._request_report(payload)
+
+    async def get_campaign_stats(
+        self,
+        date_from: date,
+        date_to: date,
+    ) -> list[dict]:
+        """Статистика на уровне КАМПАНИЙ (CAMPAIGN_PERFORMANCE_REPORT).
+
+        v1.7.6. Зачем отдельно от get_keyword_stats: у РСЯ/ретаргетинговых
+        кампаний нет ключевых слов, поэтому в CRITERIA_PERFORMANCE_REPORT их
+        расхода нет вообще. Без этого отчёта РСЯ-кампании были невидимы —
+        ни расхода, ни строки в отчёте, хотя заявки по ним есть. Этот отчёт
+        покрывает ВСЕ типы кампаний, включая сети.
+        """
+        payload = {
+            "params": {
+                "SelectionCriteria": {
+                    "DateFrom": date_from.isoformat(),
+                    "DateTo":   date_to.isoformat(),
+                },
+                "FieldNames": [
+                    "Date",
+                    "CampaignId",
+                    "CampaignName",
+                    "Impressions",
+                    "Clicks",
+                    "Ctr",
+                    "Cost",
+                    "AvgCpc",
+                ],
+                "ReportName": f"campaign_stats_{date_from}_{date_to}",
+                "ReportType": "CAMPAIGN_PERFORMANCE_REPORT",
                 "DateRangeType": "CUSTOM_DATE",
                 "Format": "TSV",
                 "IncludeVAT": "NO",
