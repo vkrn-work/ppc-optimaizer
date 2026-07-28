@@ -21,6 +21,7 @@ const PERIODS = [
   { key: '3d',        label: '3 дня' },
   { key: 'week',      label: 'Неделя' },
   { key: 'month',     label: 'Месяц' },
+  { key: 'custom',    label: 'Период…' },   // v1.7.6: произвольный диапазон дат
 ]
 
 // Полный каталог доступных столбцов. `groups: null` — показывать при любой
@@ -132,10 +133,19 @@ export default function Reports() {
     api.getCampaigns(accountId, 'month', false).then(list => setCampaigns(Array.isArray(list) ? list : [])).catch(() => {})
   }, [accountId])
 
+  const [customFrom, setCustomFrom] = useState('')
+  const [customTo, setCustomTo] = useState('')
+
   function load() {
     if (!accountId) return
     setLoading(true)
     const params = new URLSearchParams({ group_by: groupBy, period, active_only: activeOnly ? 'true' : 'false' })
+    // v1.7.6: произвольный период — бэкенд приоритезирует явные даты над preset
+    if (period === 'custom') {
+      if (!customFrom || !customTo) { setLoading(false); return }
+      params.set('date_from', customFrom)
+      params.set('date_to', customTo)
+    }
     if (selCampaign) params.set('campaign_id', selCampaign)
     api.getReport(accountId, `?${params.toString()}`)
       .then(setData)
@@ -143,7 +153,7 @@ export default function Reports() {
       .finally(() => setLoading(false))
   }
 
-  useEffect(() => { load() }, [accountId, groupBy, period, selCampaign, activeOnly])
+  useEffect(() => { load() }, [accountId, groupBy, period, selCampaign, activeOnly, customFrom, customTo])
 
   function toggleColumn(key) {
     setVisibleCols(prev => ({ ...prev, [key]: !prev[key] }))
@@ -193,6 +203,15 @@ export default function Reports() {
             <div key={p.key} className={`period-tab${period===p.key?' active':''}`} onClick={()=>setPeriod(p.key)}>{p.label}</div>
           ))}
         </div>
+        {period === 'custom' && (
+          <div style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+            <input type="date" value={customFrom} onChange={e => setCustomFrom(e.target.value)}
+              style={{ padding: '5px 8px', fontSize: 12 }} />
+            <span style={{ color: 'var(--text3)' }}>—</span>
+            <input type="date" value={customTo} onChange={e => setCustomTo(e.target.value)}
+              style={{ padding: '5px 8px', fontSize: 12 }} />
+          </div>
+        )}
         <select value={selCampaign} onChange={e => setSelCampaign(e.target.value)} style={{ padding: '6px 10px', fontSize: 12 }}>
           <option value="">Все кампании</option>
           {campaigns.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
@@ -207,6 +226,23 @@ export default function Reports() {
           </div>
         )}
       </div>
+
+      {data?.attribution && (
+        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 10, fontSize: 12 }}>
+          <div style={{ color: 'var(--text3)' }}>
+            Заявок в CRM за период: <b>{data.attribution.leads_total_crm}</b>,
+            в отчёте: <b>{data.attribution.leads_in_report}</b>
+            {data.attribution.leads_unattributed != null && data.attribution.leads_unattributed > 0 && (
+              <span style={{ color: 'var(--warn, #b45309)' }}> · не разнесено: {data.attribution.leads_unattributed}</span>
+            )}
+          </div>
+          {data.attribution.campaign_spend_source === 'keyword_stats_fallback' && (
+            <div style={{ color: 'var(--warn, #b45309)' }}>
+              ⚠ Расход РСЯ может быть занижен — не собрана статистика кампаний, запустите синхронизацию
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="card" style={{ padding: 0, overflow: 'auto' }}>
         <table>
@@ -225,6 +261,9 @@ export default function Reports() {
                 {columns.map(c => (
                   <td key={c.key} style={c.type === 'text' ? { maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } : {}}>
                     {fmt(c.type, r[c.key])}
+                    {c.key === 'campaign_name' && r.no_keywords && (
+                      <span style={{ marginLeft: 6, fontSize: 10, color: 'var(--text3)', border: '1px solid var(--border)', borderRadius: 4, padding: '0 4px' }}>РСЯ/сеть</span>
+                    )}
                   </td>
                 ))}
               </tr>
