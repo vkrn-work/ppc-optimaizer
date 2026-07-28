@@ -15,7 +15,7 @@ from app.importers.lead_attribution import (
 from app.importers.crm_importer import _build_column_map, _parse_date, _parse_decimal
 
 
-# ─── Статусы ──────────────────────────────────
+# ─── Статусы ───────────────────────────────────────────
 
 @pytest.mark.parametrize("status,expect_mql,expect_sql", [
     ("КП", True, True),
@@ -34,7 +34,7 @@ def test_classify_status(status, expect_mql, expect_sql):
     assert classify_status(status) == (expect_mql, expect_sql)
 
 
-# ─── Цепочка «Источник» ──────────────────────
+# ─── Цепочка «Источник» ───────────────────────────────
 
 CHAIN_ARROW = ("ГТО 4 → Поиск → Спецстали_Quard_все /gto365.ru /РФ3 → "
                "! Quard → 17223320102 → квард")
@@ -66,7 +66,7 @@ def test_parse_source_chain_empty():
     assert parse_source_chain("просто текст")["campaign"] is None
 
 
-# ─── Нормализация ───────────────────────────
+# ─── Нормализация ────────────────────────────────────
 
 def test_normalize_handles_nbsp_and_yo():
     assert normalize("  Ключёвое\xa0СЛОВО  ") == "ключевое слово"
@@ -76,7 +76,7 @@ def test_normalize_campaign_strips_service_tail():
     assert normalize_campaign("Спецстали_Quard_все /gto365.ru /РФ3") == "спецстали quard все"
 
 
-# ─── Матчинг кампании ──────────────────────
+# ─── Матчинг кампании ────────────────────────────────
 
 def _matchers() -> Matchers:
     m = Matchers()
@@ -156,10 +156,19 @@ def test_campaign_id_derived_from_keyword_when_name_mismatches():
     assert by == "search_query"
 
 
-def test_junk_statuses_not_mql():
-    """v1.7.6: Дубль/Перекуп/Не наша номенклатура — не MQL (из выгрузки gto365)."""
-    for junk in ("Дубль (уже в работе)", "Перекуп", "Не наша номенклатура"):
+def test_junk_only_spam_test_invite_tender():
+    """v1.7.6 (уточнение клиента): мусор = только спам/тест и приглашение к
+    сотрудничеству/тендер. Всё остальное — MQL."""
+    for junk in ("Спам", "тестовая", "Приглашение к сотрудничеству", "Тендер"):
         assert classify_status(junk) == (False, False)
+
+
+def test_dubl_and_perekup_are_mql():
+    """Дубль НЕ мусор: может быть дубль заявки с продажей. Перекуп и
+    «не наша номенклатура» клиент из мусора тоже не исключал."""
+    assert classify_status("Дубль (уже в работе)")[0] is True
+    assert classify_status("Перекуп")[0] is True
+    assert classify_status("Не наша номенклатура")[0] is True
 
 
 # ─── Распознавание колонок ───────────────────────────
