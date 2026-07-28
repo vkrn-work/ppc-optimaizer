@@ -19,6 +19,11 @@ v1.7.4 additions:
   - Lead: campaign_id — запасной уровень атрибуции. На боевых данных 73% заявок
     не привязывались к ключевому слову и выпадали из анализа целиком, из-за чего
     кампания с реальными продажами выглядела нулевой и попадала под сокращение.
+
+v1.7.6 additions:
+  - Lead: ad_group_id — уровень группы объявлений из цепочки «Источник».
+    Нужен для вложенного отчёта кампания→группа→ключ и чтобы РСЯ-заявки
+    (без ключа) доезжали до уровня группы.
 """
 from datetime import datetime
 from decimal import Decimal
@@ -246,6 +251,11 @@ class Lead(Base):
     # участвует в анализе на уровне кампании. Раньше такие лиды выпадали
     # полностью, из-за чего кампания с реальными заявками выглядела нулевой.
     campaign_id: Mapped[Optional[int]] = mapped_column(ForeignKey("campaigns.id"), index=True)
+    # v1.7.6: уровень группы объявлений — из цепочки «Источник» (кабинет →
+    # площадка → кампания → ГРУППА → объявление → фраза). Нужен для вложенного
+    # отчёта кампания→группа→объявление→ключ и чтобы РСЯ-заявки (у которых нет
+    # ключа) всё равно доезжали до уровня группы.
+    ad_group_id: Mapped[Optional[int]] = mapped_column(ForeignKey("ad_groups.id"), index=True)
     client_id: Mapped[Optional[str]] = mapped_column(String(255))
     utm_source: Mapped[Optional[str]] = mapped_column(String(255))
     utm_medium: Mapped[Optional[str]] = mapped_column(String(255))
@@ -268,12 +278,13 @@ class Lead(Base):
     # source_raw — полная цепочка "Источник" как есть в CRM (кабинет → площадка
     #   → кампания → группа → id объявления → фраза), для отладки матчинга.
     source_raw: Mapped[Optional[str]] = mapped_column(Text)
-    # matched_by — как определилась атрибуция (v1.7.4, каскад от точного к грубому):
+    # matched_by — как определилась атрибуция (v1.7.6, каскад от точного к грубому):
     #   "ad_id"        — по номеру объявления из "Источника";
     #   "search_query" — utm_term найден в search_queries (это поисковый ЗАПРОС,
     #                    а не фраза ключа — прямое сравнение с phrase почти не работало);
     #   "phrase"       — точное совпадение с Keyword.phrase;
-    #   "campaign"     — ключ не определился, но кампания известна (campaign_id);
+    #   "ad_group"     — ключ не определился, но группа известна (РСЯ);
+    #   "campaign"     — ни ключ, ни группа, но кампания известна (campaign_id);
     #   None           — не привязался никуда.
     matched_by: Mapped[Optional[str]] = mapped_column(String(50))
     # matched_ad_id — номер объявления, распаршенный из "Источника" (даже если
