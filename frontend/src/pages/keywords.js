@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import Layout from '../components/Layout'
 import { useAccount } from '../hooks/useAccount'
 import { api } from '../utils/api'
+import DateRangePicker from '../components/DateRangePicker'
 
 const PERIODS = [
   {key:'yesterday',label:'Вчера'},
@@ -42,7 +43,11 @@ function signalLabel(type) {
 
 export default function Keywords() {
   const { account, accounts, accountId, switchAccount } = useAccount()
-  const [period, setPeriod]     = useState('week')
+  const [range, setRange] = useState(() => {
+    const z = n => String(n).padStart(2,'0'); const f = d => `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`
+    const to = new Date(); const from = new Date(); from.setDate(from.getDate()-29)
+    return { from: f(from), to: f(to) }
+  })
   const [keywords, setKeywords] = useState([])
   const [loading, setLoading]   = useState(true)
   const [search, setSearch]     = useState('')
@@ -52,10 +57,11 @@ export default function Keywords() {
   useEffect(() => {
     if (!accountId) return
     setLoading(true)
-    api.getKeywords(accountId, `?limit=300&period=${period}`)
+    const range_q = range?.from && range?.to ? `&date_from=${range.from}&date_to=${range.to}` : ''
+    api.getKeywords(accountId, `?limit=300${range_q}`)
       .then(data => { setKeywords(Array.isArray(data)?data:[]); setLoading(false) })
       .catch(() => setLoading(false))
-  }, [accountId, period])
+  }, [accountId, range])
 
   const filtered = keywords
     .filter(kw => !search || kw.phrase.toLowerCase().includes(search.toLowerCase()))
@@ -78,12 +84,7 @@ export default function Keywords() {
     <Layout account={account} accounts={accounts} onAccountChange={switchAccount}>
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'1rem'}}>
         <h1 style={{fontSize:20,fontWeight:500}}>Ключевые слова</h1>
-        <div className="period-tabs">
-          {PERIODS.map(p=>(
-            <div key={p.key} className={`period-tab${period===p.key?' active':''}`}
-              onClick={()=>setPeriod(p.key)}>{p.label}</div>
-          ))}
-        </div>
+        <DateRangePicker value={range} onChange={setRange} />
       </div>
 
       {/* Фильтры */}
