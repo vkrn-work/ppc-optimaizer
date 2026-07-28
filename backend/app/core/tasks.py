@@ -16,6 +16,10 @@ CHANGED v1.6.0 (apply_suggestion):
     object_type=keyword как раньше.
   - новый change_type=add_keywords — добавление новых ключевых слов в группу
     через keywords.add (источник: страница «Задачи ИИ», app.analyzers.agent_command).
+
+CHANGED v1.7.6:
+  - После статистики ключей собирается и сохраняется CampaignStat
+    (CAMPAIGN_PERFORMANCE_REPORT) — расход на уровне кампаний, покрывает РСЯ.
 """
 import asyncio
 import logging
@@ -86,7 +90,7 @@ def collect_account_data(self, account_id: int, days: int = 28):
 async def _collect_account_data_async(account_id: int, days: int = 28):
     from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
     from app.core.config import settings
-    from app.models.models import Account, Campaign, AdGroup, Keyword, KeywordStat
+    from app.models.models import Account, Campaign, AdGroup, Keyword, KeywordStat, CampaignStat
     from app.collectors.direct_collector import YandexDirectCollector
     from app.collectors.metrika_collector import MetrikaCollector
     from sqlalchemy import select
@@ -294,6 +298,59 @@ async def _collect_account_data_async(account_id: int, days: int = 28):
                         logger.warning(f"Error parsing stat row: {e} | row={row}")
                 await db.commit()
                 logger.info(f"Stats saved: {saved_stats} rows for account {account_id}")
+
+                # ── Статистика на уровне КАМПАНИЙ (v1.7.6) ────────────────────
+                # Покрывает РСЯ/ретаргетинг, у которых нет ключей и потому нет
+                # ни одной строки в keyword_stats. Без этого расход РСЯ нигде
+                # не хранился и не показывался в отчёте.
+                try:
+                    camp_stats = await dc.get_campaign_stats(date_from, date_to)
+                    logger.info(f"Campaign stats rows: {len(camp_stats)}")
+                    saved_camp = 0
+                    for row in camp_stats:
+                        cres = await db.execute(
+                            select(Campaign).where(
+                                Campaign.account_id == account_id,
+                                Campaign.direct_id == str(row.get("CampaignId", "")),
+                            )
+                        )
+                        camp = cres.scalar_one_or_none()
+                        if not camp:
+                            continue
+                        try:
+                            cs_date = datetime.strptime(row["Date"], "%Y-%m-%d")
+                            cs_clicks = int(float(row.get("Clicks", 0) or 0))
+                            cs_impr = int(float(row.get("Impressions", 0) or 0))
+                            cs_spend = float(row.get("Cost", 0) or 0)
+                            if cs_clicks == 0 and cs_impr == 0 and cs_spend == 0:
+                                continue
+                            stmt = insert(CampaignStat).values(
+                                account_id=account_id,
+                                campaign_id=camp.id,
+                                date=cs_date,
+                                impressions=cs_impr,
+                                clicks=cs_clicks,
+                                spend=cs_spend,
+                                ctr=safe_float(row.get("Ctr")),
+                                avg_cpc=safe_float(row.get("AvgCpc")),
+                            ).on_conflict_do_update(
+                                index_elements=["account_id", "campaign_id", "date"],
+                                set_={
+                                    "impressions": cs_impr,
+                                    "clicks": cs_clicks,
+                                    "spend": cs_spend,
+                                    "ctr": safe_float(row.get("Ctr")),
+                                    "avg_cpc": safe_float(row.get("AvgCpc")),
+                                },
+                            )
+                            await db.execute(stmt)
+                            saved_camp += 1
+                        except (ValueError, KeyError) as e:
+                            logger.warning(f"Error parsing campaign stat: {e} | row={row}")
+                    await db.commit()
+                    logger.info(f"Campaign stats saved: {saved_camp} rows for account {account_id}")
+                except Exception as e:
+                    logger.warning(f"Campaign stats collection failed: {e}")
 
                 # Поисковые запросы
                 try:
