@@ -90,13 +90,31 @@ export default function CrmImport() {
 
         {result && (
           <div style={{ marginTop: 14, fontSize: 13, color: 'var(--text2)', lineHeight: 1.7 }}>
-            <div>✓ Импортировано заявок: <b>{result.imported}</b> из {result.total_rows} строк в файле</div>
-            <div>Воронка: MQL — <b>{result.mql_count}</b>, SQL — <b>{result.sql_count}</b></div>
-            <div style={{ marginTop: 6 }}>Сопоставлено с ключевым словом по номеру объявления: <b>{result.matched_by_ad_id}</b></div>
-            <div>Сопоставлено с ключевым словом по фразе: <b>{result.matched_by_phrase}</b></div>
-            <div>Не удалось сопоставить с ключом: <b>{result.unmatched}</b></div>
-            <div style={{ marginTop: 6 }}>Пропущено (нет статуса): <b>{result.skipped_empty_status}</b></div>
-            <div>Пропущено (дубликат по external_id): <b>{result.skipped_duplicate}</b></div>
+            {result.message && (
+              <div style={{ marginBottom: 8, padding: '8px 10px', borderRadius: 6,
+                background: 'var(--bg4)', color: 'var(--text)' }}>{result.message}</div>
+            )}
+            <div>✓ Импортировано новых заявок: <b>{result.imported}</b> из {result.total_rows} строк в файле</div>
+            <div>Воронка: MQL — <b>{result.mql_count}</b>, SQL (КП/БП) — <b>{result.sql_count}</b></div>
+            <div style={{ marginTop: 6 }}>Сопоставлено с кампанией: <b>{result.matched_by_campaign_only}</b>,
+              с группой: <b>{result.matched_by_ad_group}</b>,
+              с ключом (запрос/фраза/объявление): <b>{(result.matched_by_search_query||0)+(result.matched_by_phrase||0)+(result.matched_by_ad_id||0)}</b></div>
+            <div>Совсем не сопоставлено: <b>{result.unmatched}</b></div>
+            <div style={{ marginTop: 6 }}>Пропущено (нет статуса): <b>{result.skipped_empty_status}</b>,
+              дубли: <b>{result.skipped_duplicate}</b>{result.date_parse_failed ? <> , не распознана дата: <b>{result.date_parse_failed}</b></> : null}</div>
+            {result.reattribution && result.reattribution.total != null && (
+              <div style={{ marginTop: 6, color: 'var(--text3)' }}>
+                Пересчёт разноски: всего заявок <b>{result.reattribution.total}</b>,
+                получили кампанию <b>{result.reattribution.gained_campaign}</b>,
+                группу <b>{result.reattribution.gained_ad_group}</b>,
+                ключ <b>{result.reattribution.gained_keyword}</b>
+              </div>
+            )}
+            {result.columns_ignored && result.columns_ignored.length > 0 && (
+              <div style={{ marginTop: 6, color: 'var(--text3)', fontSize: 12 }}>
+                Колонки файла, которые система не использовала: {result.columns_ignored.join(', ')}
+              </div>
+            )}
           </div>
         )}
       </div>
