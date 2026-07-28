@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import Layout from '../components/Layout'
 import { useAccount } from '../hooks/useAccount'
 import { api } from '../utils/api'
+import DateRangePicker from '../components/DateRangePicker'
 
 const PERIODS = [
   {key:'yesterday',label:'Вчера'},
@@ -114,9 +115,12 @@ function CampaignDrillDown({ campaign, accountId, dateFrom, dateTo }) {
 
 export default function Campaigns() {
   const { account, accounts, accountId, switchAccount } = useAccount()
-  const [period, setPeriod]           = useState('week')
-  const [customFrom, setCustomFrom]   = useState('')
-  const [customTo, setCustomTo]       = useState('')
+  const _z = n => String(n).padStart(2,'0')
+  const _fmt = d => `${d.getFullYear()}-${_z(d.getMonth()+1)}-${_z(d.getDate())}`
+  const _to0 = new Date(); const _from0 = new Date(); _from0.setDate(_from0.getDate()-29)
+  const [period, setPeriod]           = useState('custom')
+  const [customFrom, setCustomFrom]   = useState(_fmt(_from0))
+  const [customTo, setCustomTo]       = useState(_fmt(_to0))
   const [compareFrom, setCompareFrom] = useState('')
   const [compareTo, setCompareTo]     = useState('')
   const [showCustom, setShowCustom]   = useState(false)
@@ -174,8 +178,14 @@ export default function Campaigns() {
   }
 
   useEffect(() => {
-    if (period !== 'custom') loadData()
-  }, [accountId, period, view, onlyActive, selCampaign, search])
+    // v1.7.6: период по умолчанию 'custom' (управляется DateRangePicker) —
+    // грузим, как только есть даты; для пресетных периодов грузим сразу.
+    if (period === 'custom') {
+      if (customFrom && customTo) loadData()
+    } else {
+      loadData()
+    }
+  }, [accountId, period, view, onlyActive, selCampaign, search, customFrom, customTo])
 
   function toggleSort(key) {
     if (sortBy === key) setSortDir(d => -d)
@@ -205,14 +215,10 @@ export default function Campaigns() {
       <div className="page-header">
         <div className="page-title">По кампаниям</div>
         <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
-          <div className="period-tabs">
-            {PERIODS.map(p=>(
-              <div key={p.key} className={`period-tab${period===p.key?' active':''}`}
-                onClick={()=>{ setPeriod(p.key); setShowCustom(p.key==='custom') }}>
-                {p.label}
-              </div>
-            ))}
-          </div>
+          <DateRangePicker
+            value={{ from: customFrom, to: customTo }}
+            onChange={r => { setCustomFrom(r.from); setCustomTo(r.to); setPeriod('custom'); setShowCustom(false) }}
+          />
           <div className="period-tabs">
             {['campaigns','keywords'].map(v=>(
               <div key={v} className={`period-tab${view===v?' active':''}`} onClick={()=>setView(v)}>
@@ -223,7 +229,7 @@ export default function Campaigns() {
         </div>
       </div>
 
-      {/* Произвольный период */}
+      {/* Произвольный период сравнения (опционально) */}
       {showCustom && (
         <div className="card" style={{marginBottom:14,padding:'12px 16px'}}>
           <div style={{display:'flex',gap:12,flexWrap:'wrap',alignItems:'flex-end'}}>
@@ -261,6 +267,9 @@ export default function Campaigns() {
         )}
         <button className={`btn${onlyActive?' btn-primary':''}`} onClick={()=>setOnlyActive(a=>!a)}>
           {onlyActive?'✓ ':''} Только активные
+        </button>
+        <button className="btn" onClick={()=>setShowCustom(s=>!s)} title="Сравнить с другим периодом">
+          {showCustom?'Скрыть сравнение':'Сравнить период'}
         </button>
         <span style={{fontSize:11,color:'var(--text3)',marginLeft:4}}>
           {filtered.length} {view==='campaigns'?'кампаний':'ключей'}
