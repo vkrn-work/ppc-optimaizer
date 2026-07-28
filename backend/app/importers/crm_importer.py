@@ -29,6 +29,10 @@ v1.7.5 — три причины, по которым часть выгрузк�
   3. ДЕДУПЛИКАЦИЯ работала только по external_id. Строки без него при
      повторной загрузке того же файла дублировались. Добавлен
      fingerprint (статус + источник + term + дата + выручка).
+
+v1.7.6 — атрибуция стала иерархической (кампания→группа→ключ), attribute()
+возвращает 4 значения, заявка получает ad_group_id. После импорта (в т.ч. при
+0 новых строк) запускается пересчёт разноски по свежим данным Директа.
 """
 import csv
 import hashlib
@@ -268,6 +272,7 @@ async def import_crm_file(db: AsyncSession, account_id: int, filename: str, cont
         "matched_by_ad_id": 0,
         "matched_by_search_query": 0,
         "matched_by_phrase": 0,
+        "matched_by_ad_group": 0,
         "matched_by_campaign_only": 0,
         "unmatched": 0,
         "mql_count": 0,
@@ -284,6 +289,7 @@ async def import_crm_file(db: AsyncSession, account_id: int, filename: str, cont
         "ad_id": "matched_by_ad_id",
         "search_query": "matched_by_search_query",
         "phrase": "matched_by_phrase",
+        "ad_group": "matched_by_ad_group",
         "campaign": "matched_by_campaign_only",
     }
 
@@ -321,12 +327,13 @@ async def import_crm_file(db: AsyncSession, account_id: int, filename: str, cont
             stats["skipped_duplicate"] += 1
             continue
 
-        keyword_id, campaign_id, matched_by = attribute(
+        keyword_id, ad_group_id, campaign_id, matched_by = attribute(
             matchers,
             ad_id=parsed.get("ad_id"),
             term=term,
             campaign_name=campaign_name,
             chain_campaign=parsed.get("campaign"),
+            chain_ad_group=parsed.get("ad_group"),
         )
         if matched_by:
             stats[match_stat_key[matched_by]] += 1
@@ -344,6 +351,7 @@ async def import_crm_file(db: AsyncSession, account_id: int, filename: str, cont
             is_mql=is_mql,
             is_sql=is_sql,
             keyword_id=keyword_id,
+            ad_group_id=ad_group_id,
             campaign_id=campaign_id,
             matched_by=matched_by,
             matched_ad_id=parsed.get("ad_id"),
@@ -366,5 +374,30 @@ async def import_crm_file(db: AsyncSession, account_id: int, filename: str, cont
         existing_fingerprints.add(fp)
 
     await db.commit()
+
+    # v1.7.6: даже если новых строк 0 (повторная загрузка того же файла) —
+    # перематчиваем уже лежащие заявки по свежим данным Директа. Так «обновить
+    # файл» перестаёт быть бесполезным действием: разноска пересчитывается.
+    from app.importers.lead_attribution import reattribute_account
+    try:
+        stats["reattribution"] = await reattribute_account(db, account_id)
+    except Exception as e:
+        logger.warning(f"post-import reattribution failed: {e}")
+        stats["reattribution"] = {"error": str(e)}
+
+    # Человекочитаемый итог — чтобы «Импортировано: 0» не читалось как поломка.
+    dup = stats["skipped_duplicate"]
+    if stats["imported"] == 0 and dup > 0:
+        stats["message"] = (
+            f"Новых заявок нет: все {dup} строк уже были загружены ранее "
+            f"(дубли по номеру сделки/содержимому). Разноска существующих "
+            f"заявок пересчитана заново."
+        )
+    else:
+        stats["message"] = (
+            f"Загружено новых заявок: {stats['imported']}. "
+            f"Пропущено дублей: {dup}."
+        )
+
     logger.info(f"CRM import account={account_id} file={filename}: {stats}")
     return stats
