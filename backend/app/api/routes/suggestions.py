@@ -19,7 +19,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-# ─── Analysis ──────────────────────────
+# ─── Analysis ───────────────────────
 
 @router.get("/accounts/{account_id}/analyses")
 async def get_analyses(account_id: int, limit: int = 10, db: AsyncSession = Depends(get_db)):
@@ -41,7 +41,7 @@ async def get_analyses(account_id: int, limit: int = 10, db: AsyncSession = Depe
     } for a in analyses]
 
 
-# ─── Suggestions ─────────────────────────────
+# ─── Suggestions ───────────────────
 
 @router.get("/accounts/{account_id}/suggestions")
 async def get_suggestions(
@@ -88,6 +88,10 @@ async def get_suggestions(
         "severity":      prio_sev.get(s.priority, "warning"),
         "status":        s.status.value,
         "payload":       s.payload,  # v1.7.0: черновик create_campaign (группы/ключи/объявления)
+        # v1.7.6: вехи жизненного цикла — для анализа «как отразилось применение»
+        "created_at":    s.created_at.isoformat() if s.created_at else None,
+        "approved_at":   s.approved_at.isoformat() if s.approved_at else None,
+        "applied_at":    s.applied_at.isoformat() if s.applied_at else None,
     } for s in rows]
 
 
@@ -112,6 +116,7 @@ async def action_suggestion(suggestion_id: int, data: dict, db: AsyncSession = D
 
     s.status = SuggestionStatus.approved
     s.approved_by = data.get("approved_by") or "director"
+    s.approved_at = datetime.utcnow()
     hypothesis = Hypothesis(
         account_id=s.account_id,
         suggestion_id=s.id,
