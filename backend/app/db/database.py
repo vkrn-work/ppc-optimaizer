@@ -114,6 +114,8 @@ async def _run_migrations(conn):
         # v1.7.0: универсальный JSON-payload для предложений (create_campaign и
         # будущие типы, которым нужна структура сложнее короткой строки).
         "ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS payload JSON",
+        # v1.7.6: дата одобрения предложения (created_at и applied_at уже есть)
+        "ALTER TABLE suggestions ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP",
         # v1.7.4: запасной уровень атрибуции лида. Если заявка не привязалась к
         # ключевому слову, но кампания известна — она всё равно участвует в
         # анализе. Без этого 73% лидов выпадали, и кампания с реальными
